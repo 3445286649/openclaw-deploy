@@ -2173,7 +2173,7 @@ function App() {
             </div>
             <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-2">
               <p className="font-medium text-slate-200">后续如何交互（推荐顺序）</p>
-              <p>1) 先点「启动 Gateway」，若提示服务缺失会自动安装并重试。</p>
+              <p>1) 先点「启动 Gateway 并自动打开对话网页」，若提示服务缺失会自动安装并重试，启动后浏览器会自动打开对话界面。</p>
               <p>2) 直接在图形化卡片配置 Telegram / 飞书 / QQ / Discord / 钉钉，并先做连通性测试。</p>
               <p>3) 配好后，在对应聊天应用里给机器人发消息即可对话。</p>
               <p className="text-slate-400">
