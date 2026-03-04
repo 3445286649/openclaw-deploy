@@ -1210,7 +1210,7 @@ while ($true) {
           } else {
             $modelId = $FIXED_SILICONFLOW_MODELS[0].id
           }
-          Write-Host "想用更多高端模型？加群 1088525353 解锁！" -ForegroundColor Cyan
+          Write-Host "想用更多高端模型？加群 1085253453 解锁！" -ForegroundColor Cyan
         } elseif ($provider -ne "custom") {
           Write-Host ""
           Write-Host "正在拉取可用模型列表..." -ForegroundColor Cyan

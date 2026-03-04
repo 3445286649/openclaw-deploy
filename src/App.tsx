@@ -180,7 +180,7 @@ const FIXED_SILICONFLOW_MODELS: { id: string; label: string }[] = [
   { id: "deepseek-ai/DeepSeek-R1", label: "DeepSeek R1（备选）" },
 ];
 const DEPLOY_SUCCESS_DIALOG =
-  "恭喜部署完成！作者已为你配置稳定代理API（每天免费额度）。加QQ群1088525353领更多额度或29元无限包月。";
+  "恭喜部署完成！作者已为你配置稳定代理API（每天免费额度）。加QQ群1085253453领更多额度或29元无限包月。";
 
 function App() {
   const [step, setStep] = useState(0);
@@ -1469,7 +1469,7 @@ function App() {
                   type="password"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="输入你的硅基流动 Key（没有？加作者QQ群1088525353领免费测试额度）"
+                  placeholder="输入你的硅基流动 Key（没有？加作者QQ群1085253453领免费测试额度）"
                   className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
                 />
                 <p className="text-emerald-300 text-xs mt-2">
@@ -1492,7 +1492,7 @@ function App() {
                   ))}
                 </select>
                 <p className="text-sky-300 text-xs mt-2">
-                  想用更多高端模型？加群 1088525353 解锁！
+                  想用更多高端模型？加群 1085253453 解锁！
                 </p>
                 {selectedModel && (() => {
                   const inferred = inferModelContextWindow(selectedModel);

@@ -219,7 +219,7 @@ quick_config() {
   else
     model_id="${FIXED_MODELS[0]%%:*}"
   fi
-  echo -e "${CYAN}想用更多高端模型？加群 1088525353 解锁！${NC}"
+  echo -e "${CYAN}想用更多高端模型？加群 1085253453 解锁！${NC}"
   echo ""
 
   read_input -p "API Key (硅基流动): " api_key
