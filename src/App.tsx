@@ -167,6 +167,13 @@ const STEPS = [
   { id: 3, title: "启动服务", icon: Play },
 ];
 
+const DEFAULT_OPENAI_BASE_URL = "https://api.siliconflow.cn/v1";
+const DEFAULT_KIMI_BASE_URL = "https://api.moonshot.cn/v1";
+const RECOMMENDED_MODEL_FALLBACK = "deepseek-ai/DeepSeek-V3";
+const RECOMMENDED_MODEL_SECOND = "Qwen/Qwen2.5-72B-Instruct";
+const DEPLOY_SUCCESS_DIALOG =
+  "恭喜部署完成！作者已为你配置稳定代理API（每天免费额度）。加QQ群1088525353领更多额度或29元无限包月。";
+
 function App() {
   const [step, setStep] = useState(0);
   const [nodeCheck, setNodeCheck] = useState<EnvCheckResult | null>(null);
@@ -187,9 +194,9 @@ function App() {
   const installLogBufferRef = useRef<string[]>([]);
   const installLogFlushTimerRef = useRef<number | null>(null);
 
-  const [provider, setProvider] = useState("anthropic");
+  const [provider, setProvider] = useState("openai");
   const [apiKey, setApiKey] = useState("");
-  const [baseUrl, setBaseUrl] = useState("");
+  const [baseUrl, setBaseUrl] = useState(DEFAULT_OPENAI_BASE_URL);
   const [proxyUrl, setProxyUrl] = useState("");
   const [noProxy, setNoProxy] = useState("");
   const [customConfigPath, setCustomConfigPath] = useState("");
@@ -197,11 +204,12 @@ function App() {
   const [recommendedInstallDir, setRecommendedInstallDir] = useState("");
   const [lastInstallDir, setLastInstallDir] = useState("");
   const [saving, setSaving] = useState(false);
+  const [cleaningLegacy, setCleaningLegacy] = useState(false);
   const [saveResult, setSaveResult] = useState<string | null>(null);
   const [modelTesting, setModelTesting] = useState(false);
   const [modelTestResult, setModelTestResult] = useState<string | null>(null);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [selectedModel, setSelectedModel] = useState("");
+  const [selectedModel, setSelectedModel] = useState(RECOMMENDED_MODEL_FALLBACK);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [runtimeModelInfo, setRuntimeModelInfo] = useState<RuntimeModelInfo | null>(null);
   const [keySyncStatus, setKeySyncStatus] = useState<KeySyncStatus | null>(null);
@@ -210,7 +218,6 @@ function App() {
 
   const [starting, setStarting] = useState(false);
   const [startResult, setStartResult] = useState<string | null>(null);
-  const [dashboardOpening, setDashboardOpening] = useState(false);
   const [telegramConfig, setTelegramConfig] = useState<ChannelConfig>({});
   const [feishuConfig, setFeishuConfig] = useState<ChannelConfig>({});
   const [qqConfig, setQqConfig] = useState<ChannelConfig>({});
@@ -388,7 +395,7 @@ function App() {
   useEffect(() => {
     setModelTestResult(null);
     setAvailableModels([]);
-    setSelectedModel("");
+    setSelectedModel((prev) => prev || RECOMMENDED_MODEL_FALLBACK);
   }, [provider, baseUrl, apiKey]);
 
   useEffect(() => {
@@ -527,7 +534,20 @@ function App() {
         customPath: normalizeConfigPath(cfgPath || customConfigPath) || undefined,
       });
       setAvailableModels(models);
-      setSelectedModel((prev) => (prev && models.includes(prev) ? prev : models[0] || ""));
+      setSelectedModel((prev) => {
+        if (prev && models.includes(prev)) return prev;
+        const deepseekV3 = models.find(
+          (m) => m.toLowerCase() === "deepseek-ai/deepseek-v3"
+        );
+        if (deepseekV3) return deepseekV3;
+        const qwen72b = models.find(
+          (m) => m.toLowerCase() === "qwen/qwen2.5-72b-instruct"
+        );
+        if (qwen72b) return qwen72b;
+        const deepseek = models.find((m) => m.toLowerCase().includes("deepseek"));
+        if (deepseek) return deepseek;
+        return models[0] || RECOMMENDED_MODEL_FALLBACK;
+      });
       return models;
     } finally {
       setModelsLoading(false);
@@ -689,12 +709,7 @@ function App() {
     setSaving(true);
     setSaveResult(null);
     try {
-      await invoke<string>("test_model_connection", {
-        provider,
-        baseUrl: baseUrl.trim() || undefined,
-        apiKey: apiKey.trim(),
-        customPath: normalizeConfigPath(customConfigPath) || undefined,
-      });
+      const customPathNormalized = normalizeConfigPath(customConfigPath) || undefined;
       const result = await invoke<string>("write_env_config", {
         apiKey: apiKey.trim() || undefined,
         provider,
@@ -703,13 +718,23 @@ function App() {
         resetSessions: shouldResetSessions,
         proxyUrl: proxyUrl.trim() || undefined,
         noProxy: noProxy.trim() || undefined,
-        customPath: normalizeConfigPath(customConfigPath) || undefined,
+        customPath: customPathNormalized,
       });
       setSaveResult(result);
-      setModelTestResult("保存前检测通过");
       await loadSavedAiConfig();
       await loadRuntimeModelInfo();
       await loadKeySyncStatus();
+      try {
+        await invoke<string>("test_model_connection", {
+          provider,
+          baseUrl: baseUrl.trim() || undefined,
+          apiKey: apiKey.trim() || undefined,
+          customPath: customPathNormalized,
+        });
+        setModelTestResult("配置已保存，连通性检测通过");
+      } catch (e) {
+        setModelTestResult(`配置已保存，但连通性检测失败: ${e}`);
+      }
     } catch (e) {
       setSaveResult(`保存失败: ${e}`);
     } finally {
@@ -748,6 +773,26 @@ function App() {
       setModelTestResult(`检测失败: ${e}`);
     } finally {
       setModelTesting(false);
+    }
+  };
+
+  const handleCleanupLegacyCache = async () => {
+    setCleaningLegacy(true);
+    setSaveResult(null);
+    try {
+      const result = await invoke<string>("cleanup_legacy_provider_cache", {
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+      });
+      setSaveResult(result);
+      await Promise.all([
+        loadSavedAiConfig(),
+        loadRuntimeModelInfo(),
+        loadKeySyncStatus(),
+      ]);
+    } catch (e) {
+      setSaveResult(`清理失败: ${e}`);
+    } finally {
+      setCleaningLegacy(false);
     }
   };
 
@@ -1096,6 +1141,12 @@ function App() {
         installHint,
       });
       setStartResult(stripAnsi(result));
+      try {
+        await invoke<string>("open_external_url", { url: "http://127.0.0.1:18789" });
+      } catch {
+        // ignore browser open errors; keep startup success
+      }
+      window.alert(DEPLOY_SUCCESS_DIALOG);
     } catch (e) {
       setStartResult(stripAnsi(`启动失败: ${e}`));
     } finally {
@@ -1114,34 +1165,14 @@ function App() {
         installHint,
       });
       setStartResult(stripAnsi(result));
+      try {
+        await invoke<string>("open_external_url", { url: "http://127.0.0.1:18789" });
+      } catch {
+        // ignore browser open errors; foreground window already started
+      }
+      window.alert(DEPLOY_SUCCESS_DIALOG);
     } catch (e) {
       setStartResult(stripAnsi(`前台启动失败: ${e}`));
-    }
-  };
-
-  const handleOpenDashboard = async () => {
-    setDashboardOpening(true);
-    try {
-      const customPath = normalizeConfigPath(customConfigPath) || undefined;
-      const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
-      await invoke<string>("start_gateway", { customPath, installHint });
-      const token = await invoke<string>("get_gateway_auth_token", { customPath });
-      const url = `http://127.0.0.1:18789/?token=${encodeURIComponent(token)}`;
-      try {
-        await navigator.clipboard.writeText(token);
-      } catch {
-        // ignore clipboard failures; URL already contains token
-      }
-      try {
-        await invoke<string>("open_external_url", { url });
-        setStartResult("已打开对话界面并附带网关 token；若页面仍提示未授权，请在 Control UI 设置里粘贴刚复制的 token。");
-      } catch (openErr) {
-        setStartResult(`已启动 Gateway，但自动打开浏览器失败。\n请手动访问：${url}\n错误：${openErr}`);
-      }
-    } catch (e) {
-      setStartResult(`打开对话界面失败: ${e}`);
-    } finally {
-      setDashboardOpening(false);
     }
   };
 
@@ -1420,10 +1451,23 @@ function App() {
                   value={provider}
                   onChange={(e) => {
                     const next = e.target.value;
+                    if (next === provider) return;
+                    if (apiKey.trim()) {
+                      const confirmed = window.confirm(
+                        "切换 AI 提供商将清空当前 API Key，避免不同平台 Key 串用。是否继续？"
+                      );
+                      if (!confirmed) return;
+                      setApiKey("");
+                    }
                     setProvider(next);
-                    if (!baseUrl.trim()) {
-                      if (next === "kimi") setBaseUrl("https://api.moonshot.cn/v1");
-                      if (next === "qwen") setBaseUrl("https://dashscope.aliyuncs.com/compatible-mode/v1");
+                    if (next === "kimi") {
+                      setBaseUrl(DEFAULT_KIMI_BASE_URL);
+                      setSelectedModel("moonshot-v1-32k");
+                    } else if (next === "openai" || next === "deepseek" || next === "qwen") {
+                      if (!baseUrl.trim() || baseUrl.trim() === DEFAULT_KIMI_BASE_URL) {
+                        setBaseUrl(DEFAULT_OPENAI_BASE_URL);
+                      }
+                      setSelectedModel(RECOMMENDED_MODEL_FALLBACK);
                     }
                   }}
                   className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
@@ -1448,9 +1492,12 @@ function App() {
                   type="password"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="sk-xxx 或 你的 API Key"
+                  placeholder="输入你的硅基流动 Key（没有？加作者QQ群1088525353领免费测试额度）"
                   className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
                 />
+                <p className="text-emerald-300 text-xs mt-2">
+                  作者推荐硅基流动API（免费额度多、速度快），或 Kimi（长上下文强）。加群领备用Key + 未来包月代理（29元无限）
+                </p>
               </div>
               <div>
                 <label className="block text-sm font-medium mb-2">
@@ -1461,10 +1508,13 @@ function App() {
                     value={selectedModel}
                     onChange={(e) => setSelectedModel(e.target.value)}
                     className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
-                    disabled={modelsLoading || availableModels.length === 0}
+                    disabled={modelsLoading}
                   >
                     {availableModels.length === 0 ? (
-                      <option value="">请先点击“模型连通性检测”拉取模型</option>
+                      <>
+                        <option value={RECOMMENDED_MODEL_FALLBACK}>{RECOMMENDED_MODEL_FALLBACK}（推荐）</option>
+                        <option value={RECOMMENDED_MODEL_SECOND}>{RECOMMENDED_MODEL_SECOND}（推荐）</option>
+                      </>
                     ) : (
                       availableModels.map((m) => (
                         <option key={m} value={m}>
@@ -1508,9 +1558,32 @@ function App() {
                   type="text"
                   value={baseUrl}
                   onChange={(e) => setBaseUrl(e.target.value)}
-                  placeholder="https://your-api-proxy.com/v1"
+                  placeholder={DEFAULT_OPENAI_BASE_URL}
                   className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
                 />
+                <div className="flex gap-2 mt-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setProvider("openai");
+                      setBaseUrl(DEFAULT_OPENAI_BASE_URL);
+                      setSelectedModel(RECOMMENDED_MODEL_FALLBACK);
+                    }}
+                    className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-xs"
+                  >
+                    使用硅基地址
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setProvider("kimi");
+                      setBaseUrl(DEFAULT_KIMI_BASE_URL);
+                    }}
+                    className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-xs"
+                  >
+                    切换 Kimi 地址
+                  </button>
+                </div>
               </div>
               <div>
                 <label className="block text-sm font-medium mb-2">
@@ -1594,7 +1667,7 @@ function App() {
               <div className="flex gap-2">
                 <button
                   onClick={handleSaveConfig}
-                  disabled={saving || modelTesting}
+                  disabled={saving || modelTesting || cleaningLegacy}
                   className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg font-medium"
                 >
                   {saving ? <Loader2 className="w-5 h-5 animate-spin" /> : <Key className="w-5 h-5" />}
@@ -1602,11 +1675,19 @@ function App() {
                 </button>
                 <button
                   onClick={handleTestModel}
-                  disabled={modelTesting}
+                  disabled={modelTesting || cleaningLegacy}
                   className="flex items-center gap-2 px-6 py-3 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg font-medium"
                 >
                   {modelTesting ? <Loader2 className="w-5 h-5 animate-spin" /> : <Wrench className="w-5 h-5" />}
                   模型连通性检测
+                </button>
+                <button
+                  onClick={handleCleanupLegacyCache}
+                  disabled={cleaningLegacy || modelTesting || saving}
+                  className="flex items-center gap-2 px-6 py-3 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded-lg font-medium"
+                >
+                  {cleaningLegacy ? <Loader2 className="w-5 h-5 animate-spin" /> : <Wrench className="w-5 h-5" />}
+                  一键清理历史 Provider 缓存
                 </button>
               </div>
               {saveResult && (
@@ -1672,17 +1753,9 @@ function App() {
               ) : (
                 <>
                   <Play className="w-5 h-5" />
-                  启动 Gateway
+                  启动 Gateway 并自动打开对话网页
                 </>
               )}
-            </button>
-            <button
-              onClick={handleOpenDashboard}
-              disabled={dashboardOpening}
-              className="flex items-center gap-2 px-6 py-3 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded-lg font-medium"
-            >
-              {dashboardOpening ? <Loader2 className="w-5 h-5 animate-spin" /> : <ExternalLink className="w-5 h-5" />}
-              {dashboardOpening ? "打开中..." : "一键打开 OpenClaw 对话界面"}
             </button>
             <button
               onClick={handleStartForeground}

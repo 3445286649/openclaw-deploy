@@ -976,6 +976,7 @@ fn normalize_openclaw_config_for_models(root: &mut Value) {
         .unwrap_or("https://api.openai.com/v1")
         .to_ascii_lowercase();
     let default_api = if base_url_text.contains("moonshot.cn")
+        || base_url_text.contains("moonshot.ai")
         || base_url_text.contains("dashscope.aliyuncs.com")
     {
         "openai-completions"
@@ -1169,6 +1170,172 @@ fn read_auth_profile_api_key(openclaw_dir: &str, provider: &str) -> Option<Strin
         .filter(|s| !s.is_empty())
 }
 
+fn sync_models_cache_api_key(
+    openclaw_dir: &str,
+    provider: &str,
+    base_url: &str,
+    key: &str,
+) -> Result<(), String> {
+    let agent_dir = format!("{}/agents/main/agent", openclaw_dir.replace('\\', "/"));
+    std::fs::create_dir_all(&agent_dir).map_err(|e| format!("创建 agent 目录失败: {}", e))?;
+    let models_path = format!("{}/models.json", agent_dir);
+    let mut root: Value = if Path::new(&models_path).exists() {
+        let txt = std::fs::read_to_string(&models_path).map_err(|e| format!("读取 models.json 失败: {}", e))?;
+        serde_json::from_str(&txt).unwrap_or_else(|_| json!({ "providers": {} }))
+    } else {
+        json!({ "providers": {} })
+    };
+    if !root.is_object() {
+        root = json!({ "providers": {} });
+    }
+    let obj = root.as_object_mut().expect("models root object");
+    let providers = obj.entry("providers".to_string()).or_insert_with(|| json!({}));
+    if !providers.is_object() {
+        *providers = json!({});
+    }
+    let providers_obj = providers.as_object_mut().expect("providers object");
+    let base_lower = base_url.to_ascii_lowercase();
+    let api_mode = if provider == "kimi"
+        || provider == "moonshot"
+        || provider == "qwen"
+        || provider == "bailian"
+        || provider == "dashscope"
+        || base_lower.contains("moonshot.cn")
+        || base_lower.contains("moonshot.ai")
+        || base_lower.contains("dashscope.aliyuncs.com")
+    {
+        "openai-completions"
+    } else {
+        "openai-responses"
+    };
+    providers_obj.insert(
+        "openai".to_string(),
+        json!({
+            "baseUrl": base_url,
+            "apiKey": key,
+            "api": api_mode,
+            "models": []
+        }),
+    );
+    // 修复历史 custom provider 残留（如 custom-api-moonshot-cn）导致继续读旧 key
+    for (_id, pval) in providers_obj.iter_mut() {
+        let Some(pobj) = pval.as_object_mut() else { continue };
+        let pbase = pobj
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if pbase.contains("moonshot.cn") || pbase.contains("moonshot.ai") {
+            pobj.insert("baseUrl".to_string(), json!(base_url));
+            pobj.insert("apiKey".to_string(), json!(key));
+            pobj.insert("api".to_string(), json!("openai-completions"));
+        }
+    }
+    std::fs::write(
+        &models_path,
+        serde_json::to_string_pretty(&root).map_err(|e| format!("序列化 models.json 失败: {}", e))?,
+    )
+    .map_err(|e| format!("写入 models.json 失败: {}", e))
+}
+
+#[tauri::command]
+fn cleanup_legacy_provider_cache(custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let agent_dir = format!("{}/agents/main/agent", openclaw_dir.replace('\\', "/"));
+    std::fs::create_dir_all(&agent_dir).map_err(|e| format!("创建 agent 目录失败: {}", e))?;
+    let models_path = format!("{}/models.json", agent_dir);
+    if !Path::new(&models_path).exists() {
+        return Ok("未发现 models.json 缓存，无需清理".to_string());
+    }
+
+    let txt = std::fs::read_to_string(&models_path).map_err(|e| format!("读取 models.json 失败: {}", e))?;
+    let mut root: Value = serde_json::from_str(&txt).unwrap_or_else(|_| json!({ "providers": {} }));
+    if !root.is_object() {
+        root = json!({ "providers": {} });
+    }
+    let obj = root.as_object_mut().expect("models root object");
+    let providers = obj.entry("providers".to_string()).or_insert_with(|| json!({}));
+    if !providers.is_object() {
+        *providers = json!({});
+    }
+    let providers_obj = providers.as_object_mut().expect("providers object");
+
+    let mut canonical_base = "https://api.siliconflow.cn/v1".to_string();
+    let mut canonical_key: Option<String> = read_auth_profile_api_key(&openclaw_dir, "openai");
+    if let Ok(cfg) = load_openclaw_config(&openclaw_dir) {
+        if let Some(openai_obj) = cfg
+            .as_object()
+            .and_then(|o| o.get("models"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("providers"))
+            .and_then(|v| v.as_object())
+            .and_then(|o| o.get("openai"))
+            .and_then(|v| v.as_object())
+        {
+            if let Some(b) = openai_obj.get("baseUrl").and_then(|v| v.as_str()) {
+                let b = b.trim();
+                if !b.is_empty() {
+                    canonical_base = b.to_string();
+                }
+            }
+            if canonical_key.is_none() {
+                canonical_key = openai_obj
+                    .get("apiKey")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+            }
+        }
+    }
+
+    let keys: Vec<String> = providers_obj.keys().cloned().collect();
+    let mut removed = 0usize;
+    let mut updated = 0usize;
+    for pid in keys {
+        if pid.starts_with("custom-api-") {
+            let _ = providers_obj.remove(&pid);
+            removed += 1;
+            continue;
+        }
+        let Some(pobj) = providers_obj.get_mut(&pid).and_then(|v| v.as_object_mut()) else { continue };
+        let pbase = pobj
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if pbase.contains("moonshot.cn") || pbase.contains("moonshot.ai") {
+            pobj.insert("baseUrl".to_string(), json!(canonical_base.clone()));
+            if let Some(ref k) = canonical_key {
+                pobj.insert("apiKey".to_string(), json!(k));
+            }
+            pobj.insert("api".to_string(), json!("openai-completions"));
+            updated += 1;
+        }
+    }
+
+    if let Some(openai_obj) = providers_obj
+        .entry("openai".to_string())
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+    {
+        openai_obj.insert("baseUrl".to_string(), json!(canonical_base.clone()));
+        if let Some(ref k) = canonical_key {
+            openai_obj.insert("apiKey".to_string(), json!(k));
+        }
+    }
+
+    std::fs::write(
+        &models_path,
+        serde_json::to_string_pretty(&root).map_err(|e| format!("序列化 models.json 失败: {}", e))?,
+    )
+    .map_err(|e| format!("写入 models.json 失败: {}", e))?;
+
+    Ok(format!(
+        "清理完成：移除历史 provider {} 个，更新缓存 {} 处。当前基准地址：{}",
+        removed, updated, canonical_base
+    ))
+}
+
 fn read_proxy_from_env(openclaw_dir: &str) -> (Option<String>, Option<String>) {
     let env_path = format!("{}/env", openclaw_dir.replace('\\', "/"));
     let txt = match std::fs::read_to_string(&env_path) {
@@ -1335,7 +1502,7 @@ fn write_env_config(
         s
     };
 
-    let content = match provider.as_str() {
+    let mut content = match provider.as_str() {
         "anthropic" => {
             let base = base_url_for_content.clone().map(|u| format!("export ANTHROPIC_BASE_URL={}\n", u)).unwrap_or_default();
             format!(
@@ -1389,6 +1556,26 @@ fn write_env_config(
             )
         }
     };
+    // 始终写入 OPENAI 兼容变量，便于硅基等代理直连与客户端统一读取
+    let openai_base = base_url_for_content
+        .clone()
+        .unwrap_or_else(|| match provider.as_str() {
+            "kimi" | "moonshot" => "https://api.moonshot.cn/v1".to_string(),
+            _ => "https://api.siliconflow.cn/v1".to_string(),
+        });
+    if !content.contains("OPENAI_BASE_URL=") {
+        content.push_str(&format!("export OPENAI_BASE_URL={}\n", openai_base));
+    }
+    if !content.contains("OPENAI_API_KEY=") {
+        content.push_str(&format!("export OPENAI_API_KEY={}\n", effective_api_key));
+    }
+
+    let _ = sync_models_cache_api_key(
+        &openclaw_dir,
+        provider.as_str(),
+        &openai_base,
+        &effective_api_key,
+    );
 
     let env_path = format!("{}/env", openclaw_dir);
     std::fs::write(&env_path, content).map_err(|e| format!("写入失败: {}", e))?;
@@ -1628,8 +1815,8 @@ fn read_env_config(custom_path: Option<String>) -> Result<SavedAiConfig, String>
     let env_path = format!("{}/env", openclaw_dir);
     if !Path::new(&env_path).exists() {
         return Ok(SavedAiConfig {
-            provider: "anthropic".to_string(),
-            base_url: None,
+            provider: "openai".to_string(),
+            base_url: Some("https://api.siliconflow.cn/v1".to_string()),
             proxy_url: None,
             no_proxy: None,
             has_api_key: false,
@@ -1650,7 +1837,7 @@ fn read_env_config(custom_path: Option<String>) -> Result<SavedAiConfig, String>
     } else if has_dashscope {
         "bailian"
     } else if has_openai {
-        if txt.contains("api.moonshot.cn") {
+        if txt.contains("api.moonshot.cn") || txt.contains("api.moonshot.ai") {
             "kimi"
         } else if txt.contains("dashscope.aliyuncs.com/compatible-mode") {
             "qwen"
@@ -1658,7 +1845,7 @@ fn read_env_config(custom_path: Option<String>) -> Result<SavedAiConfig, String>
             "openai"
         }
     } else {
-        "anthropic"
+        "openai"
     };
 
     let mut base_url: Option<String> = None;
@@ -2715,7 +2902,9 @@ fn probe_runtime_model_connection(custom_path: Option<String>) -> Result<String,
     let key_prefix = mask_key_prefix(&key).unwrap_or_else(|| "(隐藏)".to_string());
     let base_lower = base_url.to_ascii_lowercase();
     let model_lower = model_name.to_ascii_lowercase();
-    if base_lower.contains("moonshot.cn") && !model_lower.contains("moonshot") {
+    if (base_lower.contains("moonshot.cn") || base_lower.contains("moonshot.ai"))
+        && !model_lower.contains("moonshot")
+    {
         return Err(format!(
             "运行时探活失败[model_mismatch]：当前地址是 Kimi，但生效模型不是 moonshot。模型={}，地址={}",
             model_full, base_url
@@ -3152,6 +3341,7 @@ pub fn run() {
             recommended_install_dir,
             get_openclaw_dir,
             write_env_config,
+            cleanup_legacy_provider_cache,
             discover_available_models,
             read_env_config,
             test_model_connection,
