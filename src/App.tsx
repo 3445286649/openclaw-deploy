@@ -255,7 +255,7 @@ const FIXED_SILICONFLOW_MODELS: { id: string; label: string }[] = [
   { id: "deepseek-ai/DeepSeek-V3", label: "DeepSeek V3（推荐）" },
   { id: "Qwen/Qwen2.5-72B-Instruct", label: "Qwen2.5 72B" },
   { id: "GLM-4-9B-Chat", label: "GLM-4-9B / GLM-5" },
-  { id: "moonshot/kimi-k2-turbo-preview", label: "Kimi k2-turbo" },
+  { id: "moonshotai/Kimi-K2-Instruct-0905", label: "Kimi K2（可对话）" },
   { id: "deepseek-ai/DeepSeek-R1", label: "DeepSeek R1（备选）" },
 ];
 const DEPLOY_SUCCESS_DIALOG =
@@ -381,6 +381,7 @@ function App() {
   const [skillsCatalog, setSkillsCatalog] = useState<SkillCatalogItem[]>([]);
   const [selectedSkills, setSelectedSkills] = useState<Record<string, boolean>>({});
   const [skillsRepairLoading, setSkillsRepairLoading] = useState(false);
+  const [skillsAction, setSkillsAction] = useState<"install" | "repair" | null>(null);
   const [skillsRepairProgress, setSkillsRepairProgress] = useState<SkillsRepairProgressEvent | null>(null);
   const [skillsRepairProgressLog, setSkillsRepairProgressLog] = useState<string[]>([]);
   const [diagnosticLoading, setDiagnosticLoading] = useState(false);
@@ -1346,15 +1347,17 @@ function App() {
   const handleStart = async () => {
     setStarting(true);
     setStartResult(null);
+    const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
     const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
     try {
       const result = await invoke<string>("start_gateway", {
-        customPath: normalizeConfigPath(customConfigPath) || undefined,
+        customPath: cfgPath,
         installHint,
       });
       setStartResult(stripAnsi(result));
       try {
-        await invoke<string>("open_external_url", { url: "http://127.0.0.1:18789" });
+        const url = await invoke<string>("get_gateway_dashboard_url", { customPath: cfgPath });
+        await invoke<string>("open_external_url", { url });
       } catch {
         // ignore browser open errors; keep startup success
       }
@@ -1369,16 +1372,52 @@ function App() {
     }
   };
 
-  const handleStartForeground = async () => {
+  const handleOpenDashboard = async () => {
+    const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+    try {
+      const url = await invoke<string>("get_gateway_dashboard_url", { customPath: cfgPath });
+      await invoke<string>("open_external_url", { url });
+    } catch (e) {
+      setStartResult(`打开失败: ${e}`);
+    }
+  };
+
+  const handleResetGatewayAuth = async () => {
+    if (starting) return;
+    setStarting(true);
+    const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
     const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
     try {
-      const result = await invoke<string>("start_gateway_foreground", {
-        customPath: normalizeConfigPath(customConfigPath) || undefined,
+      const result = await invoke<string>("reset_gateway_auth_and_restart", {
+        customPath: cfgPath,
         installHint,
       });
       setStartResult(stripAnsi(result));
       try {
-        await invoke<string>("open_external_url", { url: "http://127.0.0.1:18789" });
+        const url = await invoke<string>("get_gateway_dashboard_url", { customPath: cfgPath });
+        await invoke<string>("open_external_url", { url });
+      } catch {
+        // ignore open errors
+      }
+    } catch (e) {
+      setStartResult(stripAnsi(`重置认证失败: ${e}`));
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const handleStartForeground = async () => {
+    const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+    const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+    try {
+      const result = await invoke<string>("start_gateway_foreground", {
+        customPath: cfgPath,
+        installHint,
+      });
+      setStartResult(stripAnsi(result));
+      try {
+        const url = await invoke<string>("get_gateway_dashboard_url", { customPath: cfgPath });
+        await invoke<string>("open_external_url", { url });
       } catch {
         // ignore browser open errors; foreground window already started
       }
@@ -1549,6 +1588,51 @@ function App() {
     }
   };
 
+  const handleInstallSelectedSkills = async () => {
+    enqueueTask("安装选中Skills", async () => {
+      if (skillsRepairLoading) return;
+      const selected = Object.keys(selectedSkills).filter((k) => selectedSkills[k]);
+      if (!selected.length) {
+        setSkillsResult("请先勾选至少一个 skill");
+        return;
+      }
+      setSkillsRepairLoading(true);
+      setSkillsAction("install");
+      setSkillsResult("安装任务已开始，请稍候...");
+      setSkillsRepairProgress(null);
+      setSkillsRepairProgressLog([]);
+      const unlisten = await listen<SkillsRepairProgressEvent>("skills-repair-progress", (e) => {
+        const payload = e.payload;
+        if (!payload) return;
+        setSkillsRepairProgress(payload);
+        setSkillsRepairProgressLog((prev) => {
+          const line = `[${payload.current}/${payload.total}] ${payload.skill}: ${payload.message}`;
+          const next = [...prev, line];
+          return next.length > 120 ? next.slice(-120) : next;
+        });
+      });
+      try {
+        const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+        const result = await invoke<string>("install_selected_skills", {
+          skillNames: selected,
+          customPath: normalizeConfigPath(customConfigPath) || undefined,
+          installHint,
+        });
+        const text = clampLogText(result || "").trim();
+        setSkillsResult(text || "安装任务已完成（无详细日志返回）");
+        await loadSkillsCatalog();
+      } catch (e) {
+        setSkillsResult(`安装失败: ${e}`);
+        setTicketSummary(makeTicketSummary("安装选中Skills", e, "install_selected_skills"));
+        throw e;
+      } finally {
+        unlisten();
+        setSkillsRepairLoading(false);
+        setSkillsAction(null);
+      }
+    });
+  };
+
   const handleRepairSelectedSkills = async () => {
     enqueueTask("修复选中Skills", async () => {
       if (skillsRepairLoading) return;
@@ -1558,7 +1642,8 @@ function App() {
         return;
       }
       setSkillsRepairLoading(true);
-      setSkillsResult(null);
+      setSkillsAction("repair");
+      setSkillsResult("修复任务已开始，请稍候...");
       setSkillsRepairProgress(null);
       setSkillsRepairProgressLog([]);
       const unlisten = await listen<SkillsRepairProgressEvent>("skills-repair-progress", (e) => {
@@ -1578,7 +1663,8 @@ function App() {
           customPath: normalizeConfigPath(customConfigPath) || undefined,
           installHint,
         });
-        setSkillsResult(clampLogText(result));
+        const text = clampLogText(result || "").trim();
+        setSkillsResult(text || "修复任务已完成（无详细日志返回）");
         await loadSkillsCatalog();
       } catch (e) {
         setSkillsResult(`修复失败: ${e}`);
@@ -1587,6 +1673,7 @@ function App() {
       } finally {
         unlisten();
         setSkillsRepairLoading(false);
+        setSkillsAction(null);
       }
     });
   };
@@ -1932,7 +2019,7 @@ function App() {
                     setProvider(next);
                     if (next === "kimi") {
                       setBaseUrl(DEFAULT_KIMI_BASE_URL);
-                      setSelectedModel("moonshot/kimi-k2-turbo-preview");
+                      setSelectedModel("moonshotai/Kimi-K2-Instruct-0905");
                     } else if (next === "openai" || next === "deepseek" || next === "qwen") {
                       if (!baseUrl.trim() || baseUrl.trim() === DEFAULT_KIMI_BASE_URL) {
                         setBaseUrl(DEFAULT_OPENAI_BASE_URL);
@@ -2217,13 +2304,17 @@ function App() {
               </div>
             )}
             {exeCheckInfo && (
-              <div className="bg-slate-800/50 rounded-lg p-3 text-xs space-y-1">
+              <div className="bg-indigo-900/20 border border-indigo-700 rounded-lg p-3 text-xs space-y-1">
+                <p className="text-indigo-200 font-medium">路径锁定提示（自动）</p>
                 <p className={exeCheckInfo.exists ? "text-emerald-300" : "text-amber-300"}>
-                  可执行路径检测：{exeCheckInfo.exists ? "已找到" : "未找到"}
+                  可执行：{exeCheckInfo.executable || "未解析到 openclaw.cmd"}
                 </p>
-                <p className="text-slate-300">当前路径：{exeCheckInfo.executable || "未解析到 openclaw.cmd"}</p>
-                <p className="text-slate-400">来源：{exeCheckInfo.source}</p>
-                <p className="text-slate-400">{exeCheckInfo.detail}</p>
+                <p className="text-slate-300">
+                  配置目录：{normalizeConfigPath(customConfigPath) || "默认 (~/.openclaw)"}
+                </p>
+                <p className="text-slate-400">
+                  启动时会自动清理 18789 端口占用并固定使用上述路径，避免旧版本冲突。
+                </p>
               </div>
             )}
             <p className="text-slate-400">
@@ -2247,29 +2338,49 @@ function App() {
               )}
             </button>
             <button
-              onClick={handleStartForeground}
-              className="flex items-center gap-2 px-6 py-3 bg-slate-700 hover:bg-slate-600 rounded-lg font-medium text-sm"
+              onClick={handleOpenDashboard}
+              className="flex items-center gap-2 px-6 py-3 bg-sky-700 hover:bg-sky-600 rounded-lg font-medium text-sm"
             >
-              <Wrench className="w-5 h-5" />
-              前台启动 Gateway（计划任务失败时用）
+              <ExternalLink className="w-5 h-5" />
+              打开对话界面（带 token）
             </button>
-            <button
-              onClick={handleOpenSkillsOnboard}
-              disabled={onboardCliLoading}
-              className="flex items-center gap-2 px-6 py-3 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded-lg font-medium text-sm"
-            >
-              {onboardCliLoading ? (
-                <>
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                  打开中...
-                </>
-              ) : (
-                <>
-                  <Wrench className="w-5 h-5" />
-                  安装/更新官方 Skills（推荐）
-                </>
-              )}
-            </button>
+            <details className="bg-slate-900/40 border border-slate-700 rounded-lg p-3">
+              <summary className="cursor-pointer text-slate-300 text-sm">高级启动/修复选项（一般不用）</summary>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button
+                  onClick={handleResetGatewayAuth}
+                  disabled={starting}
+                  className="flex items-center gap-2 px-4 py-2 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs"
+                >
+                  <Wrench className="w-4 h-4" />
+                  强制重置认证/修复UI并重启
+                </button>
+                <button
+                  onClick={handleStartForeground}
+                  className="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                >
+                  <Wrench className="w-4 h-4" />
+                  前台启动 Gateway
+                </button>
+                <button
+                  onClick={handleOpenSkillsOnboard}
+                  disabled={onboardCliLoading}
+                  className="flex items-center gap-2 px-4 py-2 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-xs"
+                >
+                  {onboardCliLoading ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      打开中...
+                    </>
+                  ) : (
+                    <>
+                      <Wrench className="w-4 h-4" />
+                      安装/更新官方 Skills
+                    </>
+                  )}
+                </button>
+              </div>
+            </details>
             {startResult && (
               <pre className="bg-slate-800 rounded-lg p-4 text-sm overflow-auto max-h-40">
                 {startResult}
@@ -2453,13 +2564,33 @@ function App() {
                   选择可用项
                 </button>
                 <button
+                  onClick={handleInstallSelectedSkills}
+                  disabled={skillsRepairLoading || !skillsCatalog.length}
+                  className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-xs"
+                >
+                  {skillsRepairLoading && skillsAction === "install" ? "安装中..." : "安装选中"}
+                </button>
+                <button
                   onClick={handleRepairSelectedSkills}
                   disabled={skillsRepairLoading}
                   className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
                 >
-                  {skillsRepairLoading ? "修复中..." : "一键修复缺失依赖（选中）"}
+                  {skillsRepairLoading && skillsAction === "repair" ? "修复中..." : "修复缺失依赖（选中）"}
                 </button>
                 <button onClick={() => handleSkillsManage("update")} disabled={skillsLoading} className="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs">全量更新</button>
+              </div>
+              <div className="rounded-lg border border-slate-700 bg-slate-900/30 p-3 space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-300">Skills 执行日志</span>
+                  {skillsRepairLoading ? (
+                    <span className="text-sky-300">任务进行中...</span>
+                  ) : (
+                    <span className="text-slate-400">等待任务</span>
+                  )}
+                </div>
+                <pre className="rounded bg-slate-900/60 p-3 text-xs whitespace-pre-wrap max-h-44 overflow-auto">
+                  {(skillsRepairProgressLog.join("\n").trim() || (skillsResult || "").trim() || "暂无日志。点击“安装选中”或“修复缺失依赖（选中）”后，这里会实时显示执行输出。")}
+                </pre>
               </div>
               <div className="overflow-auto border border-slate-700 rounded-lg">
                 <table className="w-full min-w-[900px] text-xs">
@@ -2526,15 +2657,7 @@ function App() {
                       }}
                     />
                   </div>
-                  <pre className="bg-slate-900/40 rounded p-3 text-xs whitespace-pre-wrap max-h-28 overflow-auto">
-                    {skillsRepairProgressLog.join("\n")}
-                  </pre>
                 </div>
-              )}
-              {skillsResult && (
-                <pre className="bg-slate-900/40 rounded p-3 text-xs whitespace-pre-wrap max-h-48 overflow-auto">
-                  {skillsResult}
-                </pre>
               )}
             </div>
             <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">

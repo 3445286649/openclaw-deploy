@@ -1127,7 +1127,7 @@ $FIXED_SILICONFLOW_MODELS = @(
   @{ id = "deepseek-ai/DeepSeek-V3"; label = "DeepSeek V3（推荐）" },
   @{ id = "Qwen/Qwen2.5-72B-Instruct"; label = "Qwen2.5 72B" },
   @{ id = "GLM-4-9B-Chat"; label = "GLM-4-9B / GLM-5" },
-  @{ id = "moonshot/kimi-k2-turbo-preview"; label = "Kimi k2-turbo" },
+  @{ id = "moonshotai/Kimi-K2-Instruct-0905"; label = "Kimi K2（可对话）" },
   @{ id = "deepseek-ai/DeepSeek-R1"; label = "DeepSeek R1（备选）" }
 )
 

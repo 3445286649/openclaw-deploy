@@ -43,7 +43,7 @@ FIXED_MODELS=(
   "deepseek-ai/DeepSeek-V3:DeepSeek V3（推荐）"
   "Qwen/Qwen2.5-72B-Instruct:Qwen2.5 72B"
   "GLM-4-9B-Chat:GLM-4-9B / GLM-5"
-  "moonshot/kimi-k2-turbo-preview:Kimi k2-turbo"
+  "moonshotai/Kimi-K2-Instruct-0905:Kimi K2（可对话）"
   "deepseek-ai/DeepSeek-R1:DeepSeek R1（备选）"
 )
 DEFAULT_BASE_URL="https://api.siliconflow.cn/v1"
