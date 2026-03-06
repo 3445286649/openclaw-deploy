@@ -125,6 +125,15 @@ pub struct StartupMigrationResult {
     pub fixed_dirs: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MemoryCenterStatus {
+    pub enabled: bool,
+    pub memory_file_exists: bool,
+    pub memory_dir_exists: bool,
+    pub memory_file_count: usize,
+    pub note: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct SkillsListResp {
     skills: Vec<SkillRawItem>,
@@ -1183,6 +1192,7 @@ fn try_fix_missing_bin(bin: &str) -> Result<String, String> {
         "jq" => Some("jqlang.jq"),
         "rg" => Some("BurntSushi.ripgrep.MSVC"),
         "ffmpeg" => Some("Gyan.FFmpeg"),
+        "op" => Some("AgileBits.1Password.CLI"),
         _ => None,
     };
     if let Some(id) = pkg {
@@ -4218,6 +4228,238 @@ fn export_diagnostic_bundle(custom_path: Option<String>, install_hint: Option<St
     Ok(zip_path.to_string_lossy().to_string())
 }
 
+fn collect_memory_files_recursively(dir: &Path, files: &mut Vec<PathBuf>) {
+    if !dir.exists() || !dir.is_dir() {
+        return;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for ent in entries.flatten() {
+            let p = ent.path();
+            if p.is_dir() {
+                collect_memory_files_recursively(&p, files);
+            } else if p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("md"))
+                .unwrap_or(false)
+            {
+                files.push(p);
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn memory_center_status(custom_path: Option<String>) -> Result<MemoryCenterStatus, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let root = load_openclaw_config(&openclaw_dir).unwrap_or_else(|_| json!({}));
+    let enabled = root
+        .as_object()
+        .and_then(|o| o.get("agents"))
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("defaults"))
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("memorySearch"))
+        .and_then(|v| v.as_object())
+        .and_then(|o| o.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let ws = Path::new(&openclaw_dir).join("workspace");
+    let memory_file = ws.join("MEMORY.md");
+    let memory_dir = ws.join("memory");
+    let memory_file_exists = memory_file.exists();
+    let memory_dir_exists = memory_dir.exists() && memory_dir.is_dir();
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_memory_files_recursively(&memory_dir, &mut files);
+    let note = if !enabled {
+        "记忆已关闭（agents.defaults.memorySearch.enabled=false）".to_string()
+    } else if !memory_file_exists && files.is_empty() {
+        "尚未发现记忆文件。".to_string()
+    } else {
+        "记忆功能已启用。".to_string()
+    };
+    Ok(MemoryCenterStatus {
+        enabled,
+        memory_file_exists,
+        memory_dir_exists,
+        memory_file_count: files.len() + if memory_file_exists { 1 } else { 0 },
+        note,
+    })
+}
+
+#[tauri::command]
+fn memory_center_read(custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let ws = Path::new(&openclaw_dir).join("workspace");
+    let memory_file = ws.join("MEMORY.md");
+    let memory_dir = ws.join("memory");
+
+    let mut out = String::new();
+    if memory_file.exists() {
+        out.push_str("=== MEMORY.md ===\n");
+        if let Ok(text) = std::fs::read_to_string(&memory_file) {
+            let lines: Vec<&str> = text.lines().take(120).collect();
+            out.push_str(&lines.join("\n"));
+            if text.lines().count() > 120 {
+                out.push_str("\n...(已截断)\n");
+            }
+        } else {
+            out.push_str("(读取失败)\n");
+        }
+        out.push('\n');
+    } else {
+        out.push_str("=== MEMORY.md ===\n(不存在)\n\n");
+    }
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_memory_files_recursively(&memory_dir, &mut files);
+    files.sort();
+    out.push_str("=== memory/*.md ===\n");
+    if files.is_empty() {
+        out.push_str("(无)\n");
+    } else {
+        for p in files.iter().take(80) {
+            out.push_str("- ");
+            out.push_str(&p.to_string_lossy().replace('\\', "/"));
+            out.push('\n');
+        }
+        if files.len() > 80 {
+            out.push_str(&format!("...(其余 {} 个已省略)\n", files.len() - 80));
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn memory_center_clear(custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let ws = Path::new(&openclaw_dir).join("workspace");
+    let memory_file = ws.join("MEMORY.md");
+    let memory_dir = ws.join("memory");
+    let mut removed: Vec<String> = Vec::new();
+
+    if memory_file.exists() {
+        std::fs::remove_file(&memory_file).map_err(|e| format!("删除 MEMORY.md 失败: {}", e))?;
+        removed.push("MEMORY.md".to_string());
+    }
+    if memory_dir.exists() {
+        std::fs::remove_dir_all(&memory_dir).map_err(|e| format!("删除 memory 目录失败: {}", e))?;
+        removed.push("memory/".to_string());
+    }
+    if removed.is_empty() {
+        Ok("没有可清空的记忆文件".to_string())
+    } else {
+        Ok(format!("已清空记忆：{}", removed.join(", ")))
+    }
+}
+
+#[tauri::command]
+fn memory_center_export(custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let ws = Path::new(&openclaw_dir).join("workspace");
+    let memory_file = ws.join("MEMORY.md");
+    let memory_dir = ws.join("memory");
+    let out_dir = Path::new(&openclaw_dir).join("diagnostics");
+    std::fs::create_dir_all(&out_dir).map_err(|e| format!("创建 diagnostics 目录失败: {}", e))?;
+    let stamp = now_stamp();
+    let export_path = out_dir.join(format!("memory-export-{}.txt", stamp));
+
+    let mut text = String::new();
+    text.push_str("=== OpenClaw Memory Export ===\n");
+    text.push_str(&format!("time_unix: {}\n", stamp));
+    text.push_str(&format!("config_dir: {}\n\n", openclaw_dir));
+
+    if memory_file.exists() {
+        text.push_str("## MEMORY.md\n");
+        match std::fs::read_to_string(&memory_file) {
+            Ok(t) => text.push_str(&t),
+            Err(e) => text.push_str(&format!("(读取失败: {})\n", e)),
+        }
+        text.push_str("\n\n");
+    }
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_memory_files_recursively(&memory_dir, &mut files);
+    files.sort();
+    for p in files {
+        text.push_str("## ");
+        text.push_str(&p.to_string_lossy().replace('\\', "/"));
+        text.push('\n');
+        match std::fs::read_to_string(&p) {
+            Ok(t) => text.push_str(&t),
+            Err(e) => text.push_str(&format!("(读取失败: {})\n", e)),
+        }
+        text.push_str("\n\n");
+    }
+
+    std::fs::write(&export_path, text).map_err(|e| format!("写入导出文件失败: {}", e))?;
+    Ok(export_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn memory_center_bootstrap(custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let ws = Path::new(&openclaw_dir).join("workspace");
+    std::fs::create_dir_all(&ws).map_err(|e| format!("创建 workspace 失败: {}", e))?;
+    let memory_file = ws.join("MEMORY.md");
+    let memory_dir = ws.join("memory");
+    std::fs::create_dir_all(&memory_dir).map_err(|e| format!("创建 memory 目录失败: {}", e))?;
+
+    let mut created = Vec::new();
+    if !memory_file.exists() {
+        let tpl = [
+            "# 长期记忆",
+            "",
+            "## 用户偏好",
+            "- 使用中文（简体）交流。",
+            "",
+            "## 当前目标",
+            "- 在此记录长期稳定信息，便于下次快速恢复上下文。",
+            "",
+            "## 注意",
+            "- 不要写入 API Key、密码等敏感信息。",
+            "",
+        ]
+        .join("\n");
+        std::fs::write(&memory_file, tpl).map_err(|e| format!("写入 MEMORY.md 失败: {}", e))?;
+        created.push("MEMORY.md".to_string());
+    }
+    let profile_file = memory_dir.join("profile.md");
+    if !profile_file.exists() {
+        let tpl = [
+            "# 用户画像",
+            "",
+            "- 行业：",
+            "- 常用场景：",
+            "- 输出偏好：",
+            "",
+        ]
+        .join("\n");
+        std::fs::write(&profile_file, tpl).map_err(|e| format!("写入 profile.md 失败: {}", e))?;
+        created.push("memory/profile.md".to_string());
+    }
+
+    let install_hint_norm = Some(openclaw_dir.replace('\\', "/"));
+    let exe = find_openclaw_executable(install_hint_norm.as_deref())
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+    let mut index_msg = "索引未执行".to_string();
+    if let Ok((ok, out, err)) = run_openclaw_cmd_clean(&exe, &["memory", "index"], env_extra) {
+        if ok {
+            index_msg = "已触发 memory index".to_string();
+        } else if !out.trim().is_empty() || !err.trim().is_empty() {
+            index_msg = format!("memory index 返回：{}\n{}", out, err);
+        }
+    }
+
+    if created.is_empty() {
+        Ok(format!("记忆文件已存在，无需初始化。\n{}", index_msg))
+    } else {
+        Ok(format!("已初始化记忆文件：{}\n{}", created.join(", "), index_msg))
+    }
+}
+
 #[tauri::command]
 fn auto_install_channel_plugins(
     app: tauri::AppHandle,
@@ -4365,6 +4607,30 @@ fn list_skills_catalog(custom_path: Option<String>, install_hint: Option<String>
     Ok(items)
 }
 
+fn summarize_skill_missing(m: &SkillMissing) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !m.bins.is_empty() {
+        parts.push(format!("bins:{}", m.bins.join(",")));
+    }
+    if !m.any_bins.is_empty() {
+        parts.push(format!("any:{}", m.any_bins.join(",")));
+    }
+    if !m.env.is_empty() {
+        parts.push(format!("env:{}", m.env.join(",")));
+    }
+    if !m.config.is_empty() {
+        parts.push(format!("cfg:{}", m.config.join(",")));
+    }
+    if !m.os.is_empty() {
+        parts.push(format!("os:{}", m.os.join(",")));
+    }
+    if parts.is_empty() {
+        "无".to_string()
+    } else {
+        parts.join(" | ")
+    }
+}
+
 #[tauri::command]
 fn repair_selected_skills(
     app: tauri::AppHandle,
@@ -4386,6 +4652,7 @@ fn repair_selected_skills(
         .into_iter()
         .filter(|s| skill_names.iter().any(|n| n.eq_ignore_ascii_case(&s.name)))
         .collect();
+    let selected_names: Vec<String> = selected.iter().map(|s| s.name.clone()).collect();
     let total = selected.len().max(1);
     let mut idx = 0usize;
     let mut logs: Vec<String> = Vec::new();
@@ -4507,6 +4774,23 @@ fn repair_selected_skills(
     if !ck_ok && !ck_err.trim().is_empty() {
         logs.push(ck_err);
     }
+    let post_catalog = list_skills_catalog(Some(openclaw_dir.clone()), install_hint.clone()).unwrap_or_default();
+    logs.push("\n[修复后状态]".to_string());
+    for n in selected_names {
+        if let Some(it) = post_catalog.iter().find(|x| x.name.eq_ignore_ascii_case(&n)) {
+            if it.eligible {
+                logs.push(format!("{}: 可用", it.name));
+            } else {
+                logs.push(format!(
+                    "{}: 仍缺失（自动修复仅覆盖 bins/部分 anyBins） -> {}",
+                    it.name,
+                    summarize_skill_missing(&it.missing)
+                ));
+            }
+        } else {
+            logs.push(format!("{}: 未在当前 skills 列表中找到（可能名称变更）", n));
+        }
+    }
     let _ = app.emit(
         "skills-repair-progress",
         json!({"skill": "summary", "status": "done", "current": total, "total": total, "message": "全部处理完成"}),
@@ -4540,6 +4824,7 @@ fn install_selected_skills(
     }
 
     let catalog = list_skills_catalog(Some(openclaw_dir.clone()), install_hint.clone()).unwrap_or_default();
+    let selected_names = selected.clone();
     let total = selected.len();
     let mut logs: Vec<String> = Vec::new();
     let mut idx = 0usize;
@@ -4610,6 +4895,23 @@ fn install_selected_skills(
     logs.push(ck_out);
     if !ck_ok && !ck_err.trim().is_empty() {
         logs.push(ck_err);
+    }
+    let post_catalog = list_skills_catalog(Some(openclaw_dir.clone()), install_hint.clone()).unwrap_or_default();
+    logs.push("\n[安装后状态]".to_string());
+    for n in selected_names {
+        if let Some(it) = post_catalog.iter().find(|x| x.name.eq_ignore_ascii_case(&n)) {
+            if it.eligible {
+                logs.push(format!("{}: 可用", it.name));
+            } else {
+                logs.push(format!(
+                    "{}: 仍缺失（可能需要手动配置） -> {}",
+                    it.name,
+                    summarize_skill_missing(&it.missing)
+                ));
+            }
+        } else {
+            logs.push(format!("{}: 未在当前 skills 列表中找到（可能名称变更）", n));
+        }
     }
     Ok(logs.join("\n"))
 }
@@ -4819,6 +5121,35 @@ fn run_self_check(custom_path: Option<String>, install_hint: Option<String>) -> 
             suggestion.to_string()
         },
     });
+
+    let (v_ok, v_out, v_err) = run_openclaw_cmd_clean(&exe, &["--version"], env_extra)?;
+    let version_text = v_out.trim().to_string();
+    let mut version_status = if v_ok && !version_text.is_empty() {
+        "ok".to_string()
+    } else if v_ok {
+        "warn".to_string()
+    } else {
+        "error".to_string()
+    };
+    let mut version_detail = if version_text.is_empty() {
+        format!("版本读取输出为空\n{}", v_err.trim())
+    } else {
+        format!("当前版本: {}", version_text)
+    };
+    let (_s_ok, s_out, s_err) = run_openclaw_cmd_clean(&exe, &["status"], env_extra)?;
+    let status_all = format!("{}\n{}", s_out, s_err).to_lowercase();
+    if status_all.contains("update available") || status_all.contains("latest") && status_all.contains("current v") {
+        if version_status == "ok" {
+            version_status = "warn".to_string();
+        }
+        version_detail.push_str("\n检测到可能存在更新，建议执行升级并重启 Gateway。");
+    }
+    items.push(SelfCheckItem {
+        key: "version".to_string(),
+        label: "版本一致性".to_string(),
+        status: version_status,
+        detail: version_detail,
+    });
     Ok(items)
 }
 
@@ -4958,6 +5289,12 @@ fn fix_self_check_item(
             let _ = run_openclaw_cmd_clean(&exe, &["gateway", "install", "--force"], env_extra);
             Ok("已尝试修复配置路径并重装 Gateway 任务".to_string())
         }
+        "version" => {
+            let _ = run_openclaw_cmd_clean(&exe, &["gateway", "install", "--force"], env_extra);
+            let _ = run_openclaw_cmd_clean(&exe, &["gateway", "stop"], env_extra);
+            thread::sleep(Duration::from_secs(2));
+            start_gateway(Some(openclaw_dir.clone()), install_hint.clone())
+        }
         _ => Err("未知修复项".to_string()),
     }
 }
@@ -5031,6 +5368,11 @@ pub fn run() {
             repair_selected_skills,
             install_selected_skills,
             run_startup_migrations,
+            memory_center_status,
+            memory_center_read,
+            memory_center_clear,
+            memory_center_export,
+            memory_center_bootstrap,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

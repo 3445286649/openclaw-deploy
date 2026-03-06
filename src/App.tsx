@@ -12,6 +12,10 @@ import {
   Play,
   ExternalLink,
   Wrench,
+  SlidersHorizontal,
+  Sparkles,
+  Brain,
+  ShieldCheck,
 } from "lucide-react";
 
 interface EnvCheckResult {
@@ -113,6 +117,44 @@ interface SkillCatalogItem {
   missing: SkillMissing;
 }
 
+function hasManualSkillGaps(s: SkillCatalogItem): boolean {
+  return s.missing.env.length > 0 || s.missing.config.length > 0 || s.missing.os.length > 0;
+}
+
+function isAutoFixableSkill(s: SkillCatalogItem): boolean {
+  if (s.eligible) return false;
+  if (hasManualSkillGaps(s)) return false;
+  return s.missing.bins.length > 0 || s.missing.any_bins.length > 0;
+}
+
+function buildManualFixHint(s: SkillCatalogItem): string {
+  const lines: string[] = [`Skill: ${s.name}`];
+  if (s.missing.env.length) {
+    lines.push(`环境变量: ${s.missing.env.join(", ")}`);
+    for (const key of s.missing.env) {
+      lines.push(`export ${key}=<your_value>`);
+    }
+  }
+  if (s.missing.config.length) {
+    lines.push(`配置项: ${s.missing.config.join(", ")}`);
+  }
+  if (s.missing.os.length) {
+    lines.push(`平台限制: ${s.missing.os.join(", ")}`);
+  }
+  if (!s.missing.env.length && !s.missing.config.length && !s.missing.os.length) {
+    lines.push("未检测到需手动处理项。");
+  }
+  return lines.join("\n");
+}
+
+type QuickMode = "stable" | "balanced" | "performance";
+type TuneLength = "short" | "medium" | "long";
+type TuneTone = "professional" | "friendly" | "concise";
+type TuneProactivity = "low" | "balanced" | "high";
+type TunePermission = "suggest" | "confirm" | "auto_low_risk";
+type MemoryMode = "off" | "session" | "long";
+type ScenarioPreset = "none" | "customer_support" | "short_video" | "office" | "developer";
+
 interface SkillsRepairProgressEvent {
   skill: string;
   status: string;
@@ -124,6 +166,14 @@ interface SkillsRepairProgressEvent {
 interface StartupMigrationResult {
   fixed_count: number;
   fixed_dirs: string[];
+}
+
+interface MemoryCenterStatus {
+  enabled: boolean;
+  memory_file_exists: boolean;
+  memory_dir_exists: boolean;
+  memory_file_count: number;
+  note: string;
 }
 
 type QueueTaskStatus = "queued" | "running" | "done" | "error" | "cancelled";
@@ -244,6 +294,7 @@ const STEPS = [
   { id: 1, title: "安装 OpenClaw", icon: Download },
   { id: 2, title: "配置 AI 模型", icon: Key },
   { id: 3, title: "启动服务", icon: Play },
+  { id: 4, title: "调教中心", icon: SlidersHorizontal },
 ];
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.siliconflow.cn/v1";
@@ -397,6 +448,26 @@ function App() {
 
   const [fixing, setFixing] = useState<"node" | "npm" | "git" | "openclaw" | null>(null);
   const [fixResult, setFixResult] = useState<string | null>(null);
+  const [quickMode, setQuickMode] = useState<QuickMode>("stable");
+  const [scenarioPreset, setScenarioPreset] = useState<ScenarioPreset>("none");
+  const [tuneLength, setTuneLength] = useState<TuneLength>("medium");
+  const [tuneTone, setTuneTone] = useState<TuneTone>("professional");
+  const [tuneProactivity, setTuneProactivity] = useState<TuneProactivity>("balanced");
+  const [tunePermission, setTunePermission] = useState<TunePermission>("confirm");
+  const [memoryMode, setMemoryMode] = useState<MemoryMode>("session");
+  const [memoryStatus, setMemoryStatus] = useState<MemoryCenterStatus | null>(null);
+  const [memorySummary, setMemorySummary] = useState<string | null>(null);
+  const [memoryLoading, setMemoryLoading] = useState(false);
+  const [memoryActionLoading, setMemoryActionLoading] = useState<"read" | "clear" | "export" | "init" | null>(null);
+  const [tuningActionLoading, setTuningActionLoading] = useState<"check" | "heal" | null>(null);
+  const [wizardOpen, setWizardOpen] = useState(false);
+  const [wizardUseCase, setWizardUseCase] = useState<ScenarioPreset>("customer_support");
+  const [wizardTone, setWizardTone] = useState<TuneTone>("friendly");
+  const [wizardMemory, setWizardMemory] = useState<MemoryMode>("session");
+  const consistencyGuardRanRef = useRef(false);
+  const selectedSkillItems = skillsCatalog.filter((s) => !!selectedSkills[s.name]);
+  const selectedManualSkillItems = selectedSkillItems.filter((s) => hasManualSkillGaps(s));
+  const selectedAutoFixableItems = selectedSkillItems.filter((s) => isAutoFixableSkill(s));
   const loadedStepDataRef = useRef<{ install: boolean; model: boolean; channel: boolean }>({
     install: false,
     model: false,
@@ -436,6 +507,57 @@ function App() {
     }
     runEnvCheck(savedInstall || undefined);
   }, []);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem("openclaw_tuning_prefs");
+      if (!raw) return;
+      const p = JSON.parse(raw) as Partial<{
+        quickMode: QuickMode;
+        scenarioPreset: ScenarioPreset;
+        tuneLength: TuneLength;
+        tuneTone: TuneTone;
+        tuneProactivity: TuneProactivity;
+        tunePermission: TunePermission;
+        memoryMode: MemoryMode;
+      }>;
+      if (p.quickMode) setQuickMode(p.quickMode);
+      if (p.scenarioPreset) setScenarioPreset(p.scenarioPreset);
+      if (p.tuneLength) setTuneLength(p.tuneLength);
+      if (p.tuneTone) setTuneTone(p.tuneTone);
+      if (p.tuneProactivity) setTuneProactivity(p.tuneProactivity);
+      if (p.tunePermission) setTunePermission(p.tunePermission);
+      if (p.memoryMode) setMemoryMode(p.memoryMode);
+    } catch {
+      // ignore invalid local cache
+    }
+  }, []);
+
+  useEffect(() => {
+    const payload = {
+      quickMode,
+      scenarioPreset,
+      tuneLength,
+      tuneTone,
+      tuneProactivity,
+      tunePermission,
+      memoryMode,
+    };
+    localStorage.setItem("openclaw_tuning_prefs", JSON.stringify(payload));
+  }, [quickMode, scenarioPreset, tuneLength, tuneTone, tuneProactivity, tunePermission, memoryMode]);
+
+  useEffect(() => {
+    const done = localStorage.getItem("openclaw_easy_onboarding_done");
+    if (!done) {
+      setWizardOpen(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (step < 3 || consistencyGuardRanRef.current) return;
+    consistencyGuardRanRef.current = true;
+    void runSelfCheck();
+  }, [step]);
 
   const enqueueTask = (
     name: string,
@@ -612,6 +734,9 @@ function App() {
     if (step >= 3 && !loadedStepDataRef.current.channel) {
       loadedStepDataRef.current.channel = true;
       void Promise.all([loadSavedChannels(cfgPath), loadSnapshots()]);
+    }
+    if (step >= 4) {
+      void refreshMemoryCenterStatus();
     }
   }, [step]);
 
@@ -1733,6 +1858,248 @@ function App() {
     }
   };
 
+  const applyQuickModePreset = (mode: QuickMode) => {
+    setQuickMode(mode);
+    if (mode === "stable") {
+      setProvider("openai");
+      setBaseUrl(DEFAULT_OPENAI_BASE_URL);
+      setSelectedModel("deepseek-ai/DeepSeek-V3");
+      setMemoryMode("session");
+      setTunePermission("confirm");
+      setTuneProactivity("balanced");
+    } else if (mode === "balanced") {
+      setProvider("openai");
+      setBaseUrl(DEFAULT_OPENAI_BASE_URL);
+      setSelectedModel("Qwen/Qwen2.5-72B-Instruct");
+      setMemoryMode("session");
+      setTunePermission("confirm");
+      setTuneProactivity("balanced");
+    } else {
+      setProvider("openai");
+      setBaseUrl(DEFAULT_OPENAI_BASE_URL);
+      setSelectedModel("deepseek-ai/DeepSeek-R1");
+      setMemoryMode("long");
+      setTunePermission("auto_low_risk");
+      setTuneProactivity("high");
+    }
+    setSaveResult("已套用快速模式，请点击“保存配置”使模型设置生效。");
+  };
+
+  const applyScenarioPreset = (preset: ScenarioPreset) => {
+    setScenarioPreset(preset);
+    if (preset === "customer_support") {
+      setTuneTone("friendly");
+      setTuneLength("short");
+      setTuneProactivity("low");
+      setTunePermission("confirm");
+    } else if (preset === "short_video") {
+      setTuneTone("friendly");
+      setTuneLength("medium");
+      setTuneProactivity("high");
+      setTunePermission("confirm");
+    } else if (preset === "office") {
+      setTuneTone("professional");
+      setTuneLength("medium");
+      setTuneProactivity("balanced");
+      setTunePermission("confirm");
+    } else if (preset === "developer") {
+      setTuneTone("concise");
+      setTuneLength("long");
+      setTuneProactivity("balanced");
+      setTunePermission("auto_low_risk");
+    }
+    setSkillsResult("已应用场景模板（行为偏好已更新）。");
+  };
+
+  const refreshMemoryCenterStatus = async () => {
+    setMemoryLoading(true);
+    try {
+      const status = await invoke<MemoryCenterStatus>("memory_center_status", {
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+      });
+      setMemoryStatus(status);
+    } catch (e) {
+      setMemorySummary(`读取记忆状态失败: ${e}`);
+    } finally {
+      setMemoryLoading(false);
+    }
+  };
+
+  const handleReadMemorySummary = async () => {
+    setMemoryActionLoading("read");
+    try {
+      const text = await invoke<string>("memory_center_read", {
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+      });
+      setMemorySummary(clampLogText(text || ""));
+      await refreshMemoryCenterStatus();
+    } catch (e) {
+      setMemorySummary(`读取记忆摘要失败: ${e}`);
+    } finally {
+      setMemoryActionLoading(null);
+    }
+  };
+
+  const handleClearMemory = async () => {
+    setMemoryActionLoading("clear");
+    try {
+      const result = await invoke<string>("memory_center_clear", {
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+      });
+      setMemorySummary(result);
+      await refreshMemoryCenterStatus();
+    } catch (e) {
+      setMemorySummary(`清空记忆失败: ${e}`);
+    } finally {
+      setMemoryActionLoading(null);
+    }
+  };
+
+  const handleExportMemory = async () => {
+    setMemoryActionLoading("export");
+    try {
+      const result = await invoke<string>("memory_center_export", {
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+      });
+      setMemorySummary(`记忆导出成功：${result}`);
+    } catch (e) {
+      setMemorySummary(`导出记忆失败: ${e}`);
+    } finally {
+      setMemoryActionLoading(null);
+    }
+  };
+
+  const handleInitMemory = async () => {
+    setMemoryActionLoading("init");
+    try {
+      const result = await invoke<string>("memory_center_bootstrap", {
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+      });
+      setMemorySummary(result);
+      await Promise.all([refreshMemoryCenterStatus(), handleReadMemorySummary()]);
+    } catch (e) {
+      setMemorySummary(`初始化记忆失败: ${e}`);
+    } finally {
+      setMemoryActionLoading(null);
+    }
+  };
+
+  const handleTuningHealthCheck = async () => {
+    if (tuningActionLoading) return;
+    setTuningActionLoading("check");
+    try {
+      const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+      const items = await invoke<SelfCheckItem[]>("run_self_check", {
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+        installHint,
+      });
+      setSelfCheckItems(items || []);
+      await Promise.all([
+        loadSkillsCatalog(),
+        refreshAllChannelHealth(),
+      ]);
+      await probeRuntimeModelConnection();
+      setSelfCheckResult("调教中心体检完成");
+    } catch (e) {
+      setSelfCheckResult(`体检失败: ${e}`);
+    } finally {
+      setTuningActionLoading(null);
+    }
+  };
+
+  const handleTuningSelfHeal = async () => {
+    if (tuningActionLoading) return;
+    setTuningActionLoading("heal");
+    try {
+      const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const minimal = await invoke<string>("run_minimal_repair", {
+        customPath: cfgPath,
+        installHint,
+      });
+      let resetMsg = "";
+      try {
+        resetMsg = await invoke<string>("reset_gateway_auth_and_restart", {
+          customPath: cfgPath,
+          installHint,
+        });
+      } catch (e) {
+        resetMsg = `网关重置跳过/失败: ${e}`;
+      }
+      setSelfCheckResult(clampLogText(`一键修复完成\n\n[最小修复]\n${minimal}\n\n[网关修复]\n${resetMsg}`));
+      await Promise.all([loadSkillsCatalog(), refreshAllChannelHealth(), refreshMemoryCenterStatus()]);
+      await probeRuntimeModelConnection();
+    } catch (e) {
+      setSelfCheckResult(`一键修复失败: ${e}`);
+    } finally {
+      setTuningActionLoading(null);
+    }
+  };
+
+  const tuningPromptPreview = [
+    `场景模板: ${scenarioPreset}`,
+    `回答长度: ${tuneLength}`,
+    `语气风格: ${tuneTone}`,
+    `主动性: ${tuneProactivity}`,
+    `执行权限: ${tunePermission}`,
+    `记忆策略: ${memoryMode}`,
+    "说明: 该模板用于小白引导，当前版本先用于配置记录与可视化，不直接改写 OpenClaw 内核提示词。",
+  ].join("\n");
+
+  const completeWizard = () => {
+    applyScenarioPreset(wizardUseCase);
+    setTuneTone(wizardTone);
+    setMemoryMode(wizardMemory);
+    if (wizardUseCase === "developer") {
+      applyQuickModePreset("performance");
+    } else {
+      applyQuickModePreset("stable");
+    }
+    localStorage.setItem("openclaw_easy_onboarding_done", "1");
+    setWizardOpen(false);
+    setStep(4);
+    setSelfCheckResult("已完成首次向导：建议点击“一键体检”确认环境状态。");
+  };
+
+  const globalGatewayState: HealthState = selfCheckItems.find((x) => x.key === "gateway")?.status === "ok"
+    ? "ok"
+    : selfCheckItems.find((x) => x.key === "gateway")
+    ? "warn"
+    : "unknown";
+  const globalModelState: HealthState = runtimeProbeResult?.includes("失败")
+    ? "error"
+    : runtimeProbeResult
+    ? "ok"
+    : "unknown";
+  const globalMemoryState: HealthState = memoryStatus?.enabled
+    ? memoryStatus.memory_file_count > 0
+      ? "ok"
+      : "warn"
+    : "warn";
+  const globalSkillsState: HealthState = skillsCatalog.length
+    ? skillsCatalog.some((s) => s.eligible)
+      ? "ok"
+      : "warn"
+    : "unknown";
+  const globalChannelState: HealthState = telegramHealth.gateway === "ok" || feishuHealth.gateway === "ok" || qqHealth.gateway === "ok" || discordHealth.gateway === "ok" || dingtalkHealth.gateway === "ok"
+    ? "ok"
+    : "warn";
+
+  const latestIssueText =
+    (selfCheckResult || "") +
+    "\n" +
+    (startResult || "") +
+    "\n" +
+    (modelTestResult || "") +
+    "\n" +
+    (skillsResult || "");
+  const lowerIssue = latestIssueText.toLowerCase();
+  const suggestModelFix = lowerIssue.includes("model") || lowerIssue.includes("401") || lowerIssue.includes("api key");
+  const suggestGatewayFix = lowerIssue.includes("token mismatch") || lowerIssue.includes("gateway") || lowerIssue.includes("端口");
+  const suggestSkillsFix = lowerIssue.includes("skills") || lowerIssue.includes("缺失依赖") || lowerIssue.includes("bins:");
+  const configGuardItem = selfCheckItems.find((x) => x.key === "config" && x.status !== "ok");
+  const versionGuardItem = selfCheckItems.find((x) => x.key === "version" && x.status !== "ok");
+
   const envReady = nodeCheck?.ok && npmCheck?.ok;
   const canProceed = step === 0 ? envReady : true;
 
@@ -1768,8 +2135,54 @@ function App() {
         ))}
       </div>
 
+      <div className="px-6 py-3 border-b border-slate-700 bg-slate-900/40 flex flex-wrap items-center gap-2 text-xs">
+        <span className="text-slate-400">当前可用性：</span>
+        <MiniLamp label="模型" state={globalModelState} />
+        <MiniLamp label="网关" state={globalGatewayState} />
+        <MiniLamp label="记忆" state={globalMemoryState} />
+        <MiniLamp label="Skills" state={globalSkillsState} />
+        <MiniLamp label="渠道" state={globalChannelState} />
+        <button
+          onClick={handleTuningHealthCheck}
+          className="ml-auto px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded"
+        >
+          快速体检
+        </button>
+      </div>
+
       {/* Content */}
       <main className="flex-1 p-6 overflow-auto">
+        {(suggestModelFix || suggestGatewayFix || suggestSkillsFix) && (
+          <div className="w-full max-w-[1200px] mx-auto mb-4 rounded-lg border border-amber-700 bg-amber-900/20 p-3 text-xs space-y-2">
+            <p className="text-amber-200">检测到可能异常，建议下一步：</p>
+            <div className="flex flex-wrap gap-2">
+              {suggestModelFix && (
+                <button
+                  onClick={() => setStep(2)}
+                  className="px-2 py-1 bg-sky-700 hover:bg-sky-600 rounded"
+                >
+                  去模型配置
+                </button>
+              )}
+              {suggestGatewayFix && (
+                <button
+                  onClick={handleResetGatewayAuth}
+                  className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded"
+                >
+                  一键修复网关
+                </button>
+              )}
+              {suggestSkillsFix && (
+                <button
+                  onClick={() => setStep(3)}
+                  className="px-2 py-1 bg-amber-700 hover:bg-amber-600 rounded"
+                >
+                  去 Skills 修复
+                </button>
+              )}
+            </div>
+          </div>
+        )}
         {/* Step 0: 环境检测 */}
         {step === 0 && (
           <div className="w-full max-w-[1200px] mx-auto space-y-6">
@@ -2447,6 +2860,33 @@ function App() {
                   </button>
                 </div>
               </div>
+              {(configGuardItem || versionGuardItem) && (
+                <div className="rounded border border-amber-700 bg-amber-900/20 p-3 text-xs space-y-2">
+                  <p className="text-amber-200">检测到版本/配置一致性异常，建议先处理再继续调教。</p>
+                  {configGuardItem && <p className="text-slate-300">配置异常：{configGuardItem.detail}</p>}
+                  {versionGuardItem && <p className="text-slate-300">版本提示：{versionGuardItem.detail}</p>}
+                  <div className="flex flex-wrap gap-2">
+                    {configGuardItem && (
+                      <button
+                        onClick={() => handleFixSelfCheck("config")}
+                        disabled={selfCheckFixingKey === "config"}
+                        className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded"
+                      >
+                        {selfCheckFixingKey === "config" ? "修复中..." : "修复配置一致性"}
+                      </button>
+                    )}
+                    {versionGuardItem && (
+                      <button
+                        onClick={() => handleFixSelfCheck("version")}
+                        disabled={selfCheckFixingKey === "version"}
+                        className="px-2 py-1 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded"
+                      >
+                        {selfCheckFixingKey === "version" ? "处理中..." : "执行版本守护"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
               {!!selfCheckItems.length && (
                 <div className="space-y-2">
                   {selfCheckItems.map((item) => (
@@ -2564,6 +3004,17 @@ function App() {
                   选择可用项
                 </button>
                 <button
+                  onClick={() =>
+                    setSelectedSkills(
+                      Object.fromEntries(skillsCatalog.map((s) => [s.name, isAutoFixableSkill(s)]))
+                    )
+                  }
+                  disabled={!skillsCatalog.length}
+                  className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                >
+                  仅选可自动修复
+                </button>
+                <button
                   onClick={handleInstallSelectedSkills}
                   disabled={skillsRepairLoading || !skillsCatalog.length}
                   className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-xs"
@@ -2579,6 +3030,39 @@ function App() {
                 </button>
                 <button onClick={() => handleSkillsManage("update")} disabled={skillsLoading} className="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs">全量更新</button>
               </div>
+              <p className="text-xs text-slate-400">
+                自动修复白名单：目前主要覆盖 <code>bins</code>（如 jq/rg/ffmpeg/op）与部分 <code>anyBins</code>。
+                <code>env/config/os</code> 属于手动项（需要你填写密钥、渠道配置或更换系统平台）。
+              </p>
+              {!!selectedSkillItems.length && (
+                <div className="rounded-lg border border-slate-700 bg-slate-900/30 p-3 text-xs space-y-1">
+                  <p className="text-slate-300">
+                    已选 {selectedSkillItems.length} 项：可自动修复 {selectedAutoFixableItems.length} 项，需手动处理{" "}
+                    {selectedManualSkillItems.length} 项。
+                  </p>
+                  {!!selectedManualSkillItems.length && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="text-amber-300">
+                        需手动项通常是缺环境变量/渠道配置/平台限制，程序无法自动补全。
+                      </p>
+                      <button
+                        onClick={async () => {
+                          const text = selectedManualSkillItems.map((s) => buildManualFixHint(s)).join("\n\n-----\n\n");
+                          try {
+                            await navigator.clipboard.writeText(text);
+                            setSkillsResult("已复制“需手动处理”清单到剪贴板");
+                          } catch {
+                            setSkillsResult(`复制失败，请手动复制：\n\n${text}`);
+                          }
+                        }}
+                        className="px-2 py-1 bg-amber-700 hover:bg-amber-600 rounded"
+                      >
+                        复制手动修复清单
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="rounded-lg border border-slate-700 bg-slate-900/30 p-3 space-y-2">
                 <div className="flex items-center justify-between text-xs">
                   <span className="text-slate-300">Skills 执行日志</span>
@@ -2589,7 +3073,14 @@ function App() {
                   )}
                 </div>
                 <pre className="rounded bg-slate-900/60 p-3 text-xs whitespace-pre-wrap max-h-44 overflow-auto">
-                  {(skillsRepairProgressLog.join("\n").trim() || (skillsResult || "").trim() || "暂无日志。点击“安装选中”或“修复缺失依赖（选中）”后，这里会实时显示执行输出。")}
+                  {(() => {
+                    const progressText = skillsRepairProgressLog.join("\n").trim();
+                    const resultText = (skillsResult || "").trim();
+                    if (progressText && resultText) return `${progressText}\n\n----- 结果日志 -----\n${resultText}`;
+                    if (progressText) return progressText;
+                    if (resultText) return resultText;
+                    return "暂无日志。点击“安装选中”或“修复缺失依赖（选中）”后，这里会实时显示执行输出。";
+                  })()}
                 </pre>
               </div>
               <div className="overflow-auto border border-slate-700 rounded-lg">
@@ -2601,6 +3092,7 @@ function App() {
                       <th className="text-left px-2 py-2">来源</th>
                       <th className="text-left px-2 py-2">状态</th>
                       <th className="text-left px-2 py-2">缺失项摘要</th>
+                      <th className="text-left px-2 py-2">操作建议</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -2625,10 +3117,40 @@ function App() {
                           </td>
                           <td className="px-2 py-2 text-slate-200">{s.name}</td>
                           <td className="px-2 py-2">{s.source || (s.bundled ? "bundled" : "unknown")}</td>
-                          <td className={`px-2 py-2 ${s.eligible ? "text-emerald-400" : "text-amber-300"}`}>
-                            {s.eligible ? "可用" : "待补依赖"}
+                          <td
+                            className={`px-2 py-2 ${
+                              s.eligible
+                                ? "text-emerald-400"
+                                : hasManualSkillGaps(s)
+                                ? "text-rose-300"
+                                : "text-amber-300"
+                            }`}
+                          >
+                            {s.eligible ? "可用" : hasManualSkillGaps(s) ? "需手动处理" : "可自动修复"}
                           </td>
                           <td className="px-2 py-2 text-slate-400">{missingParts.join(" | ") || "-"}</td>
+                          <td className="px-2 py-2">
+                            {hasManualSkillGaps(s) ? (
+                              <button
+                                onClick={async () => {
+                                  const hint = buildManualFixHint(s);
+                                  try {
+                                    await navigator.clipboard.writeText(hint);
+                                    setSkillsResult(`已复制 ${s.name} 的手动修复指引`);
+                                  } catch {
+                                    setSkillsResult(`复制失败，请手动复制：\n\n${hint}`);
+                                  }
+                                }}
+                                className="px-2 py-1 bg-amber-700 hover:bg-amber-600 rounded text-xs"
+                              >
+                                复制手动指引
+                              </button>
+                            ) : isAutoFixableSkill(s) ? (
+                              <span className="text-emerald-300 text-xs">可点“修复缺失依赖（选中）”</span>
+                            ) : (
+                              <span className="text-slate-500 text-xs">-</span>
+                            )}
+                          </td>
                         </tr>
                       );
                     })}
@@ -3164,7 +3686,288 @@ function App() {
             </div>
           </div>
         )}
+
+        {step === 4 && (
+          <div className="w-full max-w-[1200px] mx-auto space-y-6">
+            <h2 className="text-lg font-semibold">调教中心（小白模式）</h2>
+
+            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+              <p className="font-medium text-slate-200 flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-emerald-400" />
+                快速模式
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => applyQuickModePreset("stable")}
+                  className={`px-3 py-1.5 rounded text-xs ${quickMode === "stable" ? "bg-emerald-700" : "bg-slate-700 hover:bg-slate-600"}`}
+                >
+                  稳定模式（推荐）
+                </button>
+                <button
+                  onClick={() => applyQuickModePreset("balanced")}
+                  className={`px-3 py-1.5 rounded text-xs ${quickMode === "balanced" ? "bg-emerald-700" : "bg-slate-700 hover:bg-slate-600"}`}
+                >
+                  均衡模式
+                </button>
+                <button
+                  onClick={() => applyQuickModePreset("performance")}
+                  className={`px-3 py-1.5 rounded text-xs ${quickMode === "performance" ? "bg-emerald-700" : "bg-slate-700 hover:bg-slate-600"}`}
+                >
+                  高性能模式
+                </button>
+              </div>
+              <p className="text-xs text-slate-400">
+                当前快速模式会同步调整模型、记忆策略、执行权限。应用后请在第 2 步点击“保存配置”。
+              </p>
+            </div>
+
+            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+              <p className="font-medium text-slate-200 flex items-center gap-2">
+                <Brain className="w-4 h-4 text-sky-400" />
+                场景模板
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-2">
+                {[
+                  { id: "customer_support" as ScenarioPreset, label: "客服回复" },
+                  { id: "short_video" as ScenarioPreset, label: "短视频脚本" },
+                  { id: "office" as ScenarioPreset, label: "办公文档" },
+                  { id: "developer" as ScenarioPreset, label: "编程助手" },
+                  { id: "none" as ScenarioPreset, label: "清空模板" },
+                ].map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => applyScenarioPreset(t.id)}
+                    className={`px-3 py-2 rounded text-xs border ${
+                      scenarioPreset === t.id
+                        ? "bg-sky-800/60 border-sky-600 text-sky-100"
+                        : "bg-slate-700/60 border-slate-600 hover:bg-slate-700"
+                    }`}
+                  >
+                    {t.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+              <p className="font-medium text-slate-200">个性调教</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                <label className="text-xs space-y-1">
+                  <span className="text-slate-400">回答长度</span>
+                  <select value={tuneLength} onChange={(e) => setTuneLength(e.target.value as TuneLength)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
+                    <option value="short">短</option>
+                    <option value="medium">中</option>
+                    <option value="long">长</option>
+                  </select>
+                </label>
+                <label className="text-xs space-y-1">
+                  <span className="text-slate-400">语气风格</span>
+                  <select value={tuneTone} onChange={(e) => setTuneTone(e.target.value as TuneTone)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
+                    <option value="professional">专业</option>
+                    <option value="friendly">亲切</option>
+                    <option value="concise">简洁</option>
+                  </select>
+                </label>
+                <label className="text-xs space-y-1">
+                  <span className="text-slate-400">主动性</span>
+                  <select value={tuneProactivity} onChange={(e) => setTuneProactivity(e.target.value as TuneProactivity)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
+                    <option value="low">少追问</option>
+                    <option value="balanced">平衡</option>
+                    <option value="high">多建议</option>
+                  </select>
+                </label>
+                <label className="text-xs space-y-1">
+                  <span className="text-slate-400">执行权限</span>
+                  <select value={tunePermission} onChange={(e) => setTunePermission(e.target.value as TunePermission)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
+                    <option value="suggest">仅建议</option>
+                    <option value="confirm">需确认后执行</option>
+                    <option value="auto_low_risk">低风险自动执行</option>
+                  </select>
+                </label>
+                <label className="text-xs space-y-1">
+                  <span className="text-slate-400">记忆策略</span>
+                  <select value={memoryMode} onChange={(e) => setMemoryMode(e.target.value as MemoryMode)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
+                    <option value="off">关闭记忆</option>
+                    <option value="session">仅会话记忆</option>
+                    <option value="long">长期记忆</option>
+                  </select>
+                </label>
+              </div>
+              <pre className="text-xs text-slate-300 bg-slate-900/40 rounded p-3 whitespace-pre-wrap">{tuningPromptPreview}</pre>
+              <button
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(tuningPromptPreview);
+                    setSelfCheckResult("已复制调教模板摘要");
+                  } catch {
+                    setSelfCheckResult("复制失败，请手动复制调教模板摘要");
+                  }
+                }}
+                className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+              >
+                复制调教模板摘要
+              </button>
+            </div>
+
+            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+              <p className="font-medium text-slate-200">记忆中心</p>
+              <div className="flex flex-wrap gap-2">
+                <button onClick={refreshMemoryCenterStatus} disabled={memoryLoading} className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs">
+                  {memoryLoading ? "刷新中..." : "刷新记忆状态"}
+                </button>
+                <button onClick={handleInitMemory} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs">
+                  {memoryActionLoading === "init" ? "初始化中..." : "一键初始化记忆"}
+                </button>
+                <button onClick={handleReadMemorySummary} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-xs">
+                  {memoryActionLoading === "read" ? "读取中..." : "查看记忆摘要"}
+                </button>
+                <button onClick={handleClearMemory} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-rose-700 hover:bg-rose-600 disabled:opacity-50 rounded text-xs">
+                  {memoryActionLoading === "clear" ? "清空中..." : "清空记忆"}
+                </button>
+                <button onClick={handleExportMemory} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs">
+                  {memoryActionLoading === "export" ? "导出中..." : "导出记忆"}
+                </button>
+              </div>
+              {memoryStatus && (
+                <div className="text-xs text-slate-300 bg-slate-900/40 rounded p-3 space-y-1">
+                  <p>记忆启用：{memoryStatus.enabled ? "是" : "否"}</p>
+                  <p>记忆文件：{memoryStatus.memory_file_count} 个</p>
+                  <p>MEMORY.md：{memoryStatus.memory_file_exists ? "存在" : "不存在"}</p>
+                  <p>memory 目录：{memoryStatus.memory_dir_exists ? "存在" : "不存在"}</p>
+                  <p className="text-slate-400">{memoryStatus.note}</p>
+                </div>
+              )}
+              {memorySummary && <pre className="text-xs text-slate-300 whitespace-pre-wrap bg-slate-900/40 rounded p-3 max-h-52 overflow-auto">{memorySummary}</pre>}
+            </div>
+
+            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+              <p className="font-medium text-slate-200 flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                健康检查与自愈
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-2">
+                <HealthLamp label="模型探活" state={runtimeProbeResult?.includes("失败") ? "error" : runtimeProbeResult ? "ok" : "unknown"} />
+                <HealthLamp label="Skills可用率" state={skillsCatalog.length ? (skillsCatalog.some((s) => s.eligible) ? "ok" : "warn") : "unknown"} />
+                <HealthLamp label="自检状态" state={selfCheckItems.some((x) => x.status === "error") ? "error" : selfCheckItems.some((x) => x.status === "warn") ? "warn" : selfCheckItems.length ? "ok" : "unknown"} />
+                <HealthLamp label="记忆状态" state={memoryStatus?.enabled ? "ok" : "warn"} />
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={handleTuningHealthCheck}
+                  disabled={tuningActionLoading !== null}
+                  className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                >
+                  {tuningActionLoading === "check" ? "体检中..." : "一键体检"}
+                </button>
+                <button
+                  onClick={handleTuningSelfHeal}
+                  disabled={tuningActionLoading !== null}
+                  className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
+                >
+                  {tuningActionLoading === "heal" ? "修复中..." : "一键修复"}
+                </button>
+                <button
+                  onClick={handleExportDiagnosticBundle}
+                  disabled={diagnosticLoading}
+                  className="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs"
+                >
+                  {diagnosticLoading ? "导出中..." : "一键反馈包"}
+                </button>
+              </div>
+              {selfCheckResult && <pre className="text-xs text-sky-300 whitespace-pre-wrap bg-slate-900/40 rounded p-3 max-h-56 overflow-auto">{selfCheckResult}</pre>}
+            </div>
+          </div>
+        )}
       </main>
+
+      {wizardOpen && (
+        <div className="fixed inset-0 z-50 bg-black/55 flex items-center justify-center p-4">
+          <div className="w-full max-w-2xl rounded-xl border border-slate-700 bg-slate-900 p-5 space-y-4">
+            <h3 className="text-lg font-semibold">首次 30 秒向导</h3>
+            <p className="text-sm text-slate-400">选完这 3 项，自动帮你落到推荐调教参数。</p>
+            <div className="space-y-3">
+              <div>
+                <p className="text-xs text-slate-400 mb-1">你主要用来做什么？</p>
+                <div className="flex flex-wrap gap-2 text-xs">
+                  {[
+                    { id: "customer_support", label: "客服" },
+                    { id: "short_video", label: "短视频" },
+                    { id: "office", label: "办公" },
+                    { id: "developer", label: "开发" },
+                  ].map((x) => (
+                    <button
+                      key={x.id}
+                      onClick={() => setWizardUseCase(x.id as ScenarioPreset)}
+                      className={`px-2 py-1 rounded border ${
+                        wizardUseCase === x.id ? "border-emerald-500 bg-emerald-700/30" : "border-slate-700 bg-slate-800"
+                      }`}
+                    >
+                      {x.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="text-xs text-slate-400 mb-1">回答风格</p>
+                <div className="flex flex-wrap gap-2 text-xs">
+                  {[
+                    { id: "friendly", label: "亲切" },
+                    { id: "professional", label: "专业" },
+                    { id: "concise", label: "简洁" },
+                  ].map((x) => (
+                    <button
+                      key={x.id}
+                      onClick={() => setWizardTone(x.id as TuneTone)}
+                      className={`px-2 py-1 rounded border ${
+                        wizardTone === x.id ? "border-sky-500 bg-sky-700/30" : "border-slate-700 bg-slate-800"
+                      }`}
+                    >
+                      {x.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <p className="text-xs text-slate-400 mb-1">记忆模式</p>
+                <div className="flex flex-wrap gap-2 text-xs">
+                  {[
+                    { id: "off", label: "关闭记忆" },
+                    { id: "session", label: "本次会话" },
+                    { id: "longterm", label: "长期记忆" },
+                  ].map((x) => (
+                    <button
+                      key={x.id}
+                      onClick={() => setWizardMemory(x.id as MemoryMode)}
+                      className={`px-2 py-1 rounded border ${
+                        wizardMemory === x.id ? "border-amber-500 bg-amber-700/30" : "border-slate-700 bg-slate-800"
+                      }`}
+                    >
+                      {x.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => {
+                  localStorage.setItem("openclaw_easy_onboarding_done", "1");
+                  setWizardOpen(false);
+                }}
+                className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+              >
+                跳过
+              </button>
+              <button
+                onClick={completeWizard}
+                className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 rounded text-xs"
+              >
+                一键应用并继续
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Footer */}
       <footer className="border-t border-slate-700 px-6 py-3 flex justify-between items-center">
@@ -3242,6 +4045,23 @@ function HealthLamp({ label, state }: { label: string; state: HealthState }) {
       <span className="text-xs text-slate-300">{label}</span>
       <span className="ml-auto text-xs text-slate-500">{text}</span>
     </div>
+  );
+}
+
+function MiniLamp({ label, state }: { label: string; state: HealthState }) {
+  const color =
+    state === "ok"
+      ? "bg-emerald-500"
+      : state === "warn"
+        ? "bg-amber-500"
+        : state === "error"
+          ? "bg-red-500"
+          : "bg-slate-500";
+  return (
+    <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded border border-slate-700 bg-slate-800 text-slate-300">
+      <span className={`inline-block w-2 h-2 rounded-full ${color}`} />
+      {label}
+    </span>
   );
 }
 

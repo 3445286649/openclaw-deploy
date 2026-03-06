@@ -1,4 +1,4 @@
-# OpenClaw Shell - UTF-8 with BOM
+﻿# OpenClaw Shell - UTF-8 with BOM
 param(
   [string]$Action = ""
 )

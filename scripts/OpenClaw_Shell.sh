@@ -60,7 +60,7 @@ read_input() {
 # 查找 openclaw 命令（安装后需刷新 PATH）
 find_openclaw() {
   export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
-  # WSL 下 npm config 可能返回 Windows 路径，优先用 Linux 原生或 npx
+  # WSL 下 npm config 可能返回 Windows 路径，优先用 Linux 原生路径
   local npm_prefix npm_root
   npm_prefix=$(npm config get prefix 2>/dev/null || true)
   npm_prefix="${npm_prefix%/}"
@@ -94,10 +94,6 @@ find_openclaw() {
       fi
     fi
     echo "openclaw"
-    return
-  fi
-  if command -v npx &>/dev/null; then
-    echo "npx openclaw"
     return
   fi
   echo ""
@@ -257,7 +253,15 @@ show_channel_status() {
   else
     echo -e "${GRAY}  未找到配置文件${NC}"
   fi
+  if [[ -n "${OPENCLAW_CMD:-}" ]]; then
+    echo ""
+    echo -e "${GRAY}  CLI 渠道状态（若失败不影响脚本继续）:${NC}"
+    if ! run_openclaw channels status 2>/dev/null; then
+      echo -e "${GRAY}  channels status 读取失败，可能是当前版本暂不支持该命令${NC}"
+    fi
+  fi
   echo ""
+  return 0
 }
 
 # 渠道接入：安装插件 + channels add
@@ -407,6 +411,44 @@ find_openclaw_locations() {
     [[ "$dir" == "$current_dir" ]] && cur=" (当前)"
     echo "$dir|$ver|$cur"
   done | sort -u -t'|' -k1,1
+}
+
+purge_openclaw_by_prefix() {
+  local prefix="$1"
+  [[ -z "$prefix" ]] && return 1
+  prefix="${prefix%/}"
+
+  npm uninstall -g openclaw --prefix "$prefix" >/dev/null 2>&1 || true
+  rm -f "$prefix/bin/openclaw" "$prefix/bin/openclaw.cmd" >/dev/null 2>&1 || true
+  rm -rf "$prefix/lib/node_modules/openclaw" "$prefix/node_modules/openclaw" >/dev/null 2>&1 || true
+
+  if [[ -x "$prefix/bin/openclaw" || -d "$prefix/lib/node_modules/openclaw" || -d "$prefix/node_modules/openclaw" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+purge_openclaw_fallback() {
+  local npm_prefix npm_root path_bin
+  local prefixes=()
+  npm_prefix=$(npm config get prefix 2>/dev/null || true)
+  npm_root=$(npm root -g 2>/dev/null || true)
+  path_bin=$(command -v openclaw 2>/dev/null | xargs dirname 2>/dev/null || true)
+
+  [[ -n "$npm_prefix" ]] && prefixes+=("${npm_prefix%/}")
+  [[ -n "$npm_root" ]] && prefixes+=("$(dirname "$npm_root")")
+  [[ -n "$HOME" ]] && prefixes+=("$HOME/.local" "$HOME/.npm-global")
+  [[ -n "$path_bin" ]] && prefixes+=("$(dirname "$path_bin")")
+  prefixes+=("/usr/local" "/opt/homebrew")
+
+  local p ok_count=0
+  for p in "${prefixes[@]}"; do
+    [[ -z "$p" ]] && continue
+    if purge_openclaw_by_prefix "$p"; then
+      ((ok_count++)) || true
+    fi
+  done
+  echo "$ok_count"
 }
 
 # 环境检测与安装
@@ -568,7 +610,7 @@ quick_config_menu() {
       a) echo -e "${CYAN}正在打开交互式配置...${NC}"; run_openclaw onboard ;;
       b) quick_config_siliconflow ;;
       c) channel_setup ;;
-      d) show_channel_status ;;
+      d) show_channel_status || true ;;
       0) return ;;
       *) echo -e "${YELLOW}无效${NC}" ;;
     esac
@@ -735,7 +777,15 @@ main() {
                 ((i++)) || true
               done <<< "$(find_openclaw_locations 2>/dev/null || true)"
               if [[ ${#locs_arr[@]} -eq 0 ]]; then
-                echo -e "${YELLOW}无可删除的安装${NC}"
+                echo -e "${YELLOW}未检测到可枚举安装，正在尝试自动清理常见路径...${NC}"
+                local cleaned
+                cleaned=$(purge_openclaw_fallback)
+                OPENCLAW_CMD=$(find_openclaw)
+                if [[ -z "$OPENCLAW_CMD" ]]; then
+                  echo -e "${GREEN}[OK] 自动清理完成（清理尝试: $cleaned）${NC}"
+                else
+                  echo -e "${YELLOW}仍检测到命令: $OPENCLAW_CMD，可重试一次或手动检查 PATH${NC}"
+                fi
               else
                 echo "  [0] 取消"
                 read_input -p "选择要删除的安装: " sel
@@ -749,17 +799,17 @@ main() {
                     if [[ "${confirm,,}" == "y" || "${confirm,,}" == "yes" ]]; then
                       prefix="${target_dir%/bin}"
                       [[ "$prefix" == "$target_dir" ]] && prefix="$(dirname "$target_dir")"
-                      if npm uninstall -g openclaw --prefix "$prefix" 2>/dev/null; then
-                        echo -e "${GREEN}[OK] 已卸载${NC}"
+                      if purge_openclaw_by_prefix "$prefix"; then
+                        echo -e "${GREEN}[OK] 已自动卸载并清理${NC}"
                       else
-                        rm -f "$target_dir/openclaw" 2>/dev/null || true
-                        rm -rf "$prefix/node_modules/openclaw" "$prefix/lib/node_modules/openclaw" 2>/dev/null || true
-                        if [[ ! -f "$target_dir/openclaw" ]]; then
-                          echo -e "${GREEN}[OK] 已删除${NC}"
+                        rm -f "$target_dir/openclaw" "$target_dir/openclaw.cmd" 2>/dev/null || true
+                        if [[ ! -f "$target_dir/openclaw" && ! -f "$target_dir/openclaw.cmd" ]]; then
+                          echo -e "${GREEN}[OK] 已自动清理可执行文件${NC}"
                         else
-                          echo -e "${YELLOW}卸载未完成，请手动删除: $target_dir/openclaw${NC}"
+                          echo -e "${YELLOW}清理可能未完全完成，建议重试一次删除${NC}"
                         fi
                       fi
+                      OPENCLAW_CMD=$(find_openclaw)
                     else
                       echo "已取消"
                     fi
