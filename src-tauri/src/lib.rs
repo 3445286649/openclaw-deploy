@@ -3389,6 +3389,29 @@ fn start_gateway(custom_path: Option<String>, install_hint: Option<String>) -> R
     ))
 }
 
+#[derive(Clone, Serialize)]
+struct GatewayStartEvent {
+    ok: bool,
+    message: String,
+}
+
+#[tauri::command]
+fn start_gateway_background(
+    app: tauri::AppHandle,
+    custom_path: Option<String>,
+    install_hint: Option<String>,
+) -> Result<String, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let payload = match start_gateway(custom_path, install_hint) {
+            Ok(message) => GatewayStartEvent { ok: true, message },
+            Err(message) => GatewayStartEvent { ok: false, message },
+        };
+        let _ = app_handle.emit("gateway-start-finished", payload);
+    });
+    Ok("已切到后台启动 Gateway，界面可继续操作；完成后会自动回填结果。".to_string())
+}
+
 #[tauri::command]
 fn reset_gateway_auth_and_restart(custom_path: Option<String>, install_hint: Option<String>) -> Result<String, String> {
     let cfg = custom_path
@@ -7199,6 +7222,34 @@ fn create_agent(
 }
 
 #[tauri::command]
+fn rename_agent(id: String, name: String, custom_path: Option<String>) -> Result<(), String> {
+    let id = id.trim().to_string();
+    let name = name.trim().to_string();
+    if id.is_empty() {
+        return Err("Agent id 不能为空".to_string());
+    }
+    if name.is_empty() {
+        return Err("名称不能为空".to_string());
+    }
+
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let exe = find_openclaw_executable(Some(openclaw_dir.as_str()))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+
+    let (ok, _stdout, stderr) = run_openclaw_cmd_clean(
+        &exe,
+        &["agents", "set-identity", "--agent", &id, "--name", &name],
+        env_extra,
+    )?;
+    if !ok {
+        return Err(format!("openclaw agents set-identity 失败:\n{}", stderr));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 fn delete_agent(id: String, force: bool, custom_path: Option<String>) -> Result<(), String> {
     if id == "main" {
         return Err("不能删除 main agent".to_string());
@@ -8968,6 +9019,17 @@ pub struct ChatSendResponse {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatReplyFinishedEvent {
+    pub request_id: String,
+    pub agent_id: String,
+    pub session_name: String,
+    pub ok: bool,
+    pub text: Option<String>,
+    pub error: Option<String>,
+}
+
 fn build_chat_session_key(agent_id: &str, session_name: Option<&str>) -> String {
     // Canonical agent session key format expected by gateway: agent:<agentId>:<sessionName>
     let name = session_name
@@ -9071,6 +9133,24 @@ fn parse_chat_messages(value: &Value) -> Vec<ChatUiMessage> {
     out
 }
 
+fn make_chat_message_fingerprint(message: &ChatUiMessage) -> String {
+    format!(
+        "{}|{}|{}",
+        message.role.trim(),
+        message.timestamp.clone().unwrap_or_default().trim(),
+        message.text.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
+}
+
+fn latest_new_assistant_text(messages: &[ChatUiMessage], known: &BTreeSet<String>) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| m.role.eq_ignore_ascii_case("assistant") && !known.contains(&make_chat_message_fingerprint(m)))
+        .map(|m| m.text.clone())
+        .filter(|t| !t.trim().is_empty())
+}
+
 fn gateway_call_value(
     openclaw_dir: &str,
     method: &str,
@@ -9164,6 +9244,8 @@ fn chat_list_history_delta(
     gateway_id: Option<String>,
     custom_path: Option<String>,
     prefer_gateway_dir: Option<bool>,
+    known_fingerprints: Option<Vec<String>>,
+    limit: Option<usize>,
 ) -> Result<ChatHistoryDeltaResponse, String> {
     let openclaw_dir = resolve_chat_runtime_dir(
         custom_path.as_deref(),
@@ -9176,21 +9258,37 @@ fn chat_list_history_delta(
         "chat.history",
         json!({
             "sessionKey": session_key,
-            "limit": 80
+            "limit": limit.unwrap_or(80)
         }),
         false,
     )?;
     let all = parse_chat_messages(&value);
     let total = all.len();
-    let from = cursor.min(total);
-    let messages = if from >= total {
-        Vec::new()
+    let known: BTreeSet<String> = known_fingerprints
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|x| !x.trim().is_empty())
+        .collect();
+    let messages = if !known.is_empty() {
+        all.into_iter()
+            .filter(|m| !known.contains(&make_chat_message_fingerprint(m)))
+            .collect()
     } else {
-        all[from..].to_vec()
+        let from = cursor.min(total);
+        if from >= total {
+            Vec::new()
+        } else {
+            all[from..].to_vec()
+        }
+    };
+    let next_cursor = if !known.is_empty() {
+        cursor.saturating_add(messages.len())
+    } else {
+        total
     };
     Ok(ChatHistoryDeltaResponse {
         session_key,
-        cursor: total,
+        cursor: next_cursor,
         messages,
     })
 }
@@ -9281,6 +9379,128 @@ fn chat_abort(
         false,
     )?;
     Ok("已请求停止当前会话生成".to_string())
+}
+
+#[tauri::command]
+fn chat_wait_for_reply_background(
+    app: tauri::AppHandle,
+    request_id: String,
+    agent_id: String,
+    session_name: String,
+    gateway_id: Option<String>,
+    custom_path: Option<String>,
+    prefer_gateway_dir: Option<bool>,
+    known_fingerprints: Option<Vec<String>>,
+) -> Result<String, String> {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let openclaw_dir = match resolve_chat_runtime_dir(
+            custom_path.as_deref(),
+            prefer_gateway_dir.unwrap_or(true),
+            gateway_id.as_deref(),
+        ) {
+            Ok(dir) => dir,
+            Err(err) => {
+                let _ = app_handle.emit(
+                    "chat-reply-finished",
+                    ChatReplyFinishedEvent {
+                        request_id,
+                        agent_id,
+                        session_name,
+                        ok: false,
+                        text: None,
+                        error: Some(err),
+                    },
+                );
+                return;
+            }
+        };
+        let session_key = build_chat_session_key(&agent_id, Some(session_name.as_str()));
+        let known: BTreeSet<String> = known_fingerprints
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|x| !x.trim().is_empty())
+            .collect();
+        let delays_ms = [1800_u64, 2600, 3600, 5000, 6500];
+
+        for delay in delays_ms {
+            thread::sleep(Duration::from_millis(delay));
+            let value = match gateway_call_value(
+                &openclaw_dir,
+                "chat.history",
+                json!({
+                    "sessionKey": session_key,
+                    "limit": 24
+                }),
+                false,
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = app_handle.emit(
+                        "chat-reply-finished",
+                        ChatReplyFinishedEvent {
+                            request_id,
+                            agent_id,
+                            session_name,
+                            ok: false,
+                            text: None,
+                            error: Some(err),
+                        },
+                    );
+                    return;
+                }
+            };
+            let messages = parse_chat_messages(&value);
+            if let Some(text) = latest_new_assistant_text(&messages, &known) {
+                let _ = app_handle.emit(
+                    "chat-reply-finished",
+                    ChatReplyFinishedEvent {
+                        request_id,
+                        agent_id,
+                        session_name,
+                        ok: true,
+                        text: Some(text),
+                        error: None,
+                    },
+                );
+                return;
+            }
+        }
+
+        let fallback = gateway_call_value(
+            &openclaw_dir,
+            "chat.history",
+            json!({
+                "sessionKey": session_key,
+                "limit": 80
+            }),
+            false,
+        )
+        .ok()
+        .and_then(|value| latest_new_assistant_text(&parse_chat_messages(&value), &known));
+
+        let payload = if let Some(text) = fallback {
+            ChatReplyFinishedEvent {
+                request_id,
+                agent_id,
+                session_name,
+                ok: true,
+                text: Some(text),
+                error: None,
+            }
+        } else {
+            ChatReplyFinishedEvent {
+                request_id,
+                agent_id,
+                session_name,
+                ok: false,
+                text: None,
+                error: Some("等待回复超时，未检测到新的 assistant 消息".to_string()),
+            }
+        };
+        let _ = app_handle.emit("chat-reply-finished", payload);
+    });
+    Ok("已在后台等待回复结果".to_string())
 }
 
 #[tauri::command]
@@ -9548,6 +9768,7 @@ pub fn run() {
             test_model_connection,
             probe_runtime_model_connection,
             start_gateway,
+            start_gateway_background,
             start_gateway_foreground,
             stop_gateway,
             gateway_status,
@@ -9602,6 +9823,7 @@ pub fn run() {
             memory_center_bootstrap,
             read_agents_list,
             create_agent,
+            rename_agent,
             delete_agent,
             set_default_agent,
             update_bindings,
@@ -9637,6 +9859,7 @@ pub fn run() {
             chat_list_history_delta,
             chat_send,
             chat_abort,
+            chat_wait_for_reply_background,
             orchestrator_submit_task,
             orchestrator_list_tasks,
             orchestrator_retry_step,

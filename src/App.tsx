@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo, useCallback, memo, startTransition, type CSSProperties, type RefObject, type UIEvent } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback, memo, startTransition, useDeferredValue, type CSSProperties, type RefObject, type UIEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -19,6 +19,8 @@ import {
   ShieldCheck,
   Users,
   Zap,
+  House,
+  MessageSquareText,
 } from "lucide-react";
 
 interface EnvCheckResult {
@@ -271,6 +273,42 @@ interface ChatUiMessage {
   status?: "sending" | "sent" | "failed";
 }
 
+interface ChatReplyFinishedEvent {
+  requestId: string;
+  agentId: string;
+  sessionName: string;
+  ok: boolean;
+  text?: string | null;
+  error?: string | null;
+}
+
+interface PendingChatRequestMeta {
+  requestId: string;
+  targetId: string;
+  userMsgId: string;
+  mode: "direct" | "orchestrator";
+  flowSummary?: string;
+}
+
+interface ChatCachePayload {
+  version: 1;
+  selectedAgentId: string;
+  messagesByAgent: Record<string, ChatUiMessage[]>;
+  chatHistoryLoadedByAgent: Record<string, boolean>;
+  sessionNamesByAgent: Record<string, string>;
+}
+
+interface ChatCacheRecord {
+  cacheKey: string;
+  payload: ChatCachePayload;
+  updatedAt: number;
+}
+
+interface ChatPreviewMeta {
+  text: string;
+  time: string;
+}
+
 interface CpTaskStep {
   id: string;
   name: string;
@@ -418,6 +456,10 @@ interface CpCostSummary {
 }
 
 const CHAT_RENDER_BATCH = 80;
+const CHAT_VIEWPORT_WINDOW = 48;
+const CHAT_CACHE_MAX_MESSAGES = 120;
+const CHAT_CACHE_DB_NAME = "openclaw-chat-cache";
+const CHAT_CACHE_STORE_NAME = "snapshots";
 const DEFAULT_SYNC_SESSION_NAME = "main";
 const DEFAULT_ISOLATED_SESSION_NAME = "desktop";
 const EMPTY_AGENTS: AgentListItem[] = [];
@@ -484,6 +526,103 @@ function isSameChatMessageList(a: ChatUiMessage[], b: ChatUiMessage[]): boolean 
 
 function normalizeChatText(text: string): string {
   return (text || "").trim().replace(/\s+/g, " ");
+}
+
+function makeChatMessageFingerprint(message: Pick<ChatUiMessage, "role" | "text" | "timestamp">): string {
+  return [message.role || "assistant", message.timestamp || "", normalizeChatText(message.text || "")]
+    .join("|")
+    .trim();
+}
+
+function sanitizeChatMessageForCache(message: ChatUiMessage): ChatUiMessage {
+  return {
+    id: String(message.id || ""),
+    role: String(message.role || "assistant"),
+    text: String(message.text || ""),
+    timestamp: message.timestamp ? String(message.timestamp) : undefined,
+    status: message.status === "failed" ? "failed" : "sent",
+  };
+}
+
+function buildChatCacheKey(configPath: string, sessionMode: ChatSessionMode): string {
+  const scope = normalizeConfigPath(configPath) || "default";
+  return `openclaw_chat_cache_v1::${scope}::${sessionMode}`;
+}
+
+function openChatCacheDb(): Promise<IDBDatabase | null> {
+  if (typeof window === "undefined" || !("indexedDB" in window)) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      const request = window.indexedDB.open(CHAT_CACHE_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(CHAT_CACHE_STORE_NAME)) {
+          db.createObjectStore(CHAT_CACHE_STORE_NAME, { keyPath: "cacheKey" });
+        }
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(null);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
+async function readChatCacheSnapshot(cacheKey: string): Promise<ChatCachePayload | null> {
+  const db = await openChatCacheDb();
+  if (!db) return null;
+  return new Promise((resolve) => {
+    try {
+      const tx = db.transaction(CHAT_CACHE_STORE_NAME, "readonly");
+      const store = tx.objectStore(CHAT_CACHE_STORE_NAME);
+      const request = store.get(cacheKey);
+      request.onsuccess = () => {
+        const record = request.result as ChatCacheRecord | undefined;
+        resolve(record?.payload || null);
+      };
+      request.onerror = () => resolve(null);
+      tx.oncomplete = () => db.close();
+      tx.onerror = () => db.close();
+    } catch {
+      db.close();
+      resolve(null);
+    }
+  });
+}
+
+async function writeChatCacheSnapshot(cacheKey: string, payload: ChatCachePayload): Promise<void> {
+  const db = await openChatCacheDb();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(CHAT_CACHE_STORE_NAME, "readwrite");
+      const store = tx.objectStore(CHAT_CACHE_STORE_NAME);
+      store.put({
+        cacheKey,
+        payload,
+        updatedAt: Date.now(),
+      } satisfies ChatCacheRecord);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        resolve();
+      };
+    } catch {
+      db.close();
+      resolve();
+    }
+  });
+}
+
+function formatChatPreviewTime(timestamp?: string): string {
+  const raw = String(timestamp || "").trim();
+  if (!raw) return "";
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return parsed.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 function appendDeltaUniqueMessages(
@@ -660,6 +799,7 @@ interface ChatWorkbenchProps {
   agents: AgentListItem[];
   selectedAgentId: string;
   unreadByAgent: Record<string, number>;
+  previewByAgent: Record<string, ChatPreviewMeta>;
   routeMode: "manual" | "auto";
   chatExecutionMode: "orchestrator" | "direct";
   chatSessionMode: ChatSessionMode;
@@ -669,6 +809,10 @@ interface ChatWorkbenchProps {
   routeHint: string | null;
   messages: ChatUiMessage[];
   renderLimit: number;
+  historyLoaded: boolean;
+  cacheHydrating: boolean;
+  chatStickBottom: boolean;
+  pendingReply: boolean;
   chatViewportRef: RefObject<HTMLDivElement | null>;
   onRouteModeChange: (next: "manual" | "auto") => void;
   onExecutionModeChange: (next: "orchestrator" | "direct") => void;
@@ -677,6 +821,7 @@ interface ChatWorkbenchProps {
   onNewSession: () => void;
   onClearSession: () => void;
   onAbort: () => void;
+  onLoadHistory: () => void;
   onSend: (text: string) => Promise<boolean>;
   onTypingActivity: () => void;
   onViewportScroll: (evt: UIEvent<HTMLDivElement>) => void;
@@ -686,10 +831,153 @@ interface ChatWorkbenchProps {
   onPreferredGatewayChange: (agentId: string, gatewayId: string) => void;
 }
 
+const ChatAgentSidebar = memo(function ChatAgentSidebar({
+  agents,
+  selectedAgentId,
+  unreadByAgent,
+  previewByAgent,
+  onSelectAgent,
+  getAgentSpecialty,
+}: {
+  agents: AgentListItem[];
+  selectedAgentId: string;
+  unreadByAgent: Record<string, number>;
+  previewByAgent: Record<string, ChatPreviewMeta>;
+  onSelectAgent: (agentId: string) => void;
+  getAgentSpecialty: (agentId: string) => "代码" | "表格" | "通用";
+}) {
+  return (
+    <div className="w-52 shrink-0 flex flex-col gap-1 bg-slate-800/40 rounded-xl border border-slate-700/60 p-2 overflow-y-auto">
+      {agents.length > 0 ? (
+        agents.map((a) => {
+          const selected = selectedAgentId === a.id;
+          const specialty = getAgentSpecialty(a.id);
+          const unread = unreadByAgent[a.id] || 0;
+          const preview = previewByAgent[a.id];
+          return (
+            <button
+              key={a.id}
+              onClick={() => onSelectAgent(a.id)}
+              className={`text-left px-2.5 py-2.5 rounded-lg text-xs ${
+                selected
+                  ? "bg-sky-700/90 text-sky-100 shadow-[0_0_0_1px_rgba(125,211,252,0.25)]"
+                  : "bg-slate-700/50 hover:bg-slate-600 text-slate-200"
+              }`}
+              title={a.workspace || a.id}
+            >
+              <div className="flex items-center justify-between">
+                <span className="truncate">{a.name || a.id}</span>
+                {unread > 0 && (
+                  <span className="bg-rose-600 text-white rounded-full px-1.5 text-[10px]">{unread}</span>
+                )}
+              </div>
+              <div className="text-[10px] text-slate-300/80 mt-0.5">
+                {a.id} · {specialty}
+              </div>
+              {preview?.text ? (
+                <div className="mt-1 space-y-0.5">
+                  <div className="text-[11px] text-slate-300/85 truncate">{preview.text}</div>
+                  {preview.time ? <div className="text-[10px] text-slate-500">{preview.time}</div> : null}
+                </div>
+              ) : (
+                <div className="mt-1 text-[10px] text-slate-500 truncate">暂无聊天记录</div>
+              )}
+            </button>
+          );
+        })
+      ) : (
+        <p className="text-xs text-slate-500 px-2">暂无 Agent</p>
+      )}
+    </div>
+  );
+});
+
+const ChatMessagesViewport = memo(function ChatMessagesViewport({
+  chatViewportRef,
+  onViewportScroll,
+  chatLoading,
+  messages,
+  totalMessages,
+  renderLimit,
+  historyLoaded,
+  cacheHydrating,
+  chatStickBottom,
+  pendingReply,
+  onLoadHistory,
+  onRetry,
+}: {
+  chatViewportRef: RefObject<HTMLDivElement | null>;
+  onViewportScroll: (evt: UIEvent<HTMLDivElement>) => void;
+  chatLoading: boolean;
+  messages: ChatUiMessage[];
+  totalMessages: number;
+  renderLimit: number;
+  historyLoaded: boolean;
+  cacheHydrating: boolean;
+  chatStickBottom: boolean;
+  pendingReply: boolean;
+  onLoadHistory: () => void;
+  onRetry: (text: string) => void;
+}) {
+  const collapsedByLimit = Math.max(0, totalMessages - renderLimit);
+  const cachedCount = Math.min(renderLimit, totalMessages);
+  const collapsedByViewport = Math.max(0, cachedCount - messages.length);
+
+  return (
+    <div
+      ref={chatViewportRef}
+      onScroll={onViewportScroll}
+      className="flex-1 overflow-y-auto p-3 space-y-2 min-h-[320px]"
+      style={{ contentVisibility: "auto", containIntrinsicSize: "720px", overscrollBehavior: "contain" }}
+    >
+      {cacheHydrating && totalMessages === 0 && (
+        <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 text-xs text-slate-400">
+          正在恢复本地聊天...
+        </div>
+      )}
+      {!cacheHydrating && !historyLoaded && !chatLoading && totalMessages === 0 && (
+        <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 text-xs text-slate-300 space-y-2">
+          <p>已暂停进入页面自动拉历史，避免一进聊天页就卡顿。</p>
+          <button
+            onClick={onLoadHistory}
+            className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 rounded text-xs"
+          >
+            加载最近消息
+          </button>
+        </div>
+      )}
+      {chatLoading && <p className="text-xs text-slate-500">正在加载历史...</p>}
+      {!chatLoading && historyLoaded && totalMessages === 0 && <p className="text-xs text-slate-500">暂无消息，开始对话吧。</p>}
+      {collapsedByLimit > 0 && (
+        <p className="text-[11px] text-slate-500">
+          为提升流畅度当前缓存最近 {cachedCount}/{totalMessages} 条，向上滚动可继续加载更早消息。
+        </p>
+      )}
+      {collapsedByViewport > 0 && chatStickBottom && (
+        <p className="text-[11px] text-slate-500">
+          底部模式已临时折叠更早的 {collapsedByViewport} 条消息，向上查看历史时会自动展开，减少等待回复时的滚动卡顿。
+        </p>
+      )}
+      {messages.map((m) => (
+        <ChatMessageBubble key={m.id} message={m} onRetry={onRetry} />
+      ))}
+      {pendingReply && (
+        <div className="flex justify-start">
+          <div className="max-w-[78%] rounded-lg px-3 py-2 text-sm bg-slate-800/80 text-slate-100 border border-slate-700">
+            <div>等待回复中...</div>
+            <div className="text-[10px] mt-1 text-slate-400">已改为独立等待提示，减少消息列表重排。</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
+
 const ChatWorkbench = memo(function ChatWorkbench({
   agents,
   selectedAgentId,
   unreadByAgent,
+  previewByAgent,
   routeMode,
   chatExecutionMode,
   chatSessionMode,
@@ -699,6 +987,10 @@ const ChatWorkbench = memo(function ChatWorkbench({
   routeHint,
   messages,
   renderLimit,
+  historyLoaded,
+  cacheHydrating,
+  chatStickBottom,
+  pendingReply,
   chatViewportRef,
   onRouteModeChange,
   onExecutionModeChange,
@@ -707,6 +999,7 @@ const ChatWorkbench = memo(function ChatWorkbench({
   onNewSession,
   onClearSession,
   onAbort,
+  onLoadHistory,
   onSend,
   onTypingActivity,
   onViewportScroll,
@@ -717,9 +1010,17 @@ const ChatWorkbench = memo(function ChatWorkbench({
 }: ChatWorkbenchProps) {
   const [draftByAgent, setDraftByAgent] = useState<Record<string, string>>({});
   const draft = selectedAgentId ? draftByAgent[selectedAgentId] || "" : "";
+  const deferredMessages = useDeferredValue(messages);
   const visibleMessages = useMemo(
-    () => (messages.length > renderLimit ? messages.slice(-renderLimit) : messages),
-    [messages, renderLimit]
+    () => (deferredMessages.length > renderLimit ? deferredMessages.slice(-renderLimit) : deferredMessages),
+    [deferredMessages, renderLimit]
+  );
+  const windowedMessages = useMemo(
+    () =>
+      chatStickBottom && visibleMessages.length > CHAT_VIEWPORT_WINDOW
+        ? visibleMessages.slice(-CHAT_VIEWPORT_WINDOW)
+        : visibleMessages,
+    [chatStickBottom, visibleMessages]
   );
   const selectedGatewayOptions = selectedAgentId ? (gatewayOptionsByAgent[selectedAgentId] || []) : [];
   const selectedGatewayValue = selectedAgentId ? (preferredGatewayByAgent[selectedAgentId] || selectedGatewayOptions[0]?.gateway_id || "") : "";
@@ -741,11 +1042,8 @@ const ChatWorkbench = memo(function ChatWorkbench({
   }, [onSend, draft, setDraftForSelected]);
 
   return (
-    <div className="flex flex-col gap-3" style={{ minHeight: 520 }}>
-      <div className="flex items-center justify-between rounded-xl border border-slate-700/70 bg-slate-900/40 px-3 py-2 backdrop-blur-sm">
-        <p className="text-xs text-slate-400">
-          左侧选择 Agent，右侧为聊天内容。支持手动 @agent 路由；推荐“流程编排”模式，一句话自动完成多Agent协作。
-        </p>
+    <div className="flex flex-col gap-3" style={{ minHeight: 560, height: "min(72vh, 760px)" }}>
+      <div className="flex items-center justify-between rounded-xl border border-slate-700/70 bg-slate-900/40 px-3 py-2">
         <div className="flex items-center gap-2 flex-wrap">
           <label className="text-xs text-slate-400">路由模式</label>
           <select
@@ -794,42 +1092,17 @@ const ChatWorkbench = memo(function ChatWorkbench({
       </div>
 
       <div className="flex gap-3 flex-1 min-h-0">
-        <div className="w-52 shrink-0 flex flex-col gap-1 bg-slate-800/50 rounded-xl border border-slate-700/60 p-2 overflow-y-auto">
-          {agents.length > 0 ? (
-            agents.map((a) => {
-              const selected = selectedAgentId === a.id;
-              const specialty = getAgentSpecialty(a.id);
-              const unread = unreadByAgent[a.id] || 0;
-              return (
-                <button
-                  key={a.id}
-                  onClick={() => onSelectAgent(a.id)}
-                  className={`text-left px-2.5 py-2.5 rounded-lg text-xs transition-all duration-150 ${
-                    selected
-                      ? "bg-sky-700/90 text-sky-100 shadow-[0_0_0_1px_rgba(125,211,252,0.25)]"
-                      : "bg-slate-700/50 hover:bg-slate-600 text-slate-200"
-                  }`}
-                  title={a.workspace || a.id}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="truncate">{a.name || a.id}</span>
-                    {unread > 0 && (
-                      <span className="bg-rose-600 text-white rounded-full px-1.5 text-[10px]">{unread}</span>
-                    )}
-                  </div>
-                  <div className="text-[10px] text-slate-300/80 mt-0.5">
-                    {a.id} · {specialty}
-                  </div>
-                </button>
-              );
-            })
-          ) : (
-            <p className="text-xs text-slate-500 px-2">暂无 Agent</p>
-          )}
-        </div>
+        <ChatAgentSidebar
+          agents={agents}
+          selectedAgentId={selectedAgentId}
+          unreadByAgent={unreadByAgent}
+          previewByAgent={previewByAgent}
+          onSelectAgent={onSelectAgent}
+          getAgentSpecialty={getAgentSpecialty}
+        />
 
-        <div className="flex-1 min-w-0 bg-slate-900/50 rounded-xl overflow-hidden border border-slate-700/60 flex flex-col shadow-[0_12px_32px_rgba(15,23,42,0.18)]">
-          <div className="px-3 py-2 border-b border-slate-700/60 flex items-center justify-between bg-slate-900/70 backdrop-blur-sm">
+        <div className="flex-1 min-w-0 h-full bg-slate-900/50 rounded-xl overflow-hidden border border-slate-700/60 flex flex-col min-h-0">
+          <div className="px-3 py-2 border-b border-slate-700/60 flex items-center justify-between bg-slate-900/70">
             <div className="text-sm text-slate-200">
               当前会话：<span className="font-medium">{selectedAgentId || "(未选择)"}</span>
               {selectedAgentId && (
@@ -850,24 +1123,20 @@ const ChatWorkbench = memo(function ChatWorkbench({
               </button>
             </div>
           </div>
-
-          <div
-            ref={chatViewportRef}
-            onScroll={onViewportScroll}
-            className="flex-1 overflow-y-auto p-3 space-y-2 min-h-[320px] scroll-smooth"
-            style={{ contentVisibility: "auto", containIntrinsicSize: "720px" }}
-          >
-            {chatLoading && <p className="text-xs text-slate-500">正在加载历史...</p>}
-            {!chatLoading && messages.length === 0 && <p className="text-xs text-slate-500">暂无消息，开始对话吧。</p>}
-            {messages.length > visibleMessages.length && (
-              <p className="text-[11px] text-slate-500">
-                为提升流畅度当前渲染 {visibleMessages.length}/{messages.length} 条，向上滚动可继续加载更早消息。
-              </p>
-            )}
-            {visibleMessages.map((m) => (
-              <ChatMessageBubble key={m.id} message={m} onRetry={setDraftForSelected} />
-            ))}
-          </div>
+          <ChatMessagesViewport
+            chatViewportRef={chatViewportRef}
+            onViewportScroll={onViewportScroll}
+            chatLoading={chatLoading}
+            messages={windowedMessages}
+            totalMessages={messages.length}
+            renderLimit={renderLimit}
+            historyLoaded={historyLoaded}
+            cacheHydrating={cacheHydrating}
+            chatStickBottom={chatStickBottom}
+            pendingReply={pendingReply}
+            onLoadHistory={onLoadHistory}
+            onRetry={setDraftForSelected}
+          />
 
           <div className="border-t border-slate-700/60 p-3 space-y-2">
             {routeHint && <p className="text-xs text-emerald-300">{routeHint}</p>}
@@ -933,6 +1202,11 @@ interface MemoryCenterStatus {
   note: string;
 }
 
+interface GatewayStartEvent {
+  ok: boolean;
+  message: string;
+}
+
 type QueueTaskStatus = "queued" | "running" | "done" | "error" | "cancelled";
 interface QueueTaskItem {
   id: string;
@@ -988,6 +1262,10 @@ function makeTicketSummary(action: string, error: unknown, extra?: string): stri
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function getAiServiceLabel(provider: string): string {
+  return provider === "kimi" ? "Kimi" : "硅基流动";
 }
 
 function normalizeConfigPath(input: string): string {
@@ -1046,13 +1324,27 @@ function inferModelContextWindow(modelName: string): number | null {
   return null;
 }
 
-const STEPS = [
-  { id: 0, title: "环境检测", icon: CheckCircle2 },
-  { id: 1, title: "安装 OpenClaw", icon: Download },
-  { id: 2, title: "配置 AI 模型", icon: Key },
-  { id: 3, title: "服务与对话", icon: Play },
-  { id: 4, title: "调教中心", icon: SlidersHorizontal },
-];
+const PRIMARY_NAV_ITEMS = [
+  { id: "home", label: "首页", icon: House },
+  { id: "chat", label: "聊天", icon: MessageSquareText },
+  { id: "tuning", label: "调教中心", icon: SlidersHorizontal },
+  { id: "repair", label: "修复中心", icon: ShieldCheck },
+] as const;
+
+const TUNING_NAV_ITEMS = [
+  { id: "agents", label: "Agent 管理", section: "agents", agentTab: "overview" },
+  { id: "channels", label: "渠道配置", section: "agents", agentTab: "channels" },
+  { id: "skills", label: "Skills", section: "skills" },
+  { id: "memory", label: "记忆", section: "memory" },
+  { id: "templates", label: "模板", section: "scene" },
+  { id: "advanced", label: "高级设置", section: "control" },
+] as const;
+
+const AI_SERVICE_OPTIONS = [
+  { id: "openai", label: "硅基流动", desc: "新手默认推荐，价格友好，适合高频使用" },
+  { id: "kimi", label: "Kimi", desc: "长文本更稳，适合深度问答和长上下文" },
+  { id: "official", label: "官方线路", desc: "后续上线，承接你的 API 中转站方案" },
+] as const;
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.siliconflow.cn/v1";
 const DEFAULT_KIMI_BASE_URL = "https://api.moonshot.cn/v1";
@@ -1101,12 +1393,19 @@ function App() {
   const chatSessionNameByAgentRef = useRef<Record<string, string>>({});
   const chatSessionModeRef = useRef<ChatSessionMode>("isolated");
   const chatSendLockRef = useRef(false);
+  const pendingChatRequestsRef = useRef<Record<string, PendingChatRequestMeta>>({});
+  const currentPendingChatRequestIdRef = useRef<string | null>(null);
   const lastSentFingerprintRef = useRef<Record<string, { text: string; at: number }>>({});
+  const chatCacheHydratedKeyRef = useRef<string | null>(null);
+  const chatCachePersistTimerRef = useRef<number | null>(null);
+  const stepRef = useRef(0);
+  const selectedAgentIdRef = useRef("");
   const installLogBufferRef = useRef<string[]>([]);
   const installLogFlushTimerRef = useRef<number | null>(null);
 
   const [provider, setProvider] = useState("openai");
   const [apiKey, setApiKey] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
   const [baseUrl, setBaseUrl] = useState(DEFAULT_OPENAI_BASE_URL);
   const [proxyUrl, setProxyUrl] = useState("");
   const [noProxy, setNoProxy] = useState("");
@@ -1119,6 +1418,7 @@ function App() {
   const [saveResult, setSaveResult] = useState<string | null>(null);
   const [modelTesting, setModelTesting] = useState(false);
   const [modelTestResult, setModelTestResult] = useState<string | null>(null);
+  const [showAiAdvancedSettings, setShowAiAdvancedSettings] = useState(false);
   const [selectedModel, setSelectedModel] = useState(RECOMMENDED_MODEL_FALLBACK);
   const [runtimeModelInfo, setRuntimeModelInfo] = useState<RuntimeModelInfo | null>(null);
   const [keySyncStatus, setKeySyncStatus] = useState<KeySyncStatus | null>(null);
@@ -1156,7 +1456,7 @@ function App() {
   const [autoRefreshHealth] = useState(false);
   const [savedAiHint, setSavedAiHint] = useState<string | null>(null);
   const [localInfo, setLocalInfo] = useState<LocalOpenclawInfo | null>(null);
-  const [exeCheckInfo, setExeCheckInfo] = useState<ExecutableCheckInfo | null>(null);
+  const [, setExeCheckInfo] = useState<ExecutableCheckInfo | null>(null);
   const [uninstalling, setUninstalling] = useState(false);
   const [selfCheckItems, setSelfCheckItems] = useState<SelfCheckItem[]>([]);
   const [selfCheckResult, setSelfCheckResult] = useState<string | null>(null);
@@ -1218,6 +1518,7 @@ function App() {
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryActionLoading, setMemoryActionLoading] = useState<"read" | "clear" | "export" | "init" | null>(null);
   const [tuningActionLoading, setTuningActionLoading] = useState<"check" | "heal" | null>(null);
+  const [agentCenterTab, setAgentCenterTab] = useState<"overview" | "channels">("overview");
   const [wizardOpen, setWizardOpen] = useState(false);
   const [agentsList, setAgentsList] = useState<AgentsListPayload | null>(null);
   const [agentsLoading, setAgentsLoading] = useState(false);
@@ -1259,9 +1560,14 @@ function App() {
   const [createAgentName, setCreateAgentName] = useState("");
   const [createAgentWorkspace, setCreateAgentWorkspace] = useState("");
   const [creatingAgent, setCreatingAgent] = useState(false);
+  const [agentNameDrafts, setAgentNameDrafts] = useState<Record<string, string>>({});
+  const [renamingAgentId, setRenamingAgentId] = useState<string | null>(null);
+  const [agentsActionResult, setAgentsActionResult] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState<string>("");
   const [messagesByAgent, setMessagesByAgent] = useState<Record<string, ChatUiMessage[]>>({});
+  const [chatHistoryLoadedByAgent, setChatHistoryLoadedByAgent] = useState<Record<string, boolean>>({});
   const [chatHistorySuppressedByAgent, setChatHistorySuppressedByAgent] = useState<Record<string, boolean>>({});
+  const [chatCacheHydrating, setChatCacheHydrating] = useState(true);
   const [chatRenderLimitByAgent, setChatRenderLimitByAgent] = useState<Record<string, number>>({});
   const [chatDraft, setChatDraft] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
@@ -1279,14 +1585,14 @@ function App() {
   const [routeHint, setRouteHint] = useState<string | null>(null);
   const [unreadByAgent, setUnreadByAgent] = useState<Record<string, number>>({});
   const [preferredGatewayByAgent, setPreferredGatewayByAgent] = useState<Record<string, string>>({});
+  const [pendingReplyAgentId, setPendingReplyAgentId] = useState<string | null>(null);
+  const [selectedChatStickBottom, setSelectedChatStickBottom] = useState(true);
   const messagesByAgentRef = useRef<Record<string, ChatUiMessage[]>>({});
   const chatRenderLimitByAgentRef = useRef<Record<string, number>>({});
   const chatHistorySuppressedRef = useRef<Record<string, boolean>>({});
   const lastTypingAtRef = useRef(0);
   const chatInteractTimerRef = useRef<number | null>(null);
   const [chatInteracting, setChatInteracting] = useState(false);
-  const [servicePanelExpanded, setServicePanelExpanded] = useState(false);
-  const [servicePanelMounted, setServicePanelMounted] = useState(false);
   const [showServiceQueueDetails, setShowServiceQueueDetails] = useState(false);
   const [showRouteTestPanel, setShowRouteTestPanel] = useState(false);
   const [cpLoading, setCpLoading] = useState(false);
@@ -1505,17 +1811,128 @@ function App() {
     void refreshMemoryCenterStatus();
   }, [step, tuningSection, memoryStatus, memoryLoading, customConfigPath]);
 
-  useEffect(() => {
-    // 新策略：每次启动都是新会话，不恢复历史缓存，避免重启后回放旧消息。
-    try {
-      sessionStorage.removeItem("openclaw_chat_cache");
-    } catch {
-      // ignore storage error
-    }
-  }, []);
-
-  const selectedChatMessagesLength = selectedAgentId ? (messagesByAgent[selectedAgentId] || []).length : 0;
+  const selectedChatHistoryLoaded = selectedAgentId ? !!chatHistoryLoadedByAgent[selectedAgentId] : false;
   const selectedChatHistorySuppressed = selectedAgentId ? !!chatHistorySuppressedByAgent[selectedAgentId] : false;
+  const chatCacheKey = useMemo(
+    () => buildChatCacheKey(customConfigPath, chatSessionMode),
+    [customConfigPath, chatSessionMode]
+  );
+
+  useEffect(() => {
+    stepRef.current = step;
+  }, [step]);
+
+  useEffect(() => {
+    selectedAgentIdRef.current = selectedAgentId;
+  }, [selectedAgentId]);
+
+  useEffect(() => {
+    if (chatCacheHydratedKeyRef.current === chatCacheKey) return;
+    setChatCacheHydrating(true);
+    void (async () => {
+      try {
+        let parsed = (await readChatCacheSnapshot(chatCacheKey)) as Partial<ChatCachePayload> | null;
+        if (!parsed) {
+          const legacyRaw = localStorage.getItem(chatCacheKey);
+          if (legacyRaw) {
+            parsed = JSON.parse(legacyRaw) as Partial<ChatCachePayload>;
+            if (parsed) {
+              await writeChatCacheSnapshot(chatCacheKey, {
+                version: 1,
+                selectedAgentId: parsed.selectedAgentId || "",
+                messagesByAgent: (parsed.messagesByAgent || {}) as Record<string, ChatUiMessage[]>,
+                chatHistoryLoadedByAgent: parsed.chatHistoryLoadedByAgent || {},
+                sessionNamesByAgent: parsed.sessionNamesByAgent || {},
+              });
+              localStorage.removeItem(chatCacheKey);
+            }
+          }
+        }
+        if (!parsed) {
+          chatCacheHydratedKeyRef.current = chatCacheKey;
+          setChatCacheHydrating(false);
+          return;
+        }
+        const cachedMessages = Object.fromEntries(
+          Object.entries(parsed.messagesByAgent || {}).map(([agentId, list]) => [
+            agentId,
+            Array.isArray(list)
+              ? trimChatMessagesForUi(
+                  list
+                    .map((item) => sanitizeChatMessageForCache(item as ChatUiMessage))
+                    .filter((item) => item.id && item.text.trim()),
+                  CHAT_CACHE_MAX_MESSAGES
+                )
+              : [],
+          ])
+        ) as Record<string, ChatUiMessage[]>;
+        const loadedByAgent = { ...(parsed.chatHistoryLoadedByAgent || {}) };
+        for (const [agentId, list] of Object.entries(cachedMessages)) {
+          if ((list || []).length > 0) loadedByAgent[agentId] = true;
+        }
+        startTransition(() => {
+          setMessagesByAgent(cachedMessages);
+          setChatHistoryLoadedByAgent(loadedByAgent);
+          if (parsed?.selectedAgentId) {
+            setSelectedAgentId((prev) => prev || parsed?.selectedAgentId || "");
+          }
+        });
+        if (parsed.sessionNamesByAgent && typeof parsed.sessionNamesByAgent === "object") {
+          chatSessionNameByAgentRef.current = {
+            ...chatSessionNameByAgentRef.current,
+            ...parsed.sessionNamesByAgent,
+          };
+        }
+      } catch {
+        try {
+          localStorage.removeItem(chatCacheKey);
+        } catch {
+          // ignore storage error
+        }
+      } finally {
+        chatCacheHydratedKeyRef.current = chatCacheKey;
+        setChatCacheHydrating(false);
+      }
+    })();
+  }, [chatCacheKey]);
+
+  useEffect(() => {
+    if (chatCacheHydratedKeyRef.current !== chatCacheKey) return;
+    if (chatCachePersistTimerRef.current !== null) {
+      window.clearTimeout(chatCachePersistTimerRef.current);
+      chatCachePersistTimerRef.current = null;
+    }
+    chatCachePersistTimerRef.current = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const payload: ChatCachePayload = {
+            version: 1,
+            selectedAgentId,
+            messagesByAgent: Object.fromEntries(
+              Object.entries(messagesByAgent).map(([agentId, list]) => [
+                agentId,
+                trimChatMessagesForUi(
+                  (list || []).map(sanitizeChatMessageForCache).filter((item) => item.text.trim()),
+                  CHAT_CACHE_MAX_MESSAGES
+                ),
+              ])
+            ) as Record<string, ChatUiMessage[]>,
+            chatHistoryLoadedByAgent,
+            sessionNamesByAgent: { ...chatSessionNameByAgentRef.current },
+          };
+          await writeChatCacheSnapshot(chatCacheKey, payload);
+        } finally {
+          chatCachePersistTimerRef.current = null;
+        }
+      })();
+    }, 180);
+    return () => {
+      if (chatCachePersistTimerRef.current !== null) {
+        window.clearTimeout(chatCachePersistTimerRef.current);
+        chatCachePersistTimerRef.current = null;
+      }
+    };
+  }, [chatCacheKey, selectedAgentId, messagesByAgent, chatHistoryLoadedByAgent]);
 
   useEffect(() => {
     messagesByAgentRef.current = messagesByAgent;
@@ -1530,23 +1947,32 @@ function App() {
   }, [chatHistorySuppressedByAgent]);
 
   useEffect(() => {
-    if (step !== 3) return;
-    if (!selectedAgentId) return;
-    if (selectedChatHistorySuppressed) return;
-    if (selectedChatMessagesLength > 0) return;
-    void loadAgentHistory(selectedAgentId);
-  }, [step, selectedAgentId, selectedChatHistorySuppressed, selectedChatMessagesLength]);
-
-  useEffect(() => {
     if (!selectedAgentId) return;
     if (chatStickBottomByAgentRef.current[selectedAgentId] === undefined) {
       chatStickBottomByAgentRef.current[selectedAgentId] = true;
     }
+    setSelectedChatStickBottom(!!chatStickBottomByAgentRef.current[selectedAgentId]);
     setChatRenderLimitByAgent((prev) => {
       if (prev[selectedAgentId]) return prev;
       return { ...prev, [selectedAgentId]: CHAT_RENDER_BATCH };
     });
   }, [selectedAgentId]);
+
+  useEffect(() => {
+    if (step !== 3 || !selectedAgentId) return;
+    chatStickBottomByAgentRef.current[selectedAgentId] = true;
+    setSelectedChatStickBottom(true);
+    setUnreadByAgent((prev) => {
+      if ((prev[selectedAgentId] || 0) === 0) return prev;
+      return { ...prev, [selectedAgentId]: 0 };
+    });
+    const timer = window.requestAnimationFrame(() => {
+      const el = chatViewportRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(timer);
+  }, [step, selectedAgentId]);
 
   useEffect(() => {
     if (step !== 3 || !selectedAgentId) return;
@@ -1562,6 +1988,7 @@ function App() {
   useEffect(() => {
     if (step !== 3) return;
     if (!selectedAgentId) return;
+    if (!selectedChatHistoryLoaded) return;
     if (selectedChatHistorySuppressed) return;
     const timer = window.setInterval(() => {
       if (document.hidden) return;
@@ -1582,7 +2009,7 @@ function App() {
       }
     }, 7000);
     return () => window.clearInterval(timer);
-  }, [step, selectedAgentId, customConfigPath, chatSending, selectedChatHistorySuppressed]);
+  }, [step, selectedAgentId, customConfigPath, chatSending, selectedChatHistoryLoaded, selectedChatHistorySuppressed]);
 
   const markChatInteracting = useCallback((cooldownMs = 900) => {
     setChatInteracting(true);
@@ -1746,7 +2173,7 @@ function App() {
           loadKeySyncStatus(cfgPath),
         ]);
       }
-      if (step >= 3) {
+      if (step === 4 && tuningSection === "health") {
         void loadSavedChannels(cfgPath);
       }
     }, 350);
@@ -1756,7 +2183,7 @@ function App() {
         configReloadTimerRef.current = null;
       }
     };
-  }, [customConfigPath, step]);
+  }, [customConfigPath, step, tuningSection]);
 
   // 窗口重新获得焦点时刷新安装状态（例如脚本删除后切回应用）
   useEffect(() => {
@@ -1786,7 +2213,7 @@ function App() {
         loadKeySyncStatus(cfgPath),
       ]);
     }
-    if (step === 3 && !loadedStepDataRef.current.channel) {
+    if (step === 4 && tuningSection === "health" && !loadedStepDataRef.current.channel) {
       loadedStepDataRef.current.channel = true;
       void loadSavedChannels(cfgPath);
     }
@@ -2363,9 +2790,11 @@ function App() {
     setTelegramHealth((prev) => (isSameChannelHealthInfo(prev, next) ? prev : next));
   };
 
+  const runtimeHealthPanelVisible = step === 4 && tuningSection === "health";
+
   const refreshAllChannelHealth = async (force = false) => {
     if (starting || chatSending || chatInteracting) return;
-    if (!force && (!servicePanelMounted || !servicePanelExpanded)) return;
+    if (!force && !runtimeHealthPanelVisible) return;
     const gatewayState = await getGatewayHealthState();
     await Promise.all([
       refreshTelegramHealth(gatewayState),
@@ -2373,7 +2802,7 @@ function App() {
   };
 
   useEffect(() => {
-    if (step !== 3 || starting || chatInteracting || !autoRefreshHealth || !servicePanelMounted || !servicePanelExpanded) return;
+    if (!runtimeHealthPanelVisible || starting || chatInteracting || !autoRefreshHealth) return;
     void refreshAllChannelHealth();
     void refreshAllPairingRequests();
     const timer = window.setInterval(() => {
@@ -2382,13 +2811,94 @@ function App() {
       void refreshAllPairingRequests();
     }, 60000);
     return () => window.clearInterval(timer);
-  }, [step, customConfigPath, starting, autoRefreshHealth, chatSending, chatInteracting, servicePanelMounted, servicePanelExpanded, refreshAllPairingRequests]);
+  }, [runtimeHealthPanelVisible, customConfigPath, starting, autoRefreshHealth, chatSending, chatInteracting, refreshAllPairingRequests]);
 
   useEffect(() => {
-    if (step !== 3 || !servicePanelMounted || !servicePanelExpanded) return;
+    if (!runtimeHealthPanelVisible) return;
     void refreshAllChannelHealth(true);
     void refreshAllPairingRequests();
-  }, [step, servicePanelMounted, servicePanelExpanded, refreshAllPairingRequests]);
+  }, [runtimeHealthPanelVisible, refreshAllPairingRequests]);
+
+  useEffect(() => {
+    const unlistenPromise = listen<GatewayStartEvent>("gateway-start-finished", (event) => {
+      const payload = event.payload;
+      if (!payload) return;
+      setStarting(false);
+      setStartResult(stripAnsi(payload.message || ""));
+      if (payload.ok) {
+        setStep(3);
+      }
+    });
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  useEffect(() => {
+    const unlistenPromise = listen<ChatReplyFinishedEvent>("chat-reply-finished", (event) => {
+      const payload = event.payload;
+      if (!payload?.requestId) return;
+      const meta = pendingChatRequestsRef.current[payload.requestId];
+      if (!meta) return;
+      delete pendingChatRequestsRef.current[payload.requestId];
+      if (currentPendingChatRequestIdRef.current === payload.requestId) {
+        currentPendingChatRequestIdRef.current = null;
+        chatSendLockRef.current = false;
+        setChatSending(false);
+        setPendingReplyAgentId((prev) => (prev === meta.targetId ? null : prev));
+      }
+      if (!payload.ok) {
+        setChatError(payload.error || "等待回复失败");
+        setMessagesByAgent((prev) => ({
+          ...prev,
+          [meta.targetId]: (prev[meta.targetId] || []).map((m) =>
+            m.id === meta.userMsgId ? { ...m, status: "failed" as const } : m
+          ),
+        }));
+        return;
+      }
+      const replyText = String(payload.text || "").trim();
+      const finalText = meta.mode === "orchestrator"
+        ? `${meta.flowSummary || "【流程】"}\n${replyText || "暂未获取到最终回答（可切到“直连对话”重试）。"}`
+        : replyText;
+      if (!finalText) {
+        setChatError("已结束等待，但未拿到回复内容");
+        return;
+      }
+      const assistantMsg: ChatUiMessage = {
+        id: `local-assistant-bg-${payload.requestId}`,
+        role: "assistant",
+        text: finalText,
+        status: "sent",
+      };
+      startTransition(() => {
+        setMessagesByAgent((prev) => {
+          const local = prev[meta.targetId] || [];
+          const merged = trimChatMessagesForUi(
+            appendDeltaUniqueMessages(
+              local.map((m) => (m.id === meta.userMsgId ? { ...m, status: "sent" as const } : m)),
+              [assistantMsg]
+            )
+          );
+          if (isSameChatMessageList(local, merged)) return prev;
+          return {
+            ...prev,
+            [meta.targetId]: merged,
+          };
+        });
+      });
+      const targetVisible =
+        stepRef.current === 3 &&
+        selectedAgentIdRef.current === meta.targetId &&
+        document.visibilityState === "visible";
+      if (!targetVisible) {
+        setUnreadByAgent((prev) => ({ ...prev, [meta.targetId]: (prev[meta.targetId] || 0) + 1 }));
+      }
+    });
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
 
   const handleFix = async (type: "node" | "npm" | "git" | "openclaw") => {
     setFixing(type);
@@ -2418,25 +2928,21 @@ function App() {
   };
 
   const handleStart = async () => {
+    if (starting) return;
     setStarting(true);
-    setStartResult(null);
+    setStartResult("后台启动已提交，正在准备 Gateway...");
     const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
     const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
     try {
-      const result = await invoke<string>("start_gateway", {
+      const result = await invoke<string>("start_gateway_background", {
         customPath: cfgPath,
         installHint,
       });
       setStartResult(stripAnsi(result));
       setStep(3);
-      window.alert(DEPLOY_SUCCESS_DIALOG);
     } catch (e) {
-      setStartResult(stripAnsi(`启动失败: ${e}`));
-    } finally {
       setStarting(false);
-      if (step === 3) {
-        void refreshAllChannelHealth();
-      }
+      setStartResult(stripAnsi(`启动失败: ${e}`));
     }
   };
 
@@ -3053,6 +3559,17 @@ function App() {
     const fallback = selectedAgentId || agentsList?.agents?.[0]?.id || "";
     if (fallback) setSkillsSelectedAgentId(fallback);
   }, [skillsSelectedAgentId, selectedAgentId, agentsList?.agents]);
+
+  useEffect(() => {
+    if (!agentsList?.agents) return;
+    setAgentNameDrafts((prev) => {
+      const next: Record<string, string> = {};
+      for (const agent of agentsList.agents) {
+        next[agent.id] = prev[agent.id] ?? agent.name ?? "";
+      }
+      return next;
+    });
+  }, [agentsList]);
 
   const refreshModelsForProvider = useCallback(
     async (providerName: string) => {
@@ -4163,6 +4680,37 @@ function App() {
     return "通用";
   }, []);
 
+  const handleRenameAgent = useCallback(
+    async (agentId: string) => {
+      const nextName = (agentNameDrafts[agentId] || "").trim();
+      const currentName = (agentsList?.agents.find((a) => a.id === agentId)?.name || "").trim();
+      if (!nextName) {
+        setAgentsActionResult("Agent 名称不能为空。");
+        return;
+      }
+      if (nextName === currentName) {
+        setAgentsActionResult("名称未变化，无需保存。");
+        return;
+      }
+      setRenamingAgentId(agentId);
+      setAgentsActionResult(null);
+      try {
+        await invoke("rename_agent", {
+          id: agentId,
+          name: nextName,
+          customPath: normalizeConfigPath(customConfigPath) || undefined,
+        });
+        await refreshAgentsList();
+        setAgentsActionResult(`已更新 ${agentId} 的名称`);
+      } catch (e) {
+        setAgentsActionResult(`保存名称失败: ${e}`);
+      } finally {
+        setRenamingAgentId((prev) => (prev === agentId ? null : prev));
+      }
+    },
+    [agentNameDrafts, agentsList, customConfigPath]
+  );
+
   const enabledGatewaysByAgent = useMemo(() => {
     const map: Record<string, GatewayBinding[]> = {};
     for (const g of gatewayBindingsDraft || []) {
@@ -4248,14 +4796,18 @@ function App() {
       });
       const nextMessages = trimChatMessagesForUi((resp.messages || []).map((m) => ({ ...m, status: "sent" as const })));
       chatCursorByAgentRef.current[agentId] = nextMessages.length;
-      setMessagesByAgent((prev) => {
-        const current = prev[agentId] || [];
-        if (isSameChatMessageList(current, nextMessages)) return prev;
-        return {
-          ...prev,
-          [agentId]: nextMessages,
-        };
+      startTransition(() => {
+        setMessagesByAgent((prev) => {
+          const current = prev[agentId] || [];
+          if (isSameChatMessageList(current, nextMessages)) return prev;
+          return {
+            ...prev,
+            [agentId]: nextMessages,
+          };
+        });
       });
+      setChatHistoryLoadedByAgent((prev) => (prev[agentId] ? prev : { ...prev, [agentId]: true }));
+      setChatHistorySuppressedByAgent((prev) => (!prev[agentId] ? prev : { ...prev, [agentId]: false }));
       setUnreadByAgent((prev) => {
         if ((prev[agentId] || 0) === 0) return prev;
         return { ...prev, [agentId]: 0 };
@@ -4272,24 +4824,29 @@ function App() {
     const force = !!options?.force;
     if (!force && chatHistorySuppressedByAgent[agentId]) return;
     const silent = !!options?.silent;
-    const cursor = chatCursorByAgentRef.current[agentId] || 0;
     try {
       const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
       const sessionName = getOrCreateChatSessionName(agentId);
       const gatewayId = getPreferredGatewayIdForAgent(agentId);
+      const localMessages = messagesByAgentRef.current[agentId] || [];
+      const knownFingerprints = localMessages
+        .slice(-24)
+        .map((m) => makeChatMessageFingerprint(m))
+        .filter(Boolean);
       const resp = await invoke<{ session_key: string; cursor: number; messages: ChatUiMessage[] }>(
         "chat_list_history_delta",
         {
           agentId,
           sessionName,
-          cursor,
+          cursor: 0,
           gatewayId,
           customPath: cfgPath,
           preferGatewayDir: chatSessionModeRef.current === "synced",
+          knownFingerprints,
+          limit: 24,
         }
       );
       const delta = (resp.messages || []).map((m) => ({ ...m, status: "sent" as const }));
-      chatCursorByAgentRef.current[agentId] = resp.cursor || cursor;
       if (delta.length === 0) return;
       startTransition(() => {
         setMessagesByAgent((prev) => {
@@ -4345,13 +4902,45 @@ function App() {
   const handleSelectAgentForChat = useCallback(
     async (agentId: string) => {
       setSelectedAgentId(agentId);
+      setSelectedChatStickBottom(chatStickBottomByAgentRef.current[agentId] ?? true);
       setUnreadByAgent((prev) => ({ ...prev, [agentId]: 0 }));
+      setChatError(null);
       void setAgentSpecialtyIdentity(agentId);
-      if (!chatHistorySuppressedRef.current[agentId]) {
-        await loadAgentHistory(agentId);
-      }
+      // 切换 Agent 时只切本地聊天框，不再自动查远端历史。
     },
-    [loadAgentHistory, setAgentSpecialtyIdentity]
+    [setAgentSpecialtyIdentity]
+  );
+
+  const handleLoadSelectedChatHistory = useCallback(async () => {
+    if (!selectedAgentId) return;
+    await loadAgentHistory(selectedAgentId, { force: true });
+  }, [selectedAgentId, loadAgentHistory]);
+
+  const startBackgroundReplyWait = useCallback(
+    async (
+      meta: PendingChatRequestMeta,
+      args: {
+        agentId: string;
+        sessionName: string;
+        gatewayId?: string;
+        customPath?: string;
+        preferGatewayDir: boolean;
+        knownFingerprints: string[];
+      }
+    ) => {
+      pendingChatRequestsRef.current[meta.requestId] = meta;
+      currentPendingChatRequestIdRef.current = meta.requestId;
+      await invoke<string>("chat_wait_for_reply_background", {
+        requestId: meta.requestId,
+        agentId: args.agentId,
+        sessionName: args.sessionName,
+        gatewayId: args.gatewayId,
+        customPath: args.customPath,
+        preferGatewayDir: args.preferGatewayDir,
+        knownFingerprints: args.knownFingerprints,
+      });
+    },
+    []
   );
 
   const handleSendChat = useCallback(async (draftText?: string): Promise<boolean> => {
@@ -4369,6 +4958,8 @@ function App() {
     }
     lastSentFingerprintRef.current[targetId] = { text: dedupText, at: Date.now() };
     chatSendLockRef.current = true;
+    setPendingReplyAgentId(targetId);
+    setChatHistoryLoadedByAgent((prev) => (prev[targetId] ? prev : { ...prev, [targetId]: true }));
     setChatHistorySuppressedByAgent((prev) => {
       if (!prev[targetId]) return prev;
       return { ...prev, [targetId]: false };
@@ -4383,16 +4974,12 @@ function App() {
       text: normalizedText,
       status: "sending",
     };
-    const thinkingMsg: ChatUiMessage = {
-      id: `local-assistant-thinking-${Date.now()}`,
-      role: "assistant",
-      text: "思考中...",
-      status: "sending",
-    };
-    setMessagesByAgent((prev) => ({
-      ...prev,
-      [targetId]: trimChatMessagesForUi([...(prev[targetId] || []), userMsg, thinkingMsg]),
-    }));
+    startTransition(() => {
+      setMessagesByAgent((prev) => ({
+        ...prev,
+        [targetId]: trimChatMessagesForUi([...(prev[targetId] || []), userMsg]),
+      }));
+    });
 
     const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
     const preferGatewayDir = chatSessionModeRef.current === "synced";
@@ -4400,6 +4987,7 @@ function App() {
     const targetGatewayId = getPreferredGatewayIdForAgent(targetId);
     const routeHintText = hint ? `${hint}${targetGatewayId ? ` · 网关 ${targetGatewayId}` : ""}` : (targetGatewayId ? `网关 ${targetGatewayId}` : null);
     setRouteHint(routeHintText);
+    let waitingInBackground = false;
     try {
       if (chatExecutionMode === "orchestrator") {
         const task = await invoke<CpOrchestratorTask>("orchestrator_submit_task", {
@@ -4424,67 +5012,38 @@ function App() {
           customPath: cfgPath,
           preferGatewayDir,
         });
-
-        let finalAnswer = "";
-        for (let i = 0; i < 12; i++) {
-          await new Promise((r) => setTimeout(r, 1200));
-          const resp = await invoke<{ session_key: string; cursor: number; messages: ChatUiMessage[] }>(
-            "chat_list_history_delta",
-            {
-              agentId: executionAgent,
-              sessionName: executionSession,
-              cursor: chatCursorByAgentRef.current[executionAgent] || 0,
-              gatewayId: executionGatewayId,
-              customPath: cfgPath,
-              preferGatewayDir,
-            }
-          );
-          chatCursorByAgentRef.current[executionAgent] = resp.cursor || chatCursorByAgentRef.current[executionAgent] || 0;
-          const delta = (resp.messages || []).map((m) => ({ ...m, status: "sent" as const }));
-          const assistantDelta = delta.filter((m) => m.role === "assistant" && normalizeChatText(m.text).length > 0);
-          if (assistantDelta.length > 0) {
-            finalAnswer = assistantDelta[assistantDelta.length - 1].text;
-            break;
-          }
-        }
-        if (!finalAnswer) {
-          const full = await invoke<{ session_key: string; messages: ChatUiMessage[] }>("chat_list_history", {
+        const flowSummary = `【流程】编排:${targetId} -> 执行:${executionAgent}${executionGatewayId ? `@${executionGatewayId}` : ""} -> 验收:${
+          task.verifier ? `${task.verifier.passed ? "通过" : "未通过"}(${task.verifier.score.toFixed(2)})` : "无"
+        }${task.route_decision ? ` -> 意图:${task.route_decision.intent}` : ""}`;
+        setMessagesByAgent((prev) => ({
+          ...prev,
+          [targetId]: (prev[targetId] || []).map((m) =>
+            m.id === userMsg.id ? { ...m, status: "sent" as const } : m
+          ),
+        }));
+        const executionKnownFingerprints = (messagesByAgentRef.current[executionAgent] || [])
+          .concat([{ ...userMsg, status: "sent" as const }])
+          .slice(-24)
+          .map((m) => makeChatMessageFingerprint(m))
+          .filter(Boolean);
+        await startBackgroundReplyWait(
+          {
+            requestId: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            targetId,
+            userMsgId: userMsg.id,
+            mode: "orchestrator",
+            flowSummary,
+          },
+          {
             agentId: executionAgent,
             sessionName: executionSession,
             gatewayId: executionGatewayId,
             customPath: cfgPath,
             preferGatewayDir,
-          });
-          const all = (full.messages || []).map((m) => ({ ...m, status: "sent" as const }));
-          const lastAssistant = [...all].reverse().find((m) => m.role === "assistant" && normalizeChatText(m.text).length > 0);
-          if (lastAssistant) finalAnswer = lastAssistant.text;
-        }
-
-        const flowSummary = `【流程】编排:${targetId} -> 执行:${executionAgent}${executionGatewayId ? `@${executionGatewayId}` : ""} -> 验收:${
-          task.verifier ? `${task.verifier.passed ? "通过" : "未通过"}(${task.verifier.score.toFixed(2)})` : "无"
-        }${task.route_decision ? ` -> 意图:${task.route_decision.intent}` : ""}`;
-
-        const assistantMsg: ChatUiMessage = {
-          id: `local-assistant-flow-${Date.now()}`,
-          role: "assistant",
-          text: finalAnswer
-            ? `${flowSummary}\n${finalAnswer}`
-            : `${flowSummary}\n暂未获取到最终回答（可切到“直连对话”重试）。`,
-          status: "sent",
-        };
-
-        setMessagesByAgent((prev) => ({
-          ...prev,
-          [targetId]: trimChatMessagesForUi(
-            (prev[targetId] || [])
-              .map((m) => (m.id === userMsg.id ? { ...m, status: "sent" as const } : m))
-              .filter((m) => m.id !== thinkingMsg.id)
-              .concat(assistantMsg)
-          ),
-        }));
-        if (targetId !== selectedAgentId) {
-          setUnreadByAgent((prev) => ({ ...prev, [targetId]: (prev[targetId] || 0) + 1 }));
-        }
+            knownFingerprints: executionKnownFingerprints,
+          }
+        );
+        waitingInBackground = true;
         return true;
       }
 
@@ -4502,99 +5061,57 @@ function App() {
           m.id === userMsg.id ? { ...m, status: "sent" } : m
         ),
       }));
-
-      // 发送成功后走后端增量接口，低频拉取减少卡顿
-      let gotAssistant = false;
-      for (let i = 0; i < 12; i++) {
-        await new Promise((r) => setTimeout(r, 1200));
-        const resp = await invoke<{ session_key: string; cursor: number; messages: ChatUiMessage[] }>(
-          "chat_list_history_delta",
-          {
-            agentId: targetId,
-            sessionName,
-            cursor: chatCursorByAgentRef.current[targetId] || 0,
-            gatewayId: targetGatewayId,
-            customPath: cfgPath,
-            preferGatewayDir,
-          }
-        );
-        chatCursorByAgentRef.current[targetId] = resp.cursor || chatCursorByAgentRef.current[targetId] || 0;
-        const delta = (resp.messages || []).map((m) => ({ ...m, status: "sent" as const }));
-        if (delta.length > 0) {
-          const hasAssistantReply = delta.some((m) => m.role === "assistant");
-          startTransition(() => {
-            setMessagesByAgent((prev) => {
-              const local = prev[targetId] || [];
-              const merged = trimChatMessagesForUi(
-                appendDeltaUniqueMessages(local, delta, { removeMessageId: thinkingMsg.id })
-              );
-              if (isSameChatMessageList(local, merged)) return prev;
-              return {
-                ...prev,
-                [targetId]: merged,
-              };
-            });
-          });
-          if (hasAssistantReply) {
-            gotAssistant = true;
-            break;
-          }
-        }
-      }
-      if (!gotAssistant) {
-        const full = await invoke<{ session_key: string; messages: ChatUiMessage[] }>("chat_list_history", {
+      const knownFingerprints = (messagesByAgentRef.current[targetId] || [])
+        .concat([{ ...userMsg, status: "sent" as const }])
+        .slice(-24)
+        .map((m) => makeChatMessageFingerprint(m))
+        .filter(Boolean);
+      await startBackgroundReplyWait(
+        {
+          requestId: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          targetId,
+          userMsgId: userMsg.id,
+          mode: "direct",
+        },
+        {
           agentId: targetId,
           sessionName,
           gatewayId: targetGatewayId,
           customPath: cfgPath,
           preferGatewayDir,
-        });
-        const all = (full.messages || []).map((m) => ({ ...m, status: "sent" as const }));
-        const hasAssistantReply = all.some((m) => m.role === "assistant");
-        startTransition(() => {
-          setMessagesByAgent((prev) => {
-            const local = prev[targetId] || [];
-            const merged = trimChatMessagesForUi(
-              appendDeltaUniqueMessages(local, all, { removeMessageId: thinkingMsg.id })
-            );
-            if (isSameChatMessageList(local, merged)) return prev;
-            return {
-              ...prev,
-              [targetId]: merged,
-            };
-          });
-        });
-        gotAssistant = hasAssistantReply;
-      }
-
-      // 没拿到新消息时，移除占位“思考中...”
-      setMessagesByAgent((prev) => ({
-        ...prev,
-        [targetId]: (prev[targetId] || []).filter((m) => m.id !== thinkingMsg.id),
-      }));
-
-      if (targetId !== selectedAgentId) {
-        setUnreadByAgent((prev) => ({ ...prev, [targetId]: (prev[targetId] || 0) + 1 }));
-      }
+          knownFingerprints,
+        }
+      );
+      waitingInBackground = true;
       return true;
     } catch (e) {
+      currentPendingChatRequestIdRef.current = null;
       setChatError(String(e));
       setMessagesByAgent((prev) => ({
         ...prev,
-        [targetId]: (prev[targetId] || [])
-          .filter((m) => m.id !== thinkingMsg.id)
-          .map((m) => (m.id === userMsg.id ? { ...m, status: "failed" } : m)),
+        [targetId]: (prev[targetId] || []).map((m) => (m.id === userMsg.id ? { ...m, status: "failed" } : m)),
       }));
       return false;
     } finally {
-      setChatSending(false);
-      chatSendLockRef.current = false;
+      if (!waitingInBackground) {
+        setChatSending(false);
+        setPendingReplyAgentId((prev) => (prev === targetId ? null : prev));
+        chatSendLockRef.current = false;
+      }
     }
-  }, [chatSending, chatDraft, resolveTargetAgent, selectedAgentId, chatExecutionMode, customConfigPath, getOrCreateChatSessionName, markChatInteracting, getPreferredGatewayIdForAgent]);
+  }, [chatSending, chatDraft, resolveTargetAgent, selectedAgentId, chatExecutionMode, customConfigPath, getOrCreateChatSessionName, markChatInteracting, getPreferredGatewayIdForAgent, startBackgroundReplyWait]);
 
   const handleAbortChat = useCallback(async () => {
     if (!selectedAgentId) return;
     try {
+      const pendingId = currentPendingChatRequestIdRef.current;
+      if (pendingId) {
+        delete pendingChatRequestsRef.current[pendingId];
+        currentPendingChatRequestIdRef.current = null;
+      }
+      chatSendLockRef.current = false;
+      setChatSending(false);
+      setPendingReplyAgentId((prev) => (prev === selectedAgentId ? null : prev));
       const sessionName = getOrCreateChatSessionName(selectedAgentId);
       await invoke("chat_abort", {
         agentId: selectedAgentId,
@@ -4623,6 +5140,7 @@ function App() {
       setRouteHint("已切换到新的隔离会话（仅客户端可见）。");
     }
     setChatHistorySuppressedByAgent((prev) => ({ ...prev, [selectedAgentId]: true }));
+    setChatHistoryLoadedByAgent((prev) => ({ ...prev, [selectedAgentId]: false }));
     setMessagesByAgent((prev) => ({ ...prev, [selectedAgentId]: [] }));
   }, [selectedAgentId]);
 
@@ -4631,7 +5149,9 @@ function App() {
       if (!selectedAgentId) return;
       const viewport = evt.currentTarget;
       const distanceToBottom = viewport.scrollHeight - (viewport.scrollTop + viewport.clientHeight);
-      chatStickBottomByAgentRef.current[selectedAgentId] = distanceToBottom <= 40;
+      const nextStickBottom = distanceToBottom <= 40;
+      chatStickBottomByAgentRef.current[selectedAgentId] = nextStickBottom;
+      setSelectedChatStickBottom((prev) => (prev === nextStickBottom ? prev : nextStickBottom));
       if (viewport.scrollTop > 100) return;
       const total = (messagesByAgentRef.current[selectedAgentId] || []).length;
       const currentLimit = chatRenderLimitByAgentRef.current[selectedAgentId] || CHAT_RENDER_BATCH;
@@ -5204,6 +5724,23 @@ function App() {
   const chatAgents = agentsList?.agents ?? EMPTY_AGENTS;
   const selectedChatMessages = selectedAgentId ? messagesByAgent[selectedAgentId] || EMPTY_CHAT_MESSAGES : EMPTY_CHAT_MESSAGES;
   const selectedChatRenderLimit = selectedAgentId ? chatRenderLimitByAgent[selectedAgentId] || CHAT_RENDER_BATCH : CHAT_RENDER_BATCH;
+  const chatPreviewByAgent = useMemo(
+    () =>
+      Object.fromEntries(
+        Object.entries(messagesByAgent).map(([agentId, list]) => {
+          const last = [...(list || [])].reverse().find((item) => normalizeChatText(item.text).length > 0);
+          const text = last ? normalizeChatText(last.text).slice(0, 42) : "";
+          return [
+            agentId,
+            {
+              text,
+              time: last ? formatChatPreviewTime(last.timestamp) : "",
+            } satisfies ChatPreviewMeta,
+          ];
+        })
+      ) as Record<string, ChatPreviewMeta>,
+    [messagesByAgent]
+  );
   const lowerIssue = latestIssueText.toLowerCase();
   const suggestModelFix = lowerIssue.includes("model") || lowerIssue.includes("401") || lowerIssue.includes("api key");
   const suggestGatewayFix =
@@ -5262,13 +5799,25 @@ function App() {
     });
   }, []);
 
-  const handleToggleServicePanel = useCallback(() => {
-    setServicePanelExpanded((prev) => {
-      const next = !prev;
-      setServicePanelMounted(next);
-      return next;
-    });
-  }, []);
+  const currentPrimaryNav = step === 3 ? "chat" : step === 4 ? (tuningSection === "health" ? "repair" : "tuning") : "home";
+  const handlePrimaryNavChange = useCallback(
+    (target: "home" | "chat" | "tuning" | "repair") => {
+      startTransition(() => {
+        if (target === "home") {
+          setStep(0);
+          return;
+        }
+        if (target === "chat") {
+          setStep(3);
+          return;
+        }
+        setStep(4);
+        setTuningSection(target === "repair" ? "health" : "agents");
+        if (target === "tuning") setAgentCenterTab("overview");
+      });
+    },
+    []
+  );
 
   const heavyPanelStyle = useMemo(
     () =>
@@ -5281,41 +5830,141 @@ function App() {
 
   const envReady = nodeCheck?.ok && npmCheck?.ok;
   const canProceed = step === 0 ? envReady : true;
+  const currentAiServiceLabel = getAiServiceLabel(provider);
+  const visibleAiModels = provider === "kimi"
+    ? [{ id: "moonshotai/Kimi-K2-Instruct-0905", label: "Kimi K2（长文本推荐）" }]
+    : FIXED_SILICONFLOW_MODELS;
+  const installReady = !!(localInfo?.installed || openclawCheck?.ok);
+  const aiReady = !!(keySyncStatus?.env_key_prefix || runtimeModelInfo?.key_prefix || apiKey.trim());
+  const chatReady = !!selectedAgentId;
+  const homeStatusLabel = !installReady ? "未安装" : !aiReady ? "待配置 AI" : !chatReady ? "待创建 Agent" : "已可聊天";
+  const channelTabStatusMap = useMemo(() => {
+    const channels: ChannelEditorChannel[] = ["telegram", "feishu", "dingtalk", "discord", "qq"];
+    const next = {} as Record<
+      ChannelEditorChannel,
+      { label: "待补全" | "已配置" | "已连通"; dotClass: string; textClass: string; title: string }
+    >;
+    for (const ch of channels) {
+      const hasConfigured =
+        ch === "telegram"
+          ? telegramInstancesDraft.some((item) => !!item.bot_token?.trim())
+          : channelInstancesDraft.some((item) => item.channel === ch && hasRequiredChannelCredentials(ch, item));
+      const linkedToGateway = (gatewayBindingsDraft || []).some((binding) => {
+        if (binding.enabled === false) return false;
+        const channelMap = parseGatewayChannelInstances(binding.channel_instances, binding.channel, binding.instance_id);
+        return !!channelMap[ch];
+      });
+      if (!hasConfigured) {
+        next[ch] = {
+          label: "待补全",
+          dotClass: "bg-amber-400",
+          textClass: "text-amber-200",
+          title: `${ch} 还没填完凭据`,
+        };
+      } else if (linkedToGateway) {
+        next[ch] = {
+          label: "已连通",
+          dotClass: "bg-emerald-400",
+          textClass: "text-emerald-200",
+          title: `${ch} 已进入当前 Agent 网关绑定`,
+        };
+      } else {
+        next[ch] = {
+          label: "已配置",
+          dotClass: "bg-sky-400",
+          textClass: "text-sky-200",
+          title: `${ch} 已填写凭据，但还没进入网关绑定`,
+        };
+      }
+    }
+    return next;
+  }, [telegramInstancesDraft, channelInstancesDraft, gatewayBindingsDraft, parseGatewayChannelInstances, hasRequiredChannelCredentials]);
+  const stickyChannelActionFeedback = agentRuntimeResult || channelResult;
+  const stickyChannelActionFeedbackClass = stickyChannelActionFeedback
+    ? /失败|错误|拦截|冲突/.test(stickyChannelActionFeedback)
+      ? "border-rose-600/50 bg-rose-950/30 text-rose-200"
+      : /请先|未选择|待补全|暂无/.test(stickyChannelActionFeedback)
+        ? "border-amber-600/50 bg-amber-950/30 text-amber-200"
+        : "border-emerald-600/40 bg-emerald-950/20 text-emerald-200"
+    : "";
+  const tuningPageTitle = tuningSection === "health" ? "修复中心" : "调教中心";
+  const currentTuningNav =
+    tuningSection === "agents"
+      ? agentCenterTab === "channels"
+        ? "channels"
+        : "agents"
+      : tuningSection === "skills"
+        ? "skills"
+        : tuningSection === "memory"
+          ? "memory"
+          : tuningSection === "scene"
+            ? "templates"
+            : "advanced";
 
   return (
     <div className="min-h-screen bg-slate-900 text-slate-100 flex flex-col">
-      {/* Header */}
       <header className="border-b border-slate-700 px-6 py-4">
-        <h1 className="text-xl font-bold flex items-center gap-2">
-          <span className="text-2xl">🦞</span>
-          OpenClaw 一键部署
-        </h1>
-        <p className="text-slate-400 text-sm mt-1">小白零门槛，5 分钟拥有私人 AI 助手</p>
+        <div className="flex items-center justify-between gap-4 flex-wrap">
+          <div>
+            <h1 className="text-xl font-bold flex items-center gap-2">
+              <span className="text-2xl">🦞</span>
+              OpenClaw 控制台
+            </h1>
+            <p className="text-slate-400 text-sm mt-1">围绕 API、安装、对话与修复的一体化小白面板</p>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap text-xs text-slate-400">
+            <span className="rounded-full border border-slate-700 bg-slate-800/80 px-3 py-1.5">首页状态：{homeStatusLabel}</span>
+            <span className="rounded-full border border-slate-700 bg-slate-800/80 px-3 py-1.5">当前 AI：{currentAiServiceLabel}</span>
+            <span className="rounded-full border border-slate-700 bg-slate-800/80 px-3 py-1.5">当前入口：{currentPrimaryNav === "repair" ? "修复中心" : currentPrimaryNav === "tuning" ? "调教中心" : currentPrimaryNav === "chat" ? "聊天" : "首页"}</span>
+          </div>
+        </div>
       </header>
 
-      {/* Step indicator */}
-      <div className="flex gap-2 px-6 py-4 border-b border-slate-700 overflow-x-auto">
-        {STEPS.map((s, i) => (
-          <button
-            key={s.id}
-            onClick={() => handleStepChange(s.id)}
-            className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition ${
-              step === s.id
-                ? "bg-emerald-600 text-white"
-                : i < step
-                  ? "bg-slate-700 text-slate-300"
-                  : "bg-slate-800 text-slate-500"
-            }`}
-          >
-            <s.icon className="w-4 h-4" />
-            {s.title}
-            {i < STEPS.length - 1 && <ChevronRight className="w-4 h-4 opacity-50" />}
-          </button>
-        ))}
-      </div>
+      <div className="flex flex-1 min-h-0">
+        <aside className="w-60 shrink-0 border-r border-slate-700 bg-slate-950/70 p-4 flex flex-col gap-4">
+          <div className="space-y-1">
+            {PRIMARY_NAV_ITEMS.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => handlePrimaryNavChange(item.id)}
+                className={`w-full flex items-center gap-3 rounded-xl px-3 py-3 text-sm transition ${
+                  currentPrimaryNav === item.id
+                    ? "bg-sky-800/80 text-sky-100 border border-sky-600/70"
+                    : "bg-slate-800/70 text-slate-300 border border-slate-800 hover:border-slate-600 hover:bg-slate-800"
+                }`}
+              >
+                <item.icon className="w-4 h-4" />
+                <span>{item.label}</span>
+              </button>
+            ))}
+          </div>
 
-      {/* Content */}
-      <main className="flex-1 p-6 overflow-auto flex flex-col">
+          <div className="rounded-xl border border-slate-800 bg-slate-900/80 p-3 space-y-2 text-xs">
+            <p className="text-slate-200 font-medium">首次跑通路径</p>
+            <div className="space-y-1 text-slate-400">
+              <button onClick={() => handleStepChange(0)} className="block hover:text-slate-200">1. 环境检测</button>
+              <button onClick={() => handleStepChange(1)} className="block hover:text-slate-200">2. 安装 OpenClaw</button>
+              <button onClick={() => handleStepChange(2)} className="block hover:text-slate-200">3. AI 服务配置</button>
+              <button onClick={() => handlePrimaryNavChange("tuning")} className="block hover:text-slate-200">4. Agent 与渠道</button>
+              <button onClick={() => handlePrimaryNavChange("chat")} className="block hover:text-slate-200">5. 进入聊天</button>
+            </div>
+          </div>
+
+          <div className="mt-auto space-y-2 text-xs text-slate-500">
+            <button
+              onClick={() => openUrl("https://clawd.bot/docs")}
+              className="w-full flex items-center justify-between rounded-lg border border-slate-800 bg-slate-900/70 px-3 py-2 hover:text-slate-300"
+            >
+              官方文档 <ExternalLink className="w-3 h-3" />
+            </button>
+            <div className="rounded-lg border border-slate-800 bg-slate-900/70 px-3 py-2">
+              <p>当前页面：{currentPrimaryNav === "repair" ? "修复中心" : currentPrimaryNav === "tuning" ? "调教中心" : currentPrimaryNav === "chat" ? "聊天" : "首页"}</p>
+            </div>
+          </div>
+        </aside>
+
+        <div className="flex-1 min-w-0 flex flex-col">
+          <main className="flex-1 p-6 overflow-auto flex flex-col">
         {(suggestModelFix || suggestGatewayFix || suggestSkillsFix) && (
           <div className="w-full max-w-[1200px] mx-auto mb-4 rounded-lg border border-amber-700 bg-amber-900/20 p-3 text-xs space-y-2">
             <p className="text-amber-200">检测到可能异常，建议下一步：</p>
@@ -5350,7 +5999,139 @@ function App() {
         {/* Step 0: 环境检测 */}
         {step === 0 && (
           <div className="w-full max-w-[1200px] mx-auto space-y-6">
-            <h2 className="text-lg font-semibold">环境检测</h2>
+            <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-6">
+              <div className="flex items-start justify-between gap-4 flex-wrap">
+                <div className="space-y-2">
+                  <p className="text-xs uppercase tracking-[0.2em] text-sky-300">首页</p>
+                  <h2 className="text-2xl font-semibold text-white">3 分钟跑通 OpenClaw</h2>
+                  <p className="text-sm text-slate-300 max-w-2xl">
+                    先检查环境，再安装 OpenClaw，接着配置 AI 服务和 Agent/渠道，最后回到聊天页发出第一条消息。
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-700 bg-slate-900/70 px-4 py-3 text-sm text-slate-300 min-w-[220px]">
+                  <p className="text-slate-100 font-medium mb-1">当前总状态</p>
+                  <p>{homeStatusLabel}</p>
+                  <p className="text-xs text-slate-500 mt-2">
+                    {aiReady ? `AI 已接通：${currentAiServiceLabel}` : "AI 服务尚未完成测试"}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-5 space-y-3">
+                <div className="flex items-center gap-2 text-slate-100 font-medium">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  环境准备
+                </div>
+                <p className="text-sm text-slate-400">检查 Node、Git、OpenClaw 与插件状态，问题集中在这里一键修。</p>
+                <div className="text-xs text-slate-500 space-y-1">
+                  <p>Node：{nodeCheck?.ok ? "正常" : "待修复"}</p>
+                  <p>Git：{gitCheck?.ok ? "正常" : "建议安装"}</p>
+                  <p>OpenClaw：{openclawCheck?.ok ? "已安装" : "未安装"}</p>
+                </div>
+                <button
+                  onClick={() => runEnvCheck()}
+                  disabled={checking}
+                  className="px-3 py-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded-lg text-sm"
+                >
+                  {checking ? "检测中..." : "一键检查并修复"}
+                </button>
+              </div>
+
+              <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-5 space-y-3">
+                <div className="flex items-center gap-2 text-slate-100 font-medium">
+                  <Key className="w-4 h-4 text-sky-400" />
+                  AI 服务配置
+                </div>
+                <p className="text-sm text-slate-400">围绕你的 API 商业模式，先选渠道，再选便宜模型，填 Key 就能用。</p>
+                <div className="text-xs text-slate-500 space-y-1">
+                  <p>当前服务：{currentAiServiceLabel}</p>
+                  <p>当前模型：{selectedModel || "未选择"}</p>
+                  <p>状态：{aiReady ? "已配置" : "未配置"}</p>
+                </div>
+                <button
+                  onClick={() => handleStepChange(2)}
+                  className="px-3 py-2 bg-sky-700 hover:bg-sky-600 rounded-lg text-sm"
+                >
+                  配置 AI 服务
+                </button>
+              </div>
+
+              <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-5 space-y-3">
+                <div className="flex items-center gap-2 text-slate-100 font-medium">
+                  <Play className="w-4 h-4 text-amber-400" />
+                  开始聊天
+                </div>
+                <p className="text-sm text-slate-400">创建默认 Agent、绑定一个渠道，然后直接去聊天页发送第一条消息。</p>
+                <div className="text-xs text-slate-500 space-y-1">
+                  <p>默认 Agent：{selectedAgentId || "未选择"}</p>
+                  <p>渠道配置：{agentsList?.bindings?.length ? "已存在绑定" : "待配置"}</p>
+                  <p>Gateway：{starting ? "启动中" : "待就绪"}</p>
+                </div>
+                <div className="flex gap-2 flex-wrap">
+                  <button
+                    onClick={() => handlePrimaryNavChange("tuning")}
+                    className="px-3 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm"
+                  >
+                    去 Agent 与渠道
+                  </button>
+                  <button
+                    onClick={() => handlePrimaryNavChange("chat")}
+                    className="px-3 py-2 bg-amber-700 hover:bg-amber-600 rounded-lg text-sm"
+                  >
+                    进入聊天
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-700 bg-slate-800/40 p-4">
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div>
+                  <p className="text-sm text-slate-200 font-medium">推荐模板与帮助入口</p>
+                  <p className="text-xs text-slate-400 mt-1">先用模板跑通，再去调教中心做进阶配置。</p>
+                </div>
+                <div className="flex gap-2 flex-wrap">
+                  {["本地直聊", "Telegram 单 Bot", "QQ Bot", "飞书 Bot"].map((name) => (
+                    <button
+                      key={name}
+                      onClick={() => handlePrimaryNavChange(name === "本地直聊" ? "chat" : "tuning")}
+                      className="px-3 py-1.5 rounded-lg border border-slate-600 bg-slate-800 hover:bg-slate-700 text-xs"
+                    >
+                      {name}
+                    </button>
+                  ))}
+                  <button
+                    onClick={() => handlePrimaryNavChange("repair")}
+                    className="px-3 py-1.5 rounded-lg border border-amber-600 bg-amber-900/20 hover:bg-amber-900/30 text-xs text-amber-200"
+                  >
+                    出问题了？前往修复中心
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <div>
+                <h3 className="text-lg font-semibold">环境准备</h3>
+                <p className="text-sm text-slate-400 mt-1">下面保留完整环境检查与修复能力，给首次安装和排障使用。</p>
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                <button
+                  onClick={() => handleStepChange(1)}
+                  className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm"
+                >
+                  查看安装页
+                </button>
+                <button
+                  onClick={() => handleStepChange(2)}
+                  className="px-3 py-2 rounded-lg bg-sky-700 hover:bg-sky-600 text-sm"
+                >
+                  去 AI 服务配置
+                </button>
+              </div>
+            </div>
             {checking ? (
               <div className="flex items-center gap-2 text-slate-400">
                 <Loader2 className="w-5 h-5 animate-spin" />
@@ -5574,302 +6355,373 @@ function App() {
         {/* Step 2: 配置 AI 模型 */}
         {step === 2 && (
           <div className="w-full max-w-[1200px] mx-auto space-y-6">
-            <h2 className="text-lg font-semibold">配置 AI 模型</h2>
-            <p className="text-slate-400">
-              选择 AI 提供商并填入 API Key。支持自定义 API 地址（如 OneAPI、NewAPI 等中转服务）。
-            </p>
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium mb-2">AI 提供商</label>
-                <select
-                  value={provider}
-                  onChange={(e) => {
-                    const next = e.target.value;
-                    if (next === provider) return;
-                    if (apiKey.trim()) {
-                      const confirmed = window.confirm(
-                        "切换 AI 提供商将清空当前 API Key，避免不同平台 Key 串用。是否继续？"
+            <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-6">
+              <div className="flex items-start justify-between gap-4 flex-wrap">
+                <div className="space-y-2">
+                  <p className="text-xs uppercase tracking-[0.2em] text-sky-300">AI 服务配置</p>
+                  <h2 className="text-2xl font-semibold text-white">AI 服务中心</h2>
+                  <p className="text-sm text-slate-300 max-w-2xl">
+                    先选服务渠道，再选模型方案，填入密钥并验证通过。默认只保留小白真正需要的接入动作。
+                  </p>
+                </div>
+                <div className="rounded-xl border border-slate-700 bg-slate-900/70 px-4 py-3 text-sm text-slate-300 min-w-[260px]">
+                  <p className="text-slate-100 font-medium mb-1">接入状态</p>
+                  <p>服务渠道：{currentAiServiceLabel}</p>
+                  <p>当前模型：{selectedModel || "未选择"}</p>
+                  <p className={aiReady ? "text-emerald-300 mt-2" : "text-amber-300 mt-2"}>
+                    {aiReady ? "已接入，可直接开始聊天" : "尚未完成接入"}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 xl:grid-cols-[1.5fr_0.9fr] gap-6">
+              <div className="space-y-4">
+                <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-5 space-y-4">
+                  <div>
+                    <p className="text-sm font-medium text-slate-100">服务渠道选择</p>
+                    <p className="text-xs text-slate-400 mt-1">当前先固定硅基流动和 Kimi，后面可自然扩展到你的官方线路。</p>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    {AI_SERVICE_OPTIONS.map((option) => {
+                      const selected =
+                        (option.id === "kimi" && provider === "kimi") ||
+                        (option.id === "openai" && provider !== "kimi");
+                      const disabled = option.id === "official";
+                      return (
+                        <button
+                          key={option.id}
+                          disabled={disabled}
+                          onClick={() => {
+                            if (option.id === "official") return;
+                            if (option.id === "kimi") {
+                              setProvider("kimi");
+                              setBaseUrl(DEFAULT_KIMI_BASE_URL);
+                              setSelectedModel("moonshotai/Kimi-K2-Instruct-0905");
+                            } else {
+                              setProvider("openai");
+                              setBaseUrl(DEFAULT_OPENAI_BASE_URL);
+                              setSelectedModel(RECOMMENDED_MODEL_FALLBACK);
+                            }
+                          }}
+                          className={`rounded-xl border p-4 text-left transition ${
+                            disabled
+                              ? "border-slate-800 bg-slate-900/60 text-slate-500 cursor-not-allowed"
+                              : selected
+                                ? "border-sky-500 bg-sky-900/30 text-sky-100"
+                                : "border-slate-700 bg-slate-900/50 hover:border-slate-500 text-slate-200"
+                          }`}
+                        >
+                          <p className="font-medium">{option.label}</p>
+                          <p className="text-xs mt-2 opacity-80">{option.desc}</p>
+                        </button>
                       );
-                      if (!confirmed) return;
-                      setApiKey("");
+                    })}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-5 space-y-4">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div>
+                      <p className="text-sm font-medium text-slate-100">模型方案选择</p>
+                      <p className="text-xs text-slate-400 mt-1">默认展示固定低成本模型，先保证稳定、便宜、能跑通。</p>
+                    </div>
+                    <span className="text-xs text-slate-500">当前渠道：{currentAiServiceLabel}</span>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {visibleAiModels.map((model, index) => (
+                      <button
+                        key={model.id}
+                        onClick={() => setSelectedModel(model.id)}
+                        className={`rounded-xl border p-4 text-left transition ${
+                          selectedModel === model.id
+                            ? "border-emerald-500 bg-emerald-900/25 text-emerald-100"
+                            : "border-slate-700 bg-slate-900/50 hover:border-slate-500 text-slate-200"
+                        }`}
+                      >
+                        <p className="font-medium">{model.label}</p>
+                        <p className="text-xs mt-2 text-slate-400">
+                          {index === 0 ? "默认推荐，适合大多数用户" : provider === "kimi" ? "长文本问答更稳" : "便宜模型，适合高频使用"}
+                        </p>
+                      </button>
+                    ))}
+                  </div>
+                  {selectedModel && (() => {
+                    const inferred = inferModelContextWindow(selectedModel);
+                    if (inferred !== null && inferred < 16000) {
+                      return (
+                        <p className="text-amber-300 text-xs">
+                          当前模型推断窗口约 {inferred}，低于系统最低 16000，保存时会被拦截。
+                        </p>
+                      );
                     }
-                    setProvider(next);
-                    if (next === "kimi") {
-                      setBaseUrl(DEFAULT_KIMI_BASE_URL);
-                      setSelectedModel("moonshotai/Kimi-K2-Instruct-0905");
-                    } else if (next === "openai" || next === "deepseek" || next === "qwen") {
-                      if (!baseUrl.trim() || baseUrl.trim() === DEFAULT_KIMI_BASE_URL) {
-                        setBaseUrl(DEFAULT_OPENAI_BASE_URL);
-                      }
-                      setSelectedModel(RECOMMENDED_MODEL_FALLBACK);
+                    if (inferred !== null) {
+                      return <p className="text-emerald-300 text-xs">当前模型推断窗口约 {inferred}。</p>;
                     }
-                  }}
-                  className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
-                >
-                  <option value="anthropic">Anthropic Claude</option>
-                  <option value="openai">OpenAI GPT</option>
-                  <option value="deepseek">DeepSeek</option>
-                  <option value="kimi">Kimi (Moonshot)</option>
-                  <option value="qwen">通义千问 (Qwen)</option>
-                  <option value="bailian">阿里云百炼</option>
-                </select>
-                <p className="text-sky-300 text-xs mt-2">
-                  保存后将写入运行时主模型：
-                  {selectedModel
-                    ? ` ${provider === "anthropic" ? "anthropic" : "openai"}/${selectedModel}`
-                    : ` ${preferredPrimaryModelForProvider(provider)}`}
-                </p>
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-2">API Key *</label>
-                <input
-                  type="password"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="输入你的硅基流动 Key（没有？加作者QQ群1085253453领免费测试额度）"
-                  className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
-                />
-                <p className="text-emerald-300 text-xs mt-2">
-                  作者推荐硅基流动API（免费额度多、速度快），或 Kimi（长上下文强）。加群领备用Key + 未来包月代理（29元无限）
-                </p>
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-2">
-                  可用模型 <span className="text-slate-500">(硅基流动)</span>
-                </label>
-                <select
-                  value={selectedModel}
-                  onChange={(e) => setSelectedModel(e.target.value)}
-                  className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
-                >
-                  {FIXED_SILICONFLOW_MODELS.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
-                <p className="text-sky-300 text-xs mt-2">
-                  想用更多高端模型？加群 1085253453 解锁！
-                </p>
-                {selectedModel && (() => {
-                  const inferred = inferModelContextWindow(selectedModel);
-                  if (inferred !== null && inferred < 16000) {
-                    return (
-                      <p className="text-amber-300 text-xs mt-2">
-                        当前模型推断窗口约 {inferred}，低于系统最低 16000，保存将被拦截。
-                      </p>
-                    );
-                  }
-                  if (inferred !== null) {
-                    return <p className="text-emerald-300 text-xs mt-2">当前模型推断窗口约 {inferred}。</p>;
-                  }
-                  return (
-                    <p className="text-slate-400 text-xs mt-2">
-                      当前模型窗口未知，建议优先选择带 16k/32k/128k 标识的模型。
+                    return <p className="text-slate-500 text-xs">当前模型窗口未知，建议优先使用默认推荐模型。</p>;
+                  })()}
+                </div>
+
+                <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-5 space-y-4">
+                  <div>
+                    <p className="text-sm font-medium text-slate-100">接入密钥</p>
+                    <p className="text-xs text-slate-400 mt-1">填入当前服务渠道的密钥，验证通过后即可启用。</p>
+                  </div>
+                  <div className="space-y-3">
+                    <div className="flex gap-2">
+                      <input
+                        type={showApiKey ? "text" : "password"}
+                        value={apiKey}
+                        onChange={(e) => setApiKey(e.target.value)}
+                        placeholder={provider === "kimi" ? "输入你的 Kimi API Key" : "输入你的硅基流动 API Key"}
+                        className="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-4 py-3"
+                      />
+                      <button
+                        type="button"
+                        onClick={async () => {
+                          try {
+                            const text = await navigator.clipboard.readText();
+                            if (text) setApiKey(text);
+                          } catch {}
+                        }}
+                        className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs"
+                      >
+                        粘贴
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setShowApiKey((prev) => !prev)}
+                        className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs"
+                      >
+                        {showApiKey ? "隐藏" : "显示"}
+                      </button>
+                    </div>
+                    <p className="text-xs text-emerald-300">
+                      这里就是后续商业化的核心入口：获取 Key、测试额度、备用 Key、包月代理、官方线路。
                     </p>
-                  );
-                })()}
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-2">
-                  自定义 API 地址 <span className="text-slate-500">(可选)</span>
-                </label>
-                <input
-                  type="text"
-                  value={baseUrl}
-                  onChange={(e) => setBaseUrl(e.target.value)}
-                  placeholder={DEFAULT_OPENAI_BASE_URL}
-                  className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
-                />
-                <div className="flex gap-2 mt-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setProvider("openai");
-                      setBaseUrl(DEFAULT_OPENAI_BASE_URL);
-                      setSelectedModel(RECOMMENDED_MODEL_FALLBACK);
-                    }}
-                    className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-xs"
-                  >
-                    使用硅基地址
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setProvider("kimi");
-                      setBaseUrl(DEFAULT_KIMI_BASE_URL);
-                    }}
-                    className="px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-xs"
-                  >
-                    切换 Kimi 地址
-                  </button>
+                    <div className="flex gap-2 flex-wrap">
+                      <button
+                        onClick={handleTestModel}
+                        disabled={modelTesting || cleaningLegacy}
+                        className="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-sm font-medium"
+                      >
+                        {modelTesting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wrench className="w-4 h-4" />}
+                        验证密钥
+                      </button>
+                      <button
+                        onClick={handleSaveConfig}
+                        disabled={saving || modelTesting || cleaningLegacy}
+                        className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-sm font-medium"
+                      >
+                        {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Key className="w-4 h-4" />}
+                        保存并启用服务
+                      </button>
+                      <button
+                        onClick={() => handlePrimaryNavChange("chat")}
+                        className="px-4 py-2 bg-sky-700 hover:bg-sky-600 rounded-lg text-sm font-medium"
+                      >
+                        立即开始试聊
+                      </button>
+                    </div>
+                    {saveResult && (
+                      <p className={`text-sm ${saveResult.startsWith("错误") ? "text-red-400" : "text-emerald-400"}`}>
+                        {saveResult}
+                      </p>
+                    )}
+                    {modelTestResult && (
+                      <p className={`text-sm ${modelTestResult.includes("通过") ? "text-emerald-400" : "text-amber-300"}`}>
+                        {modelTestResult}
+                      </p>
+                    )}
+                    {savedAiHint && <p className="text-sky-300 text-sm">{savedAiHint}</p>}
+                  </div>
                 </div>
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-2">
-                  网络代理 URL <span className="text-slate-500">(可选，保存到 env)</span>
-                </label>
-                <input
-                  type="text"
-                  value={proxyUrl}
-                  onChange={(e) => setProxyUrl(e.target.value)}
-                  placeholder="http://127.0.0.1:7890 或 socks5://127.0.0.1:1080"
-                  className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-2">
-                  NO_PROXY <span className="text-slate-500">(可选)</span>
-                </label>
-                <input
-                  type="text"
-                  value={noProxy}
-                  onChange={(e) => setNoProxy(e.target.value)}
-                  placeholder="127.0.0.1,localhost,.local"
-                  className="w-full bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-2">
-                  自定义配置路径 <span className="text-slate-500">(可选)</span>
-                </label>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={customConfigPath}
-                    onChange={(e) => setCustomConfigPath(e.target.value)}
-                    placeholder="留空使用 ~/.openclaw，如 D:\\openclaw-config"
-                    className="flex-1 bg-slate-800 border border-slate-600 rounded-lg px-4 py-2"
-                  />
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      try {
-                        const p = await invoke<string | null>("detect_openclaw_config_path");
-                        if (p && isLikelyConfigPath(p)) setCustomConfigPath(p);
-                      } catch {}
-                    }}
-                    className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm whitespace-nowrap"
-                  >
-                    自动检测
-                  </button>
-                </div>
-                <p className="text-slate-500 text-xs mt-1">
-                  配置、凭证、会话数据将存储在此目录。建议留空使用默认，避免 Gateway 与部署工具路径不一致导致 Telegram 无响应。
-                </p>
-                <details className="mt-2 text-xs text-slate-400">
-                  <summary className="cursor-pointer hover:text-slate-300">安装在其他盘时如何填写？</summary>
-                  <ul className="mt-1 ml-4 list-disc space-y-0.5 text-slate-500">
-                    <li>填写<strong className="text-slate-400">配置目录</strong>的完整路径（内含 openclaw.json 的文件夹）</li>
-                    <li>示例：<code className="bg-slate-800 px-1 rounded">D:\openclaw\.openclaw</code>、<code className="bg-slate-800 px-1 rounded">E:\my-config</code></li>
-                    <li>可用 <code className="bg-slate-800 px-1 rounded">\</code> 或 <code className="bg-slate-800 px-1 rounded">/</code>，末尾不要加反斜杠</li>
-                    <li>不确定时先点「自动检测」；若检测不到，在资源管理器中找到含 openclaw.json 的文件夹，复制其地址栏路径粘贴即可</li>
-                  </ul>
+
+                <details
+                  open={showAiAdvancedSettings}
+                  onToggle={(e) => setShowAiAdvancedSettings((e.target as HTMLDetailsElement).open)}
+                  className="rounded-2xl border border-slate-700 bg-slate-800/40 p-5"
+                >
+                  <summary className="cursor-pointer text-sm font-medium text-slate-200">高级选项</summary>
+                  <div className="space-y-4 mt-4">
+                    <div>
+                      <label className="block text-sm font-medium mb-2">运行时 Provider</label>
+                      <select
+                        value={provider}
+                        onChange={(e) => setProvider(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-4 py-2"
+                      >
+                        <option value="openai">OpenAI 兼容</option>
+                        <option value="kimi">Kimi</option>
+                        <option value="deepseek">DeepSeek</option>
+                        <option value="qwen">通义千问</option>
+                        <option value="bailian">阿里云百炼</option>
+                        <option value="anthropic">Anthropic Claude</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-2">自定义 API 地址</label>
+                      <input
+                        type="text"
+                        value={baseUrl}
+                        onChange={(e) => setBaseUrl(e.target.value)}
+                        placeholder={DEFAULT_OPENAI_BASE_URL}
+                        className="w-full bg-slate-900 border border-slate-600 rounded-lg px-4 py-2"
+                      />
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-sm font-medium mb-2">网络代理 URL</label>
+                        <input
+                          type="text"
+                          value={proxyUrl}
+                          onChange={(e) => setProxyUrl(e.target.value)}
+                          placeholder="http://127.0.0.1:7890"
+                          className="w-full bg-slate-900 border border-slate-600 rounded-lg px-4 py-2"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium mb-2">NO_PROXY</label>
+                        <input
+                          type="text"
+                          value={noProxy}
+                          onChange={(e) => setNoProxy(e.target.value)}
+                          placeholder="127.0.0.1,localhost,.local"
+                          className="w-full bg-slate-900 border border-slate-600 rounded-lg px-4 py-2"
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-2">自定义配置路径</label>
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          value={customConfigPath}
+                          onChange={(e) => setCustomConfigPath(e.target.value)}
+                          placeholder="留空使用 ~/.openclaw"
+                          className="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-4 py-2"
+                        />
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              const p = await invoke<string | null>("detect_openclaw_config_path");
+                              if (p && isLikelyConfigPath(p)) setCustomConfigPath(p);
+                            } catch {}
+                          }}
+                          className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm whitespace-nowrap"
+                        >
+                          自动检测
+                        </button>
+                      </div>
+                    </div>
+                    <button
+                      onClick={handleCleanupLegacyCache}
+                      disabled={cleaningLegacy || modelTesting || saving}
+                      className="flex items-center gap-2 px-4 py-2 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded-lg text-sm font-medium"
+                    >
+                      {cleaningLegacy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wrench className="w-4 h-4" />}
+                      一键清理历史 Provider 缓存
+                    </button>
+                  </div>
                 </details>
               </div>
-              {runtimeModelInfo && (
-                <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-3 text-xs text-slate-300 space-y-1">
-                  <p>当前生效模型：{runtimeModelInfo.model || "未知"}</p>
-                  <p>当前生效接口：{runtimeModelInfo.provider_api || "未知"}</p>
-                  <p>当前生效地址：{runtimeModelInfo.base_url || "未知"}</p>
-                  <p>当前生效 Key 前缀：{runtimeModelInfo.key_prefix || "未读取到"}</p>
+
+              <div className="space-y-4">
+                <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-5 space-y-3" style={heavyPanelStyle}>
+                  <p className="text-sm font-medium text-slate-100">当前选择摘要</p>
+                  <div className="text-sm text-slate-300 space-y-2">
+                    <p>服务渠道：{currentAiServiceLabel}</p>
+                    <p>当前模型：{selectedModel || "未选择"}</p>
+                    <p>推荐场景：{provider === "kimi" ? "长文本问答" : "高频聊天 / 代码 / 日常使用"}</p>
+                    <p className={aiReady ? "text-emerald-300" : "text-amber-300"}>{aiReady ? "状态：已配置" : "状态：待测试"}</p>
+                  </div>
                 </div>
-              )}
-              {keySyncStatus && (
-                <div className="bg-slate-800/40 border border-slate-700 rounded-lg p-3 text-xs space-y-1">
-                  <p className={keySyncStatus.synced ? "text-emerald-300" : "text-amber-300"}>
-                    Key 同步状态：{keySyncStatus.synced ? "已同步" : "未同步"}
-                  </p>
-                  <p className="text-slate-300">openclaw.json：{keySyncStatus.openclaw_json_key_prefix || "未读取到"}</p>
-                  <p className="text-slate-300">env：{keySyncStatus.env_key_prefix || "未读取到"}</p>
-                  <p className="text-slate-300">auth-profiles：{keySyncStatus.auth_profile_key_prefix || "未读取到"}</p>
-                  <p className="text-slate-400">{keySyncStatus.detail}</p>
+
+                <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-5 space-y-3" style={heavyPanelStyle}>
+                  <p className="text-sm font-medium text-slate-100">推荐组合</p>
+                  <div className="space-y-2 text-xs text-slate-300">
+                    <div className="rounded-lg border border-slate-700 bg-slate-900/50 p-3">
+                      <p className="font-medium text-slate-100">新手推荐</p>
+                      <p className="mt-1 text-slate-400">硅基流动 + 默认推荐模型，先用最低决策成本跑通。</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-700 bg-slate-900/50 p-3">
+                      <p className="font-medium text-slate-100">性价比推荐</p>
+                      <p className="mt-1 text-slate-400">适合高频聊天，优先控制 API 成本。</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-700 bg-slate-900/50 p-3">
+                      <p className="font-medium text-slate-100">代码推荐</p>
+                      <p className="mt-1 text-slate-400">优先选你的主推代码模型，后续可平滑迁到官方线路。</p>
+                    </div>
+                  </div>
                 </div>
-              )}
-              <div className="bg-slate-800/40 border border-slate-700 rounded-lg p-3 text-xs">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-slate-300">启动后自动探活（基于当前生效配置）</p>
-                  <button
-                    onClick={() => probeRuntimeModelConnection()}
-                    disabled={runtimeProbeLoading}
-                    className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-slate-200"
-                  >
-                    {runtimeProbeLoading ? "探活中..." : "立即探活"}
-                  </button>
-                </div>
-                {runtimeProbeResult && (
-                  <p
-                    className={`mt-2 ${
-                      runtimeProbeResult.includes("通过") ? "text-emerald-400" : "text-amber-300"
-                    }`}
-                  >
-                    {runtimeProbeResult}
-                  </p>
+
+                {(runtimeModelInfo || keySyncStatus || runtimeProbeResult) && (
+                  <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-5 space-y-3" style={heavyPanelStyle}>
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-sm font-medium text-slate-100">运行时诊断</p>
+                      <button
+                        onClick={() => probeRuntimeModelConnection()}
+                        disabled={runtimeProbeLoading}
+                        className="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-slate-200 text-xs"
+                      >
+                        {runtimeProbeLoading ? "探活中..." : "立即探活"}
+                      </button>
+                    </div>
+                    {runtimeModelInfo && (
+                      <div className="text-xs text-slate-300 space-y-1">
+                        <p>当前生效模型：{runtimeModelInfo.model || "未知"}</p>
+                        <p>当前生效接口：{runtimeModelInfo.provider_api || "未知"}</p>
+                        <p>当前生效地址：{runtimeModelInfo.base_url || "未知"}</p>
+                        <p>当前生效 Key 前缀：{runtimeModelInfo.key_prefix || "未读取到"}</p>
+                      </div>
+                    )}
+                    {keySyncStatus && (
+                      <div className="text-xs space-y-1">
+                        <p className={keySyncStatus.synced ? "text-emerald-300" : "text-amber-300"}>
+                          Key 同步状态：{keySyncStatus.synced ? "已同步" : "未同步"}
+                        </p>
+                        <p className="text-slate-300">openclaw.json：{keySyncStatus.openclaw_json_key_prefix || "未读取到"}</p>
+                        <p className="text-slate-300">env：{keySyncStatus.env_key_prefix || "未读取到"}</p>
+                        <p className="text-slate-300">auth-profiles：{keySyncStatus.auth_profile_key_prefix || "未读取到"}</p>
+                        <p className="text-slate-500">{keySyncStatus.detail}</p>
+                      </div>
+                    )}
+                    {runtimeProbeResult && (
+                      <p className={`text-xs ${runtimeProbeResult.includes("通过") ? "text-emerald-400" : "text-amber-300"}`}>
+                        {runtimeProbeResult}
+                      </p>
+                    )}
+                  </div>
                 )}
+
+                <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-5 space-y-3" style={heavyPanelStyle}>
+                  <p className="text-sm font-medium text-slate-100">获取密钥 / 商业入口</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                    <button onClick={() => openUrl("https://api.siliconflow.cn")} className="rounded-lg border border-slate-700 bg-slate-900/50 px-3 py-2 text-left hover:border-slate-500">
+                      获取硅基流动 Key
+                    </button>
+                    <button onClick={() => openUrl("https://platform.moonshot.cn")} className="rounded-lg border border-slate-700 bg-slate-900/50 px-3 py-2 text-left hover:border-slate-500">
+                      获取 Kimi Key
+                    </button>
+                    <button className="rounded-lg border border-slate-700 bg-slate-900/50 px-3 py-2 text-left text-slate-500 cursor-not-allowed">
+                      官方线路（即将上线）
+                    </button>
+                    <div className="rounded-lg border border-slate-700 bg-slate-900/50 px-3 py-2 text-left text-slate-300">
+                      QQ 群 / 套餐咨询：1085253453
+                    </div>
+                  </div>
+                  <p className="text-xs text-slate-500">
+                    这里后续就是你的 API 中转站和套餐转化位，不需要再做第二层复杂参数页。
+                  </p>
+                </div>
               </div>
-              <div className="flex gap-2">
-                <button
-                  onClick={handleSaveConfig}
-                  disabled={saving || modelTesting || cleaningLegacy}
-                  className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg font-medium"
-                >
-                  {saving ? <Loader2 className="w-5 h-5 animate-spin" /> : <Key className="w-5 h-5" />}
-                  保存配置
-                </button>
-                <button
-                  onClick={handleTestModel}
-                  disabled={modelTesting || cleaningLegacy}
-                  className="flex items-center gap-2 px-6 py-3 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg font-medium"
-                >
-                  {modelTesting ? <Loader2 className="w-5 h-5 animate-spin" /> : <Wrench className="w-5 h-5" />}
-                  模型连通性检测
-                </button>
-                <button
-                  onClick={handleCleanupLegacyCache}
-                  disabled={cleaningLegacy || modelTesting || saving}
-                  className="flex items-center gap-2 px-6 py-3 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded-lg font-medium"
-                >
-                  {cleaningLegacy ? <Loader2 className="w-5 h-5 animate-spin" /> : <Wrench className="w-5 h-5" />}
-                  一键清理历史 Provider 缓存
-                </button>
-              </div>
-              {saveResult && (
-                <p className={`text-sm ${saveResult.startsWith("错误") ? "text-red-400" : "text-emerald-400"}`}>
-                  {saveResult}
-                </p>
-              )}
-              {modelTestResult && (
-                <p className={`text-sm ${modelTestResult.includes("通过") ? "text-emerald-400" : "text-amber-300"}`}>
-                  {modelTestResult}
-                </p>
-              )}
-              {savedAiHint && (
-                <p className="text-sky-300 text-sm">{savedAiHint}</p>
-              )}
-            </div>
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-400">
-              <p className="font-medium text-slate-300 mb-2">获取 API Key：</p>
-              <ul className="space-y-1">
-                <li>• Claude: console.anthropic.com</li>
-                <li>• OpenAI: platform.openai.com</li>
-                <li>• DeepSeek: platform.deepseek.com</li>
-                <li>• Kimi: platform.moonshot.cn</li>
-                <li>• 通义千问: dashscope.console.aliyun.com</li>
-                <li>• 阿里云百炼: bailian.console.aliyun.com</li>
-              </ul>
             </div>
           </div>
         )}
 
-        {/* Step 3: 服务与对话 */}
         {step === 3 && (
-          <div className="w-full max-w-[1200px] mx-auto space-y-6 order-2">
-            <h2 className="text-lg font-semibold">服务与对话</h2>
-            {customConfigPath && (
-              <div className="bg-slate-800/50 rounded-lg p-3 text-sm text-slate-400">
-                配置路径: {normalizeConfigPath(customConfigPath)}
-              </div>
-            )}
+          <div className="w-full max-w-[1200px] mx-auto space-y-4 order-1">
             {startupMigrationResult && startupMigrationResult.fixed_count > 0 && (
               <div className="bg-emerald-900/20 border border-emerald-700 rounded-lg p-3 text-xs text-emerald-300 space-y-1">
                 <p>
@@ -5880,192 +6732,54 @@ function App() {
                 </p>
               </div>
             )}
-            {exeCheckInfo && (
-              <div className="bg-indigo-900/20 border border-indigo-700 rounded-lg p-3 text-xs space-y-1">
-                <p className="text-indigo-200 font-medium">路径锁定提示（自动）</p>
-                <p className={exeCheckInfo.exists ? "text-emerald-300" : "text-amber-300"}>
-                  可执行：{exeCheckInfo.executable || "未解析到 openclaw.cmd"}
-                </p>
-                <p className="text-slate-300">
-                  配置目录：{normalizeConfigPath(customConfigPath) || "默认 (~/.openclaw)"}
-                </p>
-                <p className="text-slate-400">
-                  启动时会自动清理 18789 端口占用并固定使用上述路径，避免旧版本冲突。
-                </p>
-              </div>
-            )}
-            <div className="bg-slate-800/40 border border-slate-700 rounded-lg p-3 transition-colors duration-150 hover:border-slate-600">
+            <div className="flex items-center justify-end gap-2 flex-wrap">
               <button
-                onClick={handleToggleServicePanel}
-                className="w-full text-left flex items-center justify-between text-sm text-slate-200"
+                onClick={handleStart}
+                disabled={starting}
+                className="flex items-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-xs font-medium"
               >
-                <span>服务卡片（自检 / 修复）</span>
-                <span className="text-xs text-slate-400 transition-all duration-150">{servicePanelExpanded ? "收起" : "展开"}</span>
-              </button>
-              {!servicePanelExpanded && (
-                <p className="text-xs text-slate-500 mt-2">
-                  默认收起以减少渲染压力，聊天区优先显示在上方。
-                </p>
-              )}
-            </div>
-            {servicePanelMounted && servicePanelExpanded && (chatInteracting || chatSending) && (
-              <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-3 text-xs text-slate-400">
-                聊天交互中，服务区暂时降载以保证输入、等待回复与滚动流畅度；本轮对话结束后自动恢复显示。
-              </div>
-            )}
-            {servicePanelMounted && servicePanelExpanded && !chatInteracting && !chatSending && (
-            <div style={heavyPanelStyle} className="space-y-3">
-            {startResult && (
-              <div className="bg-slate-800 rounded-lg p-3 text-sm text-slate-300 space-y-2">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="font-medium text-slate-200">最近输出</p>
-                  <span className="text-[11px] text-slate-500">仅显示最近几行</span>
-                </div>
-                <pre className="overflow-auto max-h-28 whitespace-pre-wrap text-xs text-slate-300">
-                  {serviceStartSummary}
-                </pre>
-              </div>
-            )}
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3" style={heavyPanelStyle}>
-              <div className="flex items-center justify-between gap-2 flex-wrap">
-                <div>
-                  <p className="font-medium text-slate-200">任务队列中心（防卡死）</p>
-                  <p className="text-xs text-slate-500 mt-1">
-                    共 {serviceQueueSummary.total} 个任务
-                    {serviceQueueSummary.running ? ` · 运行中 ${serviceQueueSummary.running}` : ""}
-                    {serviceQueueSummary.queued ? ` · 排队 ${serviceQueueSummary.queued}` : ""}
-                    {serviceQueueSummary.failed ? ` · 失败 ${serviceQueueSummary.failed}` : ""}
-                    {serviceQueueSummary.cancelled ? ` · 已取消 ${serviceQueueSummary.cancelled}` : ""}
-                  </p>
-                </div>
-                {queueTasks.length > 0 && (
-                  <button
-                    onClick={() => setShowServiceQueueDetails((prev) => !prev)}
-                    className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
-                  >
-                    {showServiceQueueDetails ? "收起任务详情" : "展开任务详情"}
-                  </button>
+                {starting ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    启动中...
+                  </>
+                ) : (
+                  <>
+                    <Play className="w-4 h-4" />
+                    启动 Gateway
+                  </>
                 )}
-              </div>
-              {queueTasks.length === 0 ? (
-                <p className="text-xs text-slate-500">暂无任务。重操作会进入队列并串行执行。</p>
-              ) : showServiceQueueDetails ? (
-                <div className="space-y-2 max-h-44 overflow-auto">
-                  {serviceRecentQueueTasks.map((t) => (
-                    <div key={t.id} className="bg-slate-900/40 border border-slate-700 rounded p-2">
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="text-xs text-slate-200">
-                          {t.name}
-                          <span className="ml-2 text-slate-400">[{t.status}]</span>
-                        </p>
-                        <div className="flex gap-1">
-                          {(t.status === "queued" || t.status === "running") && (
-                            <button
-                              onClick={() => cancelTask(t.id)}
-                              className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
-                            >
-                              取消
-                            </button>
-                          )}
-                          {(t.status === "error" || t.status === "cancelled") &&
-                            t.retryCount < t.maxRetries && (
-                              <button
-                                onClick={() => retryTask(t.id)}
-                                className="px-2 py-1 bg-amber-700 hover:bg-amber-600 rounded text-[11px]"
-                              >
-                                重试
-                              </button>
-                            )}
-                        </div>
-                      </div>
-                      {t.error && <p className="text-[11px] text-rose-300 mt-1">{t.error}</p>}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-xs text-slate-500">默认仅显示摘要，点击“展开任务详情”查看最近 5 条任务。</p>
-              )}
-            </div>
-            </div>
-            )}
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-2">
-              <p className="font-medium text-slate-200">渠道配置入口已统一</p>
-              <p className="text-slate-400">
-                渠道凭据（Telegram / 飞书 / 钉钉 / Discord / QQ）已统一迁移至
-                <strong className="text-slate-200"> 调教中心 → Agent 管理 → 渠道实例池</strong>。
-                首次配对审批也已迁过去，请在那里按 Agent 配置 Token / appId / appSecret 等，并保存、应用到网关。
-              </p>
-              <button
-                onClick={() => { setStep(4); setTuningSection("agents"); }}
-                className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs"
-              >
-                前往渠道实例池
               </button>
-            </div>
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-2">
-              <p className="font-medium text-slate-200">后续如何交互（推荐顺序）</p>
-              <p>1) 在「聊天对话」标题右侧点击「启动 Gateway」，若提示服务缺失会自动安装并重试。</p>
-              <p>2) 前往「调教中心 → Agent 管理 → 渠道实例池」统一配置 Telegram / 飞书 / QQ / Discord / 钉钉，并处理首次配对审批。</p>
-              <p>3) 配好后，在对应聊天应用里给机器人发消息即可对话。</p>
-              <p className="text-slate-400">
-                说明：敏感信息不会在页面回显，避免泄露；请妥善保存凭证。
-              </p>
-            </div>
-          </div>
-        )}
-
-        {step === 3 && (
-          <div className="w-full max-w-[1200px] mx-auto space-y-4 order-1">
-            <div className="flex items-center justify-between gap-3">
-              <h2 className="text-lg font-semibold">聊天对话</h2>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handleStart}
-                  disabled={starting}
-                  className="flex items-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-xs font-medium"
-                >
-                  {starting ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      启动中...
-                    </>
-                  ) : (
-                    <>
-                      <Play className="w-4 h-4" />
-                      启动 Gateway
-                    </>
-                  )}
-                </button>
-                <button
-                  onClick={() => void runStartAllEnabledGateways()}
-                  disabled={gatewayBatchLoading === "start"}
-                  className="flex items-center gap-2 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs font-medium"
-                >
-                  {gatewayBatchLoading === "start" ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      启动中...
-                    </>
-                  ) : (
-                    <>
-                      <Zap className="w-4 h-4" />
-                      一键启动所有 Gateway
-                    </>
-                  )}
-                </button>
-                <button
-                  onClick={handleOpenBrowserChat}
-                  className="flex items-center gap-2 px-3 py-1.5 bg-sky-700 hover:bg-sky-600 rounded text-xs font-medium"
-                >
-                  <ExternalLink className="w-4 h-4" />
-                  打开浏览器对话框
-                </button>
-              </div>
+              <button
+                onClick={() => void runStartAllEnabledGateways()}
+                disabled={gatewayBatchLoading === "start"}
+                className="flex items-center gap-2 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs font-medium"
+              >
+                {gatewayBatchLoading === "start" ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    启动中...
+                  </>
+                ) : (
+                  <>
+                    <Zap className="w-4 h-4" />
+                    一键启动所有 Gateway
+                  </>
+                )}
+              </button>
+              <button
+                onClick={handleOpenBrowserChat}
+                className="flex items-center gap-2 px-3 py-1.5 bg-sky-700 hover:bg-sky-600 rounded text-xs font-medium"
+              >
+                <ExternalLink className="w-4 h-4" />
+                打开浏览器对话框
+              </button>
             </div>
             <ChatWorkbench
               agents={chatAgents}
               selectedAgentId={selectedAgentId}
               unreadByAgent={unreadByAgent}
+              previewByAgent={chatPreviewByAgent}
               routeMode={routeMode}
               chatExecutionMode={chatExecutionMode}
               chatSessionMode={chatSessionMode}
@@ -6075,6 +6789,10 @@ function App() {
               routeHint={routeHint}
               messages={selectedChatMessages}
               renderLimit={selectedChatRenderLimit}
+              historyLoaded={selectedChatHistoryLoaded}
+              cacheHydrating={chatCacheHydrating}
+              chatStickBottom={selectedChatStickBottom}
+              pendingReply={pendingReplyAgentId === selectedAgentId && chatSending}
               chatViewportRef={chatViewportRef}
               onRouteModeChange={setRouteMode}
               onExecutionModeChange={setChatExecutionMode}
@@ -6083,6 +6801,7 @@ function App() {
               onNewSession={handleNewSessionLocal}
               onClearSession={handleNewSessionLocal}
               onAbort={handleAbortChat}
+              onLoadHistory={handleLoadSelectedChatHistory}
               onSend={handleSendChat}
               onTypingActivity={handleChatTypingActivity}
               onViewportScroll={handleChatViewportScroll}
@@ -6093,59 +6812,128 @@ function App() {
                 setPreferredGatewayByAgent((prev) => ({ ...prev, [agentId]: gatewayId }))
               }
             />
+            <div className="rounded-xl border border-emerald-700/40 bg-emerald-950/20 p-4 text-sm text-emerald-100 space-y-2">
+              <p className="font-medium text-emerald-200">权益与 QQ 群入口</p>
+              <p>{DEPLOY_SUCCESS_DIALOG}</p>
+              <p className="text-emerald-200/90">
+                需要更多额度、备用 Key 或 29 元无限包月代理，也可以直接进群处理。
+              </p>
+            </div>
           </div>
         )}
 
         {step === 4 && (
           <div className="w-full max-w-[1200px] mx-auto space-y-6">
-            <h2 className="text-lg font-semibold">调教中心（小白模式）</h2>
-            <div className="flex flex-wrap gap-2">
-              {[
-                { id: "agents", label: "Agent 管理" },
-                { id: "control", label: "总控编排" },
-                { id: "quick", label: "快速模式" },
-                { id: "scene", label: "场景模板" },
-                { id: "personal", label: "个性调教" },
-                { id: "memory", label: "记忆中心" },
-                { id: "skills", label: "Skills" },
-                { id: "health", label: "健康自愈" },
-              ].map((tab) => (
-                <button
-                  key={tab.id}
-                  onClick={() =>
-                    setTuningSection(
-                      tab.id as "quick" | "scene" | "personal" | "memory" | "health" | "skills" | "agents" | "chat" | "control"
-                    )
-                  }
-                  className={`px-3 py-1.5 rounded text-xs border ${
-                    tuningSection === tab.id
-                      ? "bg-sky-800/60 border-sky-600 text-sky-100"
-                      : "bg-slate-700/60 border-slate-600 hover:bg-slate-700"
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
+            <div className="rounded-2xl border border-slate-700 bg-slate-800/40 p-5">
+              <div className="flex items-start justify-between gap-4 flex-wrap">
+                <div className="space-y-2">
+                  <p className="text-xs uppercase tracking-[0.2em] text-sky-300">{currentPrimaryNav === "repair" ? "Repair" : "Tuning"}</p>
+                  <h2 className="text-2xl font-semibold text-white">{tuningPageTitle}</h2>
+                  <p className="text-sm text-slate-400 max-w-2xl">
+                    {currentPrimaryNav === "repair"
+                      ? "集中查看环境、Gateway、Skills 与渠道问题。这里负责体检、修复和导出诊断。"
+                      : "这里负责 Agent、渠道、Skills 与记忆等持续配置，默认只保留对小白最重要的入口。"}
+                  </p>
+                </div>
+                {currentPrimaryNav === "repair" ? (
+                  <div className="flex gap-2 flex-wrap">
+                    <button
+                      onClick={() => void handleTuningHealthCheck()}
+                      disabled={tuningActionLoading === "check"}
+                      className="px-3 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 text-sm"
+                    >
+                      {tuningActionLoading === "check" ? "体检中..." : "一键体检"}
+                    </button>
+                    <button
+                      onClick={() => void handleTuningSelfHeal()}
+                      disabled={tuningActionLoading === "heal"}
+                      className="px-3 py-2 rounded-lg bg-amber-700 hover:bg-amber-600 disabled:opacity-50 text-sm"
+                    >
+                      {tuningActionLoading === "heal" ? "修复中..." : "一键修复"}
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {TUNING_NAV_ITEMS.map((tab) => (
+                      <button
+                        key={tab.id}
+                        onClick={() => {
+                          setTuningSection(
+                            tab.section as "quick" | "scene" | "personal" | "memory" | "health" | "skills" | "agents" | "chat" | "control"
+                          );
+                          if (tab.section === "agents") {
+                            setAgentCenterTab((tab.agentTab as "overview" | "channels") || "overview");
+                          }
+                        }}
+                        className={`px-3 py-1.5 rounded text-xs border ${
+                          currentTuningNav === tab.id
+                            ? "bg-sky-800/60 border-sky-600 text-sky-100"
+                            : "bg-slate-700/60 border-slate-600 hover:bg-slate-700"
+                        }`}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
 
             {tuningSection === "agents" && (
             <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
               <p className="font-medium text-slate-200 flex items-center gap-2">
                 <Users className="w-4 h-4 text-sky-400" />
-                Agent 管理
+                {agentCenterTab === "channels" ? "渠道配置" : "Agent 管理"}
               </p>
               {agentsLoading ? (
                 <p className="text-xs text-slate-400">加载中...</p>
               ) : agentsError ? (
                 <p className="text-xs text-rose-400">{agentsError}</p>
               ) : agentsList ? (
-                <>
+                <div className="space-y-3">
+                  <div className={`grid grid-cols-1 gap-3 ${agentCenterTab === "channels" ? "md:grid-cols-3" : "md:grid-cols-2"}`}>
+                    <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+                      <p className="text-[11px] text-slate-400">当前 Agent 数量</p>
+                      <p className="text-lg font-semibold text-slate-100 mt-1">{agentsList.agents.length}</p>
+                    </div>
+                    <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+                      <p className="text-[11px] text-slate-400">默认 Agent</p>
+                      <p className="text-lg font-semibold text-slate-100 mt-1">
+                        {agentsList.agents.find((a) => a.default)?.name || agentsList.agents.find((a) => a.default)?.id || "未设置"}
+                      </p>
+                    </div>
+                    {agentCenterTab === "channels" && (
+                      <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+                        <p className="text-[11px] text-slate-400">已绑定渠道</p>
+                        <p className="text-lg font-semibold text-slate-100 mt-1">{agentsList.bindings?.length || 0}</p>
+                      </div>
+                    )}
+                  </div>
+                  <div className="rounded-lg border border-slate-700 bg-slate-900/30 p-2 flex gap-2 flex-wrap">
+                    <button
+                      onClick={() => setAgentCenterTab("overview")}
+                      className={`px-3 py-1.5 rounded text-xs ${
+                        agentCenterTab === "overview" ? "bg-sky-700 text-white" : "bg-slate-700 hover:bg-slate-600 text-slate-200"
+                      }`}
+                    >
+                      Agent 管理
+                    </button>
+                    <button
+                      onClick={() => setAgentCenterTab("channels")}
+                      className={`px-3 py-1.5 rounded text-xs ${
+                        agentCenterTab === "channels" ? "bg-sky-700 text-white" : "bg-slate-700 hover:bg-slate-600 text-slate-200"
+                      }`}
+                    >
+                      渠道配置
+                    </button>
+                  </div>
+                  <div className={agentCenterTab === "overview" ? "space-y-3" : "hidden"}>
                   <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 space-y-2">
                     <div className="flex items-center justify-between gap-2 flex-wrap">
                       <div>
                         <p className="text-sm text-slate-200 font-medium">极简模式</p>
                         <p className="text-[11px] text-slate-400">
-                          默认只保留「按 Agent 配置」「保存并应用」「网关状态」。其它功能都收进高级设置。
+                          默认只保留 Agent 列表、改名、设默认、新建、删除。模型策略和维护项都收进高级设置。
                         </p>
                       </div>
                       <button
@@ -6156,10 +6944,7 @@ function App() {
                       </button>
                     </div>
                   </div>
-                  {showAgentAdvancedSettings && (
-                    <>
-                  <p className="text-xs text-slate-400">配置: {agentsList.config_path}</p>
-                  <p className="text-xs text-slate-400">点击「设为默认」切换用于对话的 Agent，新对话将使用默认 Agent。</p>
+                  {agentsActionResult ? <p className="text-xs text-slate-300">{agentsActionResult}</p> : null}
                   <div className="overflow-x-auto">
                     <table className="w-full text-xs border-collapse">
                       <thead>
@@ -6175,14 +6960,37 @@ function App() {
                         {agentsList.agents.map((a) => (
                           <tr key={a.id} className="border-b border-slate-700/50">
                             <td className="py-1.5 px-2 font-mono">{a.id}</td>
-                            <td className="py-1.5 px-2">{a.name || "-"}</td>
+                            <td className="py-1.5 px-2">
+                              <input
+                                value={agentNameDrafts[a.id] ?? a.name ?? ""}
+                                onChange={(e) => {
+                                  const next = e.target.value;
+                                  setAgentNameDrafts((prev) => ({ ...prev, [a.id]: next }));
+                                  if (agentsActionResult) setAgentsActionResult(null);
+                                }}
+                                placeholder="输入 Agent 名称"
+                                className="w-full min-w-[140px] bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100"
+                              />
+                            </td>
                             <td className="py-1.5 px-2">{a.default ? "✓" : ""}</td>
                             <td className="py-1.5 px-2 font-mono text-slate-400 truncate max-w-[120px]">{a.workspace || "-"}</td>
                             <td className="py-1.5 px-2 flex gap-1 flex-wrap">
+                              <button
+                                onClick={() => void handleRenameAgent(a.id)}
+                                disabled={
+                                  renamingAgentId === a.id ||
+                                  !(agentNameDrafts[a.id] || "").trim() ||
+                                  (agentNameDrafts[a.id] || "").trim() === (a.name || "").trim()
+                                }
+                                className="text-sky-400 hover:text-sky-300 disabled:text-slate-500 text-xs"
+                              >
+                                {renamingAgentId === a.id ? "保存中..." : "保存名称"}
+                              </button>
                               {!a.default && (
                                 <button
                                   onClick={async () => {
                                     try {
+                                      setAgentsActionResult(null);
                                       await invoke("set_default_agent", {
                                         id: a.id,
                                         customPath: normalizeConfigPath(customConfigPath) || undefined,
@@ -6202,6 +7010,7 @@ function App() {
                                   onClick={async () => {
                                     if (!confirm(`确定删除 Agent "${a.id}"？`)) return;
                                     try {
+                                      setAgentsActionResult(null);
                                       await invoke("delete_agent", {
                                         id: a.id,
                                         force: true,
@@ -6230,141 +7039,173 @@ function App() {
                     >
                       新建 Agent
                     </button>
-                    <button
-                      onClick={refreshAgentsList}
-                      className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
-                    >
-                      刷新
-                    </button>
                   </div>
-                  <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-3 space-y-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <p className="text-sm text-slate-200 font-medium">Agent 模型分配（按 Agent 独立）</p>
-                      <button
-                        onClick={() => {
-                          const providers = new Set<string>();
-                          for (const a of agentsList.agents) {
-                            const p = agentProfileDrafts[a.id]?.provider;
-                            if (p) providers.add(p);
-                          }
-                          providers.forEach((p) => {
-                            void refreshModelsForProvider(p);
-                          });
-                        }}
-                        className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
-                      >
-                        刷新已选 Provider 模型列表
-                      </button>
-                    </div>
-                    <p className="text-[11px] text-slate-400">
-                      模型来源于你当前 Provider 的“刷新模型”结果；保存后将同步写入对应 Agent 的主模型。
-                    </p>
-                    {agentRuntimeSettings && (
-                      <p className="text-[11px] text-slate-500">运行时配置文件：{agentRuntimeSettings.settings_path}</p>
-                    )}
-                    <div className="space-y-2">
-                      {agentsList.agents.map((a) => {
-                        const draft = agentProfileDrafts[a.id] || { provider: "openai", model: RECOMMENDED_MODEL_FALLBACK };
-                        const models = agentModelsByProvider[draft.provider] || [];
-                        const providerLoading = !!agentModelsLoadingByProvider[draft.provider];
-                        return (
-                          <div key={`runtime-${a.id}`} className="border border-slate-700 rounded p-2 space-y-2">
-                            <div className="text-xs text-slate-300">
-                              <span className="font-mono">{a.id}</span>
-                              <span className="text-slate-500 ml-2">{a.name || "-"}</span>
-                            </div>
-                            <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
-                              <select
-                                value={draft.provider}
-                                onChange={(e) => {
-                                  const nextProvider = e.target.value;
-                                  setAgentProfileDrafts((prev) => ({
-                                    ...prev,
-                                    [a.id]: {
-                                      provider: nextProvider,
-                                      model: prev[a.id]?.model || RECOMMENDED_MODEL_FALLBACK,
-                                    },
-                                  }));
-                                }}
-                                className="bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs"
-                              >
-                                {AGENT_PROVIDER_OPTIONS.map((p) => (
-                                  <option key={p} value={p}>
-                                    {p}
-                                  </option>
-                                ))}
-                              </select>
-                              <select
-                                value={draft.model}
-                                onChange={(e) =>
-                                  setAgentProfileDrafts((prev) => ({
-                                    ...prev,
-                                    [a.id]: { ...(prev[a.id] || { provider: draft.provider, model: "" }), model: e.target.value },
-                                  }))
-                                }
-                                className="bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs md:col-span-2"
-                              >
-                                {models.length === 0 ? (
-                                  <option value={draft.model}>{draft.model || "请先刷新模型列表"}</option>
-                                ) : (
-                                  <>
-                                    {!models.includes(draft.model) && <option value={draft.model}>{draft.model}</option>}
-                                    {models.map((m) => (
-                                      <option key={m} value={m}>
-                                        {m}
-                                      </option>
-                                    ))}
-                                  </>
-                                )}
-                              </select>
-                              <div className="flex gap-2">
-                                <button
-                                  onClick={() => void refreshModelsForProvider(draft.provider)}
-                                  className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
-                                  disabled={providerLoading}
-                                >
-                                  {providerLoading ? "刷新中..." : "刷新模型"}
-                                </button>
-                                <button
-                                  onClick={() => void saveAgentProfile(a.id)}
-                                  className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-[11px]"
-                                  disabled={agentRuntimeSaving}
-                                >
-                                  保存
-                                </button>
-                              </div>
-                            </div>
-                            <input
-                              value={draft.model}
-                              onChange={(e) =>
-                                setAgentProfileDrafts((prev) => ({
-                                  ...prev,
-                                  [a.id]: { ...(prev[a.id] || { provider: draft.provider, model: "" }), model: e.target.value },
-                                }))
-                              }
-                              placeholder="也可手动输入模型ID"
-                              className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
-                            />
+                  {showAgentAdvancedSettings && (
+                    <div className="space-y-3">
+                      <details className="rounded-lg border border-slate-700 bg-slate-900/30 p-3">
+                        <summary className="cursor-pointer text-sm font-medium text-slate-200">维护工具</summary>
+                        <div className="mt-3 space-y-2">
+                          <p className="text-[11px] text-slate-400">这里放维护型操作，不打扰默认使用流程。</p>
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              onClick={refreshAgentsList}
+                              className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                            >
+                              刷新 Agent 列表
+                            </button>
                           </div>
-                        );
-                      })}
+                          <p className="text-[11px] text-slate-500">配置: {agentsList.config_path}</p>
+                          <p className="text-[11px] text-slate-500">点击「设为默认」切换用于对话的 Agent，新对话将使用默认 Agent。</p>
+                        </div>
+                      </details>
+
+                      <details className="rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+                        <summary className="cursor-pointer text-sm font-medium text-slate-200">模型策略</summary>
+                        <div className="mt-3 space-y-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-sm text-slate-200 font-medium">Agent 模型分配（按 Agent 独立）</p>
+                            <button
+                              onClick={() => {
+                                const providers = new Set<string>();
+                                for (const a of agentsList.agents) {
+                                  const p = agentProfileDrafts[a.id]?.provider;
+                                  if (p) providers.add(p);
+                                }
+                                providers.forEach((p) => {
+                                  void refreshModelsForProvider(p);
+                                });
+                              }}
+                              className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                            >
+                              刷新已选 Provider 模型列表
+                            </button>
+                          </div>
+                          <p className="text-[11px] text-slate-400">
+                            模型来源于你当前 Provider 的“刷新模型”结果；保存后将同步写入对应 Agent 的主模型。
+                          </p>
+                          {agentRuntimeSettings && (
+                            <p className="text-[11px] text-slate-500">运行时配置文件：{agentRuntimeSettings.settings_path}</p>
+                          )}
+                          <div className="space-y-2">
+                            {agentsList.agents.map((a) => {
+                              const draft = agentProfileDrafts[a.id] || { provider: "openai", model: RECOMMENDED_MODEL_FALLBACK };
+                              const models = agentModelsByProvider[draft.provider] || [];
+                              const providerLoading = !!agentModelsLoadingByProvider[draft.provider];
+                              return (
+                                <div key={`runtime-${a.id}`} className="border border-slate-700 rounded p-2 space-y-2">
+                                  <div className="text-xs text-slate-300">
+                                    <span className="font-mono">{a.id}</span>
+                                    <span className="text-slate-500 ml-2">{a.name || "-"}</span>
+                                  </div>
+                                  <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
+                                    <select
+                                      value={draft.provider}
+                                      onChange={(e) => {
+                                        const nextProvider = e.target.value;
+                                        setAgentProfileDrafts((prev) => ({
+                                          ...prev,
+                                          [a.id]: {
+                                            provider: nextProvider,
+                                            model: prev[a.id]?.model || RECOMMENDED_MODEL_FALLBACK,
+                                          },
+                                        }));
+                                      }}
+                                      className="bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs"
+                                    >
+                                      {AGENT_PROVIDER_OPTIONS.map((p) => (
+                                        <option key={p} value={p}>
+                                          {p}
+                                        </option>
+                                      ))}
+                                    </select>
+                                    <select
+                                      value={draft.model}
+                                      onChange={(e) =>
+                                        setAgentProfileDrafts((prev) => ({
+                                          ...prev,
+                                          [a.id]: { ...(prev[a.id] || { provider: draft.provider, model: "" }), model: e.target.value },
+                                        }))
+                                      }
+                                      className="bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs md:col-span-2"
+                                    >
+                                      {models.length === 0 ? (
+                                        <option value={draft.model}>{draft.model || "请先刷新模型列表"}</option>
+                                      ) : (
+                                        <>
+                                          {!models.includes(draft.model) && <option value={draft.model}>{draft.model}</option>}
+                                          {models.map((m) => (
+                                            <option key={m} value={m}>
+                                              {m}
+                                            </option>
+                                          ))}
+                                        </>
+                                      )}
+                                    </select>
+                                    <div className="flex gap-2">
+                                      <button
+                                        onClick={() => void refreshModelsForProvider(draft.provider)}
+                                        className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                                        disabled={providerLoading}
+                                      >
+                                        {providerLoading ? "刷新中..." : "刷新模型"}
+                                      </button>
+                                      <button
+                                        onClick={() => void saveAgentProfile(a.id)}
+                                        className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-[11px]"
+                                        disabled={agentRuntimeSaving}
+                                      >
+                                        保存
+                                      </button>
+                                    </div>
+                                  </div>
+                                  <input
+                                    value={draft.model}
+                                    onChange={(e) =>
+                                      setAgentProfileDrafts((prev) => ({
+                                        ...prev,
+                                        [a.id]: { ...(prev[a.id] || { provider: draft.provider, model: "" }), model: e.target.value },
+                                      }))
+                                    }
+                                    placeholder="也可手动输入模型ID"
+                                    className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
+                                  />
+                                </div>
+                              );
+                            })}
+                          </div>
+                          {agentRuntimeResult && (
+                            <div
+                              className={`rounded-lg p-3 text-xs whitespace-pre-wrap ${
+                                agentRuntimeResult.includes("向导完成") || agentRuntimeResult.includes("配置完成")
+                                  ? "bg-emerald-900/40 border border-emerald-600/50 text-emerald-200"
+                                  : "text-emerald-300"
+                              }`}
+                            >
+                              {(agentRuntimeResult.includes("向导完成") || agentRuntimeResult.includes("配置完成")) && (
+                                <p className="font-medium text-emerald-100 mb-1">✓ 配置完成</p>
+                              )}
+                              {agentRuntimeResult}
+                            </div>
+                          )}
+                        </div>
+                      </details>
                     </div>
-                    {agentRuntimeResult && (
-                      <div
-                        className={`rounded-lg p-3 text-xs whitespace-pre-wrap ${
-                          agentRuntimeResult.includes("向导完成") || agentRuntimeResult.includes("配置完成")
-                            ? "bg-emerald-900/40 border border-emerald-600/50 text-emerald-200"
-                            : "text-emerald-300"
-                        }`}
-                      >
-                        {(agentRuntimeResult.includes("向导完成") || agentRuntimeResult.includes("配置完成")) && (
-                          <p className="font-medium text-emerald-100 mb-1">✓ 配置完成</p>
-                        )}
-                        {agentRuntimeResult}
-                      </div>
-                    )}
+                  )}
                   </div>
 
+                  <div className={agentCenterTab === "channels" ? "space-y-3" : "hidden"}>
+                  <div className="rounded-lg border border-slate-700 bg-slate-900/30 p-3">
+                    <div className="flex items-center justify-between gap-3 flex-wrap">
+                      <div>
+                        <p className="text-sm text-slate-200 font-medium">渠道绑定摘要</p>
+                        <p className="text-[11px] text-slate-400 mt-1">这里的统计严格跟随下方 Agent 网关控制台，不再和 Agent 管理混放。</p>
+                      </div>
+                      <div className="rounded-lg border border-slate-700 bg-slate-950/40 px-3 py-2 text-right">
+                        <p className="text-[11px] text-slate-400">已绑定渠道</p>
+                        <p className="text-lg font-semibold text-slate-100 mt-1">{agentsList.bindings?.length || 0}</p>
+                      </div>
+                    </div>
+                  </div>
                   <div className="bg-indigo-950/30 border border-indigo-700/50 rounded-lg p-4 space-y-3">
                     <div className="flex items-center justify-between gap-2 flex-wrap">
                       <p className="text-sm text-indigo-200 font-medium flex items-center gap-2">
@@ -6555,24 +7396,30 @@ function App() {
                     )}
                   </div>
 
-                    </>
-                  )}
                   <div className="bg-slate-900/40 border border-slate-700 rounded-lg overflow-hidden flex flex-col md:flex-row min-h-[320px]">
                     <div className="w-full md:w-36 shrink-0 flex md:flex-col gap-1 p-2 border-b md:border-b-0 md:border-r border-slate-700 bg-slate-800/50">
                       <p className="text-xs text-slate-400 px-2 py-1 md:mb-1 hidden md:block">渠道</p>
                       {(["telegram", "feishu", "dingtalk", "discord", "qq"] as ChannelEditorChannel[]).map((ch) => {
                         const label = { telegram: "Telegram", feishu: "飞书", dingtalk: "钉钉", discord: "Discord", qq: "QQ" }[ch];
+                        const statusMeta = channelTabStatusMap[ch];
                         return (
                           <button
                             key={ch}
                             onClick={() => setChannelInstancesEditorChannel(ch)}
+                            title={statusMeta.title}
                             className={`text-left px-2 py-2 rounded text-xs font-medium transition-colors ${
                               channelInstancesEditorChannel === ch
                                 ? "bg-indigo-700 text-indigo-100"
                                 : "bg-slate-700/60 hover:bg-slate-600 text-slate-300"
                             }`}
                           >
-                            {label}
+                            <div className="flex items-center justify-between gap-2">
+                              <span>{label}</span>
+                              <span className={`inline-flex h-2 w-2 rounded-full ${statusMeta.dotClass}`} aria-hidden />
+                            </div>
+                            <div className={`mt-1 text-[10px] ${channelInstancesEditorChannel === ch ? "text-indigo-100/80" : statusMeta.textClass}`}>
+                              {statusMeta.label}
+                            </div>
                           </button>
                         );
                       })}
@@ -6897,36 +7744,7 @@ function App() {
                             </option>
                           ))}
                       </select>
-                      <button
-                        onClick={() => void saveAndApplyChannelSetup(channelInstancesEditorChannel)}
-                        disabled={agentRuntimeSaving}
-                        className="px-3 py-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
-                      >
-                        保存并应用
-                      </button>
-                      {showAgentAdvancedSettings && (
-                        <>
-                          <button
-                            onClick={() => void saveChannelInstances(channelInstancesEditorChannel)}
-                            disabled={agentRuntimeSaving}
-                            className="px-3 py-1 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
-                          >
-                            仅保存
-                          </button>
-                          <button
-                            onClick={() =>
-                              void applyChannelInstance(
-                                channelInstancesEditorChannel,
-                                activeChannelInstanceByChannel[channelInstancesEditorChannel] || ""
-                              )
-                            }
-                            disabled={agentRuntimeSaving || !(activeChannelInstanceByChannel[channelInstancesEditorChannel] || "")}
-                            className="px-3 py-1 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-xs"
-                          >
-                            重新应用
-                          </button>
-                        </>
-                      )}
+                      <p className="text-[11px] text-slate-500">保存并应用、测试连通、启动网关已统一放到底部固定操作条。</p>
                     </div>
                     </>
                   )}
@@ -7092,31 +7910,7 @@ function App() {
                           </option>
                         ))}
                       </select>
-                      <button
-                        onClick={() => void saveAndApplyTelegramSetup()}
-                        disabled={agentRuntimeSaving}
-                        className="px-3 py-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
-                      >
-                        保存并应用
-                      </button>
-                      {showAgentAdvancedSettings && (
-                        <>
-                          <button
-                            onClick={() => void saveTelegramInstances()}
-                            disabled={agentRuntimeSaving}
-                            className="px-3 py-1 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
-                          >
-                            仅保存
-                          </button>
-                          <button
-                            onClick={() => void applyTelegramInstance(activeTelegramInstanceId)}
-                            disabled={agentRuntimeSaving || !activeTelegramInstanceId}
-                            className="px-3 py-1 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-xs"
-                          >
-                            重新应用
-                          </button>
-                        </>
-                      )}
+                      <p className="text-[11px] text-slate-500">保存并应用、测试连通、启动网关已统一放到底部固定操作条。</p>
                     </div>
                     </>
                   )}
@@ -7688,6 +8482,77 @@ function App() {
                       </div>
                     </div>
                   )}
+                  {(() => {
+                    const focusedAgentId =
+                      selectedAgentId ||
+                      agentsList.agents.find((a) => a.default)?.id ||
+                      agentsList.agents[0]?.id ||
+                      "";
+                    const currentGatewayBinding =
+                      gatewayBindingsDraft.find((g) => (g.agent_id || "").trim() === focusedAgentId && g.enabled !== false) ||
+                      gatewayBindingsDraft.find((g) => (g.agent_id || "").trim() === focusedAgentId) ||
+                      null;
+                    const currentGatewayId = currentGatewayBinding?.gateway_id || "";
+                    const gatewayLoading = currentGatewayId ? !!gatewayActionLoadingById[currentGatewayId] : false;
+                    const testingCurrentChannel =
+                      channelInstancesEditorChannel === "telegram"
+                        ? telegramBatchTesting
+                        : !!channelBatchTestingByChannel[channelInstancesEditorChannel];
+                    return (
+                      <div className="sticky bottom-0 z-20 rounded-lg border border-slate-700 bg-slate-950/90 backdrop-blur px-4 py-3 shadow-[0_-8px_24px_rgba(0,0,0,0.28)]">
+                        <div className="flex items-center justify-between gap-3 flex-wrap">
+                          <div className="text-xs text-slate-300">
+                            <p>
+                              当前 Agent：<span className="text-slate-100 font-medium">{focusedAgentId || "未选择"}</span>
+                              {" · "}
+                              当前渠道：<span className="text-slate-100 font-medium">{channelInstancesEditorChannel}</span>
+                            </p>
+                            <p className="text-slate-500 mt-1">
+                              当前网关：{currentGatewayId || "未生成，先点保存并应用"}{currentGatewayBinding?.listen_port ? ` · 端口 ${currentGatewayBinding.listen_port}` : ""}
+                            </p>
+                          </div>
+                          <div className="flex gap-2 flex-wrap">
+                            <button
+                              onClick={() =>
+                                void (channelInstancesEditorChannel === "telegram"
+                                  ? saveAndApplyTelegramSetup()
+                                  : saveAndApplyChannelSetup(channelInstancesEditorChannel as NonTelegramChannel))
+                              }
+                              disabled={agentRuntimeSaving}
+                              className="px-3 py-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded-lg text-xs font-medium"
+                            >
+                              {agentRuntimeSaving ? "保存中..." : "保存并应用"}
+                            </button>
+                            <button
+                              onClick={() =>
+                                void (channelInstancesEditorChannel === "telegram"
+                                  ? testTelegramInstancesBatch()
+                                  : testChannelInstancesBatch(channelInstancesEditorChannel as NonTelegramChannel))
+                              }
+                              disabled={testingCurrentChannel}
+                              className="px-3 py-2 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded-lg text-xs font-medium"
+                            >
+                              {testingCurrentChannel ? "测试中..." : "测试连通"}
+                            </button>
+                            <button
+                              onClick={() => void runGatewayAction("start", currentGatewayId)}
+                              disabled={!currentGatewayId || gatewayLoading}
+                              className="px-3 py-2 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded-lg text-xs font-medium"
+                            >
+                              {gatewayLoading ? "启动中..." : "启动当前 Agent 网关"}
+                            </button>
+                          </div>
+                        </div>
+                        {stickyChannelActionFeedback && (
+                          <div className={`mt-3 rounded-lg border px-3 py-2 text-xs whitespace-pre-wrap ${stickyChannelActionFeedbackClass}`}>
+                            <p className="font-medium mb-1">最近一次操作结果</p>
+                            <p>{stickyChannelActionFeedback}</p>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+                  </div>
                   {showCreateAgent && (
                     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setShowCreateAgent(false)}>
                       <div className="bg-slate-800 rounded-lg p-4 max-w-md w-full mx-2 space-y-2" onClick={(e) => e.stopPropagation()}>
@@ -7756,7 +8621,7 @@ function App() {
                       </div>
                     </div>
                   )}
-                </>
+                </div>
               ) : (
                 <p className="text-xs text-slate-400">暂无 Agent 数据</p>
               )}
@@ -7932,6 +8797,32 @@ function App() {
 
             {tuningSection === "control" && (
             <div className="space-y-4">
+              <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+                <p className="font-medium text-slate-200">高级设置入口</p>
+                <p className="text-xs text-slate-400">
+                  小白默认只用前面的 Agent、渠道、Skills 和记忆。这里收纳更偏进阶的模型策略、个性调教和控制平面。
+                </p>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <button
+                    onClick={() => setTuningSection("quick")}
+                    className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 text-left hover:border-slate-500"
+                  >
+                    <p className="text-sm text-slate-100 font-medium">模型策略</p>
+                    <p className="text-[11px] text-slate-400 mt-1">稳定 / 均衡 / 高性能，适合先做全局推荐配置。</p>
+                  </button>
+                  <button
+                    onClick={() => setTuningSection("personal")}
+                    className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 text-left hover:border-slate-500"
+                  >
+                    <p className="text-sm text-slate-100 font-medium">个性调教</p>
+                    <p className="text-[11px] text-slate-400 mt-1">回答长度、语气风格、主动性、执行权限等细调。</p>
+                  </button>
+                  <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 text-left">
+                    <p className="text-sm text-slate-100 font-medium">控制平面</p>
+                    <p className="text-[11px] text-slate-400 mt-1">更偏专家模式，包含 Orchestrator、DAG、Ticket 等能力。</p>
+                  </div>
+                </div>
+              </div>
               <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
                 <p className="font-medium text-slate-200">控制平面（Orchestrator / DAG / Ticket / Memory / Sandbox / Verifier）</p>
                 <div className="flex flex-wrap gap-2">
@@ -8687,6 +9578,97 @@ function App() {
                   {tuningActionLoading === "heal" ? "修复中..." : "一键修复"}
                 </button>
               </div>
+              <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-3 text-sm text-slate-300 space-y-3" style={heavyPanelStyle}>
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <div>
+                    <p className="font-medium text-slate-200">运行状态与任务队列</p>
+                    <p className="text-xs text-slate-500 mt-1">
+                      这部分已从聊天页迁入这里，减少聊天滚动时的布局和重绘压力。
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => {
+                      setStep(3);
+                    }}
+                    className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                  >
+                    返回聊天页
+                  </button>
+                </div>
+                {startResult ? (
+                  <div className="bg-slate-800 rounded-lg p-3 text-sm text-slate-300 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="font-medium text-slate-200">最近输出</p>
+                      <span className="text-[11px] text-slate-500">仅显示最近几行</span>
+                    </div>
+                    <pre className="overflow-auto max-h-28 whitespace-pre-wrap text-xs text-slate-300">
+                      {serviceStartSummary}
+                    </pre>
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-500">最近没有新的启动输出。</p>
+                )}
+                <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3" style={heavyPanelStyle}>
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div>
+                      <p className="font-medium text-slate-200">任务队列中心</p>
+                      <p className="text-xs text-slate-500 mt-1">
+                        共 {serviceQueueSummary.total} 个任务
+                        {serviceQueueSummary.running ? ` · 运行中 ${serviceQueueSummary.running}` : ""}
+                        {serviceQueueSummary.queued ? ` · 排队 ${serviceQueueSummary.queued}` : ""}
+                        {serviceQueueSummary.failed ? ` · 失败 ${serviceQueueSummary.failed}` : ""}
+                        {serviceQueueSummary.cancelled ? ` · 已取消 ${serviceQueueSummary.cancelled}` : ""}
+                      </p>
+                    </div>
+                    {queueTasks.length > 0 && (
+                      <button
+                        onClick={() => setShowServiceQueueDetails((prev) => !prev)}
+                        className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                      >
+                        {showServiceQueueDetails ? "收起任务详情" : "展开任务详情"}
+                      </button>
+                    )}
+                  </div>
+                  {queueTasks.length === 0 ? (
+                    <p className="text-xs text-slate-500">暂无任务。重操作会进入队列并串行执行。</p>
+                  ) : showServiceQueueDetails ? (
+                    <div className="space-y-2 max-h-44 overflow-auto">
+                      {serviceRecentQueueTasks.map((t) => (
+                        <div key={t.id} className="bg-slate-900/40 border border-slate-700 rounded p-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-xs text-slate-200">
+                              {t.name}
+                              <span className="ml-2 text-slate-400">[{t.status}]</span>
+                            </p>
+                            <div className="flex gap-1">
+                              {(t.status === "queued" || t.status === "running") && (
+                                <button
+                                  onClick={() => cancelTask(t.id)}
+                                  className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                                >
+                                  取消
+                                </button>
+                              )}
+                              {(t.status === "error" || t.status === "cancelled") &&
+                                t.retryCount < t.maxRetries && (
+                                  <button
+                                    onClick={() => retryTask(t.id)}
+                                    className="px-2 py-1 bg-amber-700 hover:bg-amber-600 rounded text-[11px]"
+                                  >
+                                    重试
+                                  </button>
+                                )}
+                            </div>
+                          </div>
+                          {t.error && <p className="text-[11px] text-rose-300 mt-1">{t.error}</p>}
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-xs text-slate-500">默认仅显示摘要，点击“展开任务详情”查看最近 5 条任务。</p>
+                  )}
+                </div>
+              </div>
               <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-3 text-sm text-slate-300 space-y-3">
                 <p className="font-medium text-slate-200">渠道驱动的插件自动安装</p>
                 <div className="flex flex-wrap gap-3">
@@ -8748,6 +9730,8 @@ function App() {
           </div>
         )}
       </main>
+        </div>
+      </div>
 
       {wizardOpen && (
         <div className="fixed inset-0 z-50 bg-black/55 flex items-center justify-center p-4">
@@ -8846,7 +9830,7 @@ function App() {
         >
           官方文档 <ExternalLink className="w-3 h-3" />
         </button>
-        {step < STEPS.length - 1 && (
+        {currentPrimaryNav === "home" && step < 3 && (
           <button
             onClick={() => handleStepChange(step + 1)}
             disabled={step === 0 && !canProceed}

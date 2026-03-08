@@ -1,6 +1,6 @@
 [package]
 name = "openclaw-deploy"
-version = "0.1.0"
+version = "2.0.0"
 description = "OpenClaw 一键部署工具"
 authors = ["OpenClaw"]
 edition = "2021"
