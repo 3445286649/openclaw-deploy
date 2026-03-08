@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback, memo, startTransition, type CSSProperties, type RefObject, type UIEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   CheckCircle2,
   XCircle,
@@ -16,6 +17,8 @@ import {
   Sparkles,
   Brain,
   ShieldCheck,
+  Users,
+  Zap,
 } from "lucide-react";
 
 interface EnvCheckResult {
@@ -100,6 +103,21 @@ interface PluginInstallProgressEvent {
   total: number;
 }
 
+interface PairingRequestItem {
+  code?: string;
+  senderId?: string;
+  senderLabel?: string;
+  displayName?: string;
+  from?: string;
+  meta?: Record<string, string | undefined>;
+  [key: string]: unknown;
+}
+
+interface PairingListResponse {
+  channel?: string;
+  requests?: PairingRequestItem[];
+}
+
 interface SkillMissing {
   bins: string[];
   any_bins: string[];
@@ -112,9 +130,398 @@ interface SkillCatalogItem {
   name: string;
   description: string;
   source: string;
+  source_type?: string;
   bundled: boolean;
   eligible: boolean;
   missing: SkillMissing;
+  repo_url?: string | null;
+  package_name?: string | null;
+  version?: string | null;
+  author?: string | null;
+  verified?: boolean;
+  install_method?: string | null;
+}
+
+interface AgentListItem {
+  id: string;
+  name?: string;
+  default: boolean;
+  workspace?: string;
+  model?: string;
+}
+
+interface AgentBindingItem {
+  channel: string;
+  agent_id: string;
+}
+
+interface AgentsListPayload {
+  agents: AgentListItem[];
+  bindings: AgentBindingItem[];
+  config_path: string;
+}
+
+interface AgentRuntimeProfile {
+  agent_id: string;
+  provider: string;
+  model: string;
+}
+
+interface AgentSkillBinding {
+  agent_id: string;
+  mode: string;
+  enabled_skills: string[];
+  isolated_state_dir?: string | null;
+}
+
+interface AgentChannelRoute {
+  id: string;
+  channel: string;
+  agent_id: string;
+  gateway_id?: string;
+  bot_instance?: string;
+  account?: string;
+  peer?: string;
+  enabled: boolean;
+}
+
+interface TelegramBotInstance {
+  id: string;
+  name: string;
+  bot_token: string;
+  chat_id?: string;
+  enabled: boolean;
+}
+
+interface ChannelBotInstance {
+  id: string;
+  name: string;
+  channel: string;
+  credential1: string;
+  credential2?: string;
+  chat_id?: string;
+  enabled: boolean;
+}
+
+interface AgentRuntimeSettingsPayload {
+  schema_version: number;
+  profiles: AgentRuntimeProfile[];
+  channel_routes: AgentChannelRoute[];
+  telegram_instances: TelegramBotInstance[];
+  active_telegram_instance?: string | null;
+  channel_instances: ChannelBotInstance[];
+  active_channel_instances: Record<string, string>;
+  gateways: GatewayBinding[];
+  skills_scope: "shared" | "agent_override" | string;
+  agent_skill_bindings: AgentSkillBinding[];
+  settings_path: string;
+}
+
+interface AgentRouteResolveResult {
+  agent_id: string;
+  gateway_id?: string | null;
+  matched_route_id?: string | null;
+  detail: string;
+}
+
+interface GatewayRuntimeHealth {
+  status: string;
+  detail: string;
+  checked_at: number;
+}
+
+interface GatewayBinding {
+  gateway_id: string;
+  agent_id: string;
+  channel: string;
+  instance_id: string;
+  channel_instances?: Record<string, string>;
+  enabled: boolean;
+  state_dir?: string;
+  listen_port?: number;
+  pid?: number;
+  auto_restart?: boolean;
+  last_error?: string;
+  health?: GatewayRuntimeHealth;
+}
+
+interface TelegramInstanceHealth {
+  id: string;
+  ok: boolean;
+  detail: string;
+  username?: string | null;
+}
+
+interface ChannelInstanceHealth {
+  channel: string;
+  id: string;
+  ok: boolean;
+  detail: string;
+}
+
+type NonTelegramChannel = "feishu" | "dingtalk" | "discord" | "qq";
+type ChannelEditorChannel = "telegram" | NonTelegramChannel;
+type PairingChannel = "telegram" | "feishu" | "qq";
+
+interface ChatUiMessage {
+  id: string;
+  role: string;
+  text: string;
+  timestamp?: string;
+  status?: "sending" | "sent" | "failed";
+}
+
+interface CpTaskStep {
+  id: string;
+  name: string;
+  assigned_agent: string;
+  status: string;
+  retry_count: number;
+  output?: string;
+}
+
+interface CpVerifierReport {
+  passed: boolean;
+  score: number;
+  reasons: string[];
+}
+
+interface CpOrchestratorTask {
+  id: string;
+  title: string;
+  input: string;
+  status: string;
+  steps: CpTaskStep[];
+  final_output?: string;
+  verifier?: CpVerifierReport;
+  route_decision?: {
+    intent: string;
+    selected_agent: string;
+    explanation: string;
+    score_table: { agent_id: string; score: number; reason: string }[];
+  };
+  created_at: string;
+  updated_at: string;
+}
+
+interface CpAgentCapability {
+  agent_id: string;
+  specialty: string;
+  primary_model: string;
+  fallback_model?: string;
+  tools: string[];
+  strengths: string[];
+  max_cost_tier: string;
+  updated_at: string;
+}
+
+interface CpGraphNode {
+  id: string;
+  node_type: string;
+  config: Record<string, unknown>;
+}
+
+interface CpGraphEdge {
+  from: string;
+  to: string;
+}
+
+interface CpSkillGraph {
+  id: string;
+  name: string;
+  nodes: CpGraphNode[];
+  edges: CpGraphEdge[];
+  created_at: string;
+}
+
+interface CpTicket {
+  id: string;
+  channel: string;
+  external_ref: string;
+  title: string;
+  payload: Record<string, unknown>;
+  assignee?: string;
+  status: string;
+  sla_minutes: number;
+  created_at: string;
+  updated_at: string;
+}
+
+interface CpMemoryRecord {
+  id: string;
+  layer: string;
+  scope: string;
+  content: string;
+  rationale: string;
+  tags: string[];
+  created_at: string;
+}
+
+interface CpSandboxPreview {
+  action_type: string;
+  resource: string;
+  risk_level: string;
+  requires_approval: boolean;
+  plan: string[];
+}
+
+interface CpDebateOpinion {
+  agent: string;
+  viewpoint: string;
+  confidence: number;
+}
+
+interface CpDebateResult {
+  task: string;
+  opinions: CpDebateOpinion[];
+  judge_summary: string;
+}
+
+interface CpSnapshot {
+  id: string;
+  task_id: string;
+  input: string;
+  tool_calls: string[];
+  config: Record<string, unknown>;
+  created_at: string;
+}
+
+interface CpPromptPolicyVersion {
+  id: string;
+  name: string;
+  rules: Record<string, string>;
+  traffic_percent: number;
+  active: boolean;
+  created_at: string;
+}
+
+interface CpRoleBinding {
+  user_id: string;
+  role: string;
+  updated_at: string;
+}
+
+interface CpAuditEvent {
+  id: string;
+  category: string;
+  action: string;
+  subject: string;
+  detail: string;
+  created_at: string;
+}
+
+interface CpCostSummary {
+  total_tokens: number;
+  avg_latency_ms: number;
+  success_rate: number;
+  total_count: number;
+}
+
+const CHAT_RENDER_BATCH = 80;
+const DEFAULT_SYNC_SESSION_NAME = "main";
+const DEFAULT_ISOLATED_SESSION_NAME = "desktop";
+const EMPTY_AGENTS: AgentListItem[] = [];
+const EMPTY_CHAT_MESSAGES: ChatUiMessage[] = [];
+type ChatSessionMode = "isolated" | "synced";
+
+const ChatMessageBubble = memo(
+  function ChatMessageBubble({
+    message,
+    onRetry,
+  }: {
+    message: ChatUiMessage;
+    onRetry: (text: string) => void;
+  }) {
+    const isUser = message.role === "user";
+    return (
+      <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+        <div
+          className={`max-w-[78%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap ${
+            isUser ? "bg-sky-700 text-white" : "bg-slate-800 text-slate-100"
+          }`}
+        >
+          <div>{message.text}</div>
+          <div className={`text-[10px] mt-1 ${isUser ? "text-sky-100/70" : "text-slate-400"}`}>
+            {message.status === "sending" && "发送中..."}
+            {message.status === "failed" && "发送失败，可重试"}
+            {(message.status === "sent" || !message.status) && (message.timestamp || message.role)}
+          </div>
+          {message.status === "failed" && (
+            <button
+              onClick={() => onRetry(message.text)}
+              className="mt-1 text-[10px] text-amber-300 hover:text-amber-200 underline"
+            >
+              回填重试
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  },
+  (prev, next) =>
+    prev.onRetry === next.onRetry &&
+    isSameChatMessage(prev.message, next.message)
+);
+
+function isSameChatMessage(a: ChatUiMessage, b: ChatUiMessage): boolean {
+  return (
+    a.id === b.id &&
+    a.role === b.role &&
+    (a.text || "") === (b.text || "") &&
+    (a.timestamp || "") === (b.timestamp || "") &&
+    (a.status || "sent") === (b.status || "sent")
+  );
+}
+
+function isSameChatMessageList(a: ChatUiMessage[], b: ChatUiMessage[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (!isSameChatMessage(a[i], b[i])) return false;
+  }
+  return true;
+}
+
+function normalizeChatText(text: string): string {
+  return (text || "").trim().replace(/\s+/g, " ");
+}
+
+function appendDeltaUniqueMessages(
+  current: ChatUiMessage[],
+  delta: ChatUiMessage[],
+  options?: { removeMessageId?: string }
+): ChatUiMessage[] {
+  const base = options?.removeMessageId ? current.filter((m) => m.id !== options.removeMessageId) : current.slice();
+  const seenIds = new Set(base.map((m) => m.id));
+  const seenUserTexts = new Set(base.filter((m) => m.role === "user").map((m) => normalizeChatText(m.text)));
+  const appended: ChatUiMessage[] = [];
+  for (const msg of delta) {
+    if (seenIds.has(msg.id)) continue;
+    if (msg.role === "user") {
+      const normalized = normalizeChatText(msg.text);
+      if (normalized && seenUserTexts.has(normalized)) continue;
+      if (normalized) seenUserTexts.add(normalized);
+    }
+    seenIds.add(msg.id);
+    appended.push(msg);
+  }
+  if (appended.length === 0) return base;
+  return [...base, ...appended];
+}
+
+function trimChatMessagesForUi(messages: ChatUiMessage[], max = 320): ChatUiMessage[] {
+  if (messages.length <= max) return messages;
+  return messages.slice(messages.length - max);
+}
+
+function isSameChannelHealthInfo(a: ChannelHealthInfo, b: ChannelHealthInfo): boolean {
+  return (
+    a.configured === b.configured &&
+    a.token === b.token &&
+    a.gateway === b.gateway &&
+    a.pairing === b.pairing &&
+    a.detail === b.detail
+  );
 }
 
 function hasManualSkillGaps(s: SkillCatalogItem): boolean {
@@ -146,6 +553,356 @@ function buildManualFixHint(s: SkillCatalogItem): string {
   }
   return lines.join("\n");
 }
+
+const SkillTableRow = memo(function SkillTableRow({
+  skill,
+  checked,
+  onToggle,
+  onCopyManualHint,
+  agentEnabled,
+  showAgentToggle,
+  onToggleAgentSkill,
+  repairState,
+}: {
+  skill: SkillCatalogItem;
+  checked: boolean;
+  onToggle: (name: string, checked: boolean) => void;
+  onCopyManualHint: (skill: SkillCatalogItem) => void;
+  agentEnabled: boolean;
+  showAgentToggle: boolean;
+  onToggleAgentSkill: (name: string, enabled: boolean) => void;
+  repairState?: "fixed" | "still_missing" | "manual";
+}) {
+  const missingParts = [
+    skill.missing.bins.length ? `bins:${skill.missing.bins.join(",")}` : "",
+    skill.missing.any_bins.length ? `any:${skill.missing.any_bins.join(",")}` : "",
+    skill.missing.env.length ? `env:${skill.missing.env.join(",")}` : "",
+    skill.missing.config.length ? `cfg:${skill.missing.config.slice(0, 2).join(",")}` : "",
+    skill.missing.os.length ? `os:${skill.missing.os.join(",")}` : "",
+  ].filter(Boolean);
+  const manual = hasManualSkillGaps(skill);
+  const autoFixable = isAutoFixableSkill(skill);
+  const statusText = skill.eligible
+    ? "可用"
+    : manual
+      ? "需手动处理"
+      : repairState === "still_missing"
+        ? "仍缺依赖（已尝试修复）"
+        : "缺依赖（可修复）";
+  const statusClass = skill.eligible
+    ? "text-emerald-400"
+    : manual
+      ? "text-rose-300"
+      : repairState === "still_missing"
+        ? "text-amber-200"
+        : "text-amber-300";
+
+  return (
+    <tr className="border-t border-slate-800">
+      <td className="px-2 py-2">
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => onToggle(skill.name, e.target.checked)}
+        />
+      </td>
+      <td className="px-2 py-2 text-slate-200">{skill.name}</td>
+      <td className="px-2 py-2">
+        <div className="flex flex-col gap-1">
+          <span>{skill.source || (skill.bundled ? "bundled" : "unknown")}</span>
+          {(skill.author || skill.version) && (
+            <span className="text-[11px] text-slate-500">
+              {[skill.author, skill.version].filter(Boolean).join(" · ")}
+            </span>
+          )}
+        </div>
+      </td>
+      <td className={`px-2 py-2 ${statusClass}`}>
+        {statusText}
+      </td>
+      <td className={`px-2 py-2 ${agentEnabled ? "text-emerald-300" : "text-slate-500"}`}>
+        {agentEnabled ? "已启用" : "未启用"}
+      </td>
+      <td className="px-2 py-2 text-slate-400">{missingParts.join(" | ") || "-"}</td>
+      <td className="px-2 py-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {manual ? (
+            <button
+              onClick={() => onCopyManualHint(skill)}
+              className="px-2 py-1 bg-amber-700 hover:bg-amber-600 rounded text-xs"
+            >
+              复制手动指引
+            </button>
+          ) : autoFixable ? (
+            <span className="text-emerald-300 text-xs">
+              {repairState === "still_missing" ? "仍缺依赖，说明还没修好，可再次尝试或手动处理" : "可点“修复缺失依赖（选中）”"}
+            </span>
+          ) : (
+            <span className="text-slate-500 text-xs">-</span>
+          )}
+          {showAgentToggle && (
+            <button
+              onClick={() => onToggleAgentSkill(skill.name, !agentEnabled)}
+              className={`px-2 py-1 rounded text-xs ${
+                agentEnabled ? "bg-slate-700 hover:bg-slate-600 text-slate-200" : "bg-sky-700 hover:bg-sky-600 text-white"
+              }`}
+            >
+              {agentEnabled ? "对当前 Agent 禁用" : "对当前 Agent 启用"}
+            </button>
+          )}
+        </div>
+      </td>
+    </tr>
+  );
+});
+
+interface ChatWorkbenchProps {
+  agents: AgentListItem[];
+  selectedAgentId: string;
+  unreadByAgent: Record<string, number>;
+  routeMode: "manual" | "auto";
+  chatExecutionMode: "orchestrator" | "direct";
+  chatSessionMode: ChatSessionMode;
+  chatLoading: boolean;
+  chatSending: boolean;
+  chatError: string | null;
+  routeHint: string | null;
+  messages: ChatUiMessage[];
+  renderLimit: number;
+  chatViewportRef: RefObject<HTMLDivElement | null>;
+  onRouteModeChange: (next: "manual" | "auto") => void;
+  onExecutionModeChange: (next: "orchestrator" | "direct") => void;
+  onSessionModeChange: (next: ChatSessionMode) => void;
+  onSelectAgent: (agentId: string) => void;
+  onNewSession: () => void;
+  onClearSession: () => void;
+  onAbort: () => void;
+  onSend: (text: string) => Promise<boolean>;
+  onTypingActivity: () => void;
+  onViewportScroll: (evt: UIEvent<HTMLDivElement>) => void;
+  getAgentSpecialty: (agentId: string) => "代码" | "表格" | "通用";
+  gatewayOptionsByAgent: Record<string, GatewayBinding[]>;
+  preferredGatewayByAgent: Record<string, string>;
+  onPreferredGatewayChange: (agentId: string, gatewayId: string) => void;
+}
+
+const ChatWorkbench = memo(function ChatWorkbench({
+  agents,
+  selectedAgentId,
+  unreadByAgent,
+  routeMode,
+  chatExecutionMode,
+  chatSessionMode,
+  chatLoading,
+  chatSending,
+  chatError,
+  routeHint,
+  messages,
+  renderLimit,
+  chatViewportRef,
+  onRouteModeChange,
+  onExecutionModeChange,
+  onSessionModeChange,
+  onSelectAgent,
+  onNewSession,
+  onClearSession,
+  onAbort,
+  onSend,
+  onTypingActivity,
+  onViewportScroll,
+  getAgentSpecialty,
+  gatewayOptionsByAgent,
+  preferredGatewayByAgent,
+  onPreferredGatewayChange,
+}: ChatWorkbenchProps) {
+  const [draftByAgent, setDraftByAgent] = useState<Record<string, string>>({});
+  const draft = selectedAgentId ? draftByAgent[selectedAgentId] || "" : "";
+  const visibleMessages = useMemo(
+    () => (messages.length > renderLimit ? messages.slice(-renderLimit) : messages),
+    [messages, renderLimit]
+  );
+  const selectedGatewayOptions = selectedAgentId ? (gatewayOptionsByAgent[selectedAgentId] || []) : [];
+  const selectedGatewayValue = selectedAgentId ? (preferredGatewayByAgent[selectedAgentId] || selectedGatewayOptions[0]?.gateway_id || "") : "";
+
+  const setDraftForSelected = useCallback(
+    (text: string) => {
+      if (!selectedAgentId) return;
+      setDraftByAgent((prev) => {
+        if ((prev[selectedAgentId] || "") === text) return prev;
+        return { ...prev, [selectedAgentId]: text };
+      });
+    },
+    [selectedAgentId]
+  );
+
+  const handleSend = useCallback(async () => {
+    const ok = await onSend(draft);
+    if (ok) setDraftForSelected("");
+  }, [onSend, draft, setDraftForSelected]);
+
+  return (
+    <div className="flex flex-col gap-3" style={{ minHeight: 520 }}>
+      <div className="flex items-center justify-between rounded-xl border border-slate-700/70 bg-slate-900/40 px-3 py-2 backdrop-blur-sm">
+        <p className="text-xs text-slate-400">
+          左侧选择 Agent，右侧为聊天内容。支持手动 @agent 路由；推荐“流程编排”模式，一句话自动完成多Agent协作。
+        </p>
+        <div className="flex items-center gap-2 flex-wrap">
+          <label className="text-xs text-slate-400">路由模式</label>
+          <select
+            value={routeMode}
+            onChange={(e) => onRouteModeChange(e.target.value as "manual" | "auto")}
+            className="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs"
+          >
+            <option value="manual">手动</option>
+            <option value="auto">自动</option>
+          </select>
+          <label className="text-xs text-slate-400 ml-2">执行方式</label>
+          <select
+            value={chatExecutionMode}
+            onChange={(e) => onExecutionModeChange(e.target.value as "orchestrator" | "direct")}
+            className="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs"
+          >
+            <option value="orchestrator">流程编排（推荐）</option>
+            <option value="direct">直连对话</option>
+          </select>
+          <label className="text-xs text-slate-400 ml-2">会话模式</label>
+          <select
+            value={chatSessionMode}
+            onChange={(e) => onSessionModeChange(e.target.value as ChatSessionMode)}
+            className="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs"
+          >
+            <option value="isolated">隔离（仅客户端）</option>
+            <option value="synced">同步（三端共享）</option>
+          </select>
+          {selectedAgentId && selectedGatewayOptions.length > 0 && (
+            <>
+              <label className="text-xs text-slate-400 ml-2">网关</label>
+              <select
+                value={selectedGatewayValue}
+                onChange={(e) => onPreferredGatewayChange(selectedAgentId, e.target.value)}
+                className="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs max-w-[240px]"
+              >
+                {selectedGatewayOptions.map((g) => (
+                  <option key={g.gateway_id} value={g.gateway_id}>
+                    {g.gateway_id} · {g.channel}/{g.instance_id}
+                  </option>
+                ))}
+              </select>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div className="flex gap-3 flex-1 min-h-0">
+        <div className="w-52 shrink-0 flex flex-col gap-1 bg-slate-800/50 rounded-xl border border-slate-700/60 p-2 overflow-y-auto">
+          {agents.length > 0 ? (
+            agents.map((a) => {
+              const selected = selectedAgentId === a.id;
+              const specialty = getAgentSpecialty(a.id);
+              const unread = unreadByAgent[a.id] || 0;
+              return (
+                <button
+                  key={a.id}
+                  onClick={() => onSelectAgent(a.id)}
+                  className={`text-left px-2.5 py-2.5 rounded-lg text-xs transition-all duration-150 ${
+                    selected
+                      ? "bg-sky-700/90 text-sky-100 shadow-[0_0_0_1px_rgba(125,211,252,0.25)]"
+                      : "bg-slate-700/50 hover:bg-slate-600 text-slate-200"
+                  }`}
+                  title={a.workspace || a.id}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="truncate">{a.name || a.id}</span>
+                    {unread > 0 && (
+                      <span className="bg-rose-600 text-white rounded-full px-1.5 text-[10px]">{unread}</span>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-slate-300/80 mt-0.5">
+                    {a.id} · {specialty}
+                  </div>
+                </button>
+              );
+            })
+          ) : (
+            <p className="text-xs text-slate-500 px-2">暂无 Agent</p>
+          )}
+        </div>
+
+        <div className="flex-1 min-w-0 bg-slate-900/50 rounded-xl overflow-hidden border border-slate-700/60 flex flex-col shadow-[0_12px_32px_rgba(15,23,42,0.18)]">
+          <div className="px-3 py-2 border-b border-slate-700/60 flex items-center justify-between bg-slate-900/70 backdrop-blur-sm">
+            <div className="text-sm text-slate-200">
+              当前会话：<span className="font-medium">{selectedAgentId || "(未选择)"}</span>
+              {selectedAgentId && (
+                <span className="text-xs text-slate-400 ml-2">
+                  专长：{getAgentSpecialty(selectedAgentId)}
+                </span>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <button onClick={onNewSession} className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs">
+                新会话
+              </button>
+              <button onClick={onClearSession} className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs">
+                清空
+              </button>
+              <button onClick={onAbort} className="px-2 py-1 bg-rose-700 hover:bg-rose-600 rounded text-xs">
+                停止
+              </button>
+            </div>
+          </div>
+
+          <div
+            ref={chatViewportRef}
+            onScroll={onViewportScroll}
+            className="flex-1 overflow-y-auto p-3 space-y-2 min-h-[320px] scroll-smooth"
+            style={{ contentVisibility: "auto", containIntrinsicSize: "720px" }}
+          >
+            {chatLoading && <p className="text-xs text-slate-500">正在加载历史...</p>}
+            {!chatLoading && messages.length === 0 && <p className="text-xs text-slate-500">暂无消息，开始对话吧。</p>}
+            {messages.length > visibleMessages.length && (
+              <p className="text-[11px] text-slate-500">
+                为提升流畅度当前渲染 {visibleMessages.length}/{messages.length} 条，向上滚动可继续加载更早消息。
+              </p>
+            )}
+            {visibleMessages.map((m) => (
+              <ChatMessageBubble key={m.id} message={m} onRetry={setDraftForSelected} />
+            ))}
+          </div>
+
+          <div className="border-t border-slate-700/60 p-3 space-y-2">
+            {routeHint && <p className="text-xs text-emerald-300">{routeHint}</p>}
+            {chatError && <p className="text-xs text-rose-400">{chatError}</p>}
+            <div className="flex gap-2">
+              <textarea
+                value={draft}
+                onChange={(e) => {
+                  onTypingActivity();
+                  setDraftForSelected(e.target.value);
+                }}
+                placeholder="输入消息，手动路由可用 @code 你的问题"
+                rows={2}
+                className="flex-1 bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm resize-none"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    void handleSend();
+                  }
+                }}
+              />
+              <button
+                onClick={() => void handleSend()}
+                disabled={chatSending || !selectedAgentId}
+                className="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-sm"
+              >
+                {chatSending ? "发送中..." : "发送"}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});
 
 type QuickMode = "stable" | "balanced" | "performance";
 type TuneLength = "short" | "medium" | "long";
@@ -293,7 +1050,7 @@ const STEPS = [
   { id: 0, title: "环境检测", icon: CheckCircle2 },
   { id: 1, title: "安装 OpenClaw", icon: Download },
   { id: 2, title: "配置 AI 模型", icon: Key },
-  { id: 3, title: "启动服务", icon: Play },
+  { id: 3, title: "服务与对话", icon: Play },
   { id: 4, title: "调教中心", icon: SlidersHorizontal },
 ];
 
@@ -309,8 +1066,17 @@ const FIXED_SILICONFLOW_MODELS: { id: string; label: string }[] = [
   { id: "moonshotai/Kimi-K2-Instruct-0905", label: "Kimi K2（可对话）" },
   { id: "deepseek-ai/DeepSeek-R1", label: "DeepSeek R1（备选）" },
 ];
+const AGENT_PROVIDER_OPTIONS = ["openai", "deepseek", "kimi", "qwen", "bailian", "anthropic"] as const;
 const DEPLOY_SUCCESS_DIALOG =
   "恭喜部署完成！作者已为你配置稳定代理API（每天免费额度）。加QQ群1085253453领更多额度或29元无限包月。";
+
+function defaultBaseUrlForProvider(provider: string): string {
+  if (provider === "kimi") return DEFAULT_KIMI_BASE_URL;
+  if (provider === "qwen" || provider === "bailian") return "https://dashscope.aliyuncs.com/compatible-mode/v1";
+  if (provider === "deepseek") return "https://api.deepseek.com/v1";
+  if (provider === "anthropic") return "https://api.anthropic.com/v1";
+  return DEFAULT_OPENAI_BASE_URL;
+}
 
 function App() {
   const [step, setStep] = useState(0);
@@ -329,6 +1095,13 @@ function App() {
   const [installLog, setInstallLog] = useState<string[]>([]);
   const [installSteps, setInstallSteps] = useState<InstallStepItem[]>(INSTALL_STEPS);
   const logEndRef = useRef<HTMLPreElement>(null);
+  const chatViewportRef = useRef<HTMLDivElement | null>(null);
+  const chatStickBottomByAgentRef = useRef<Record<string, boolean>>({});
+  const chatCursorByAgentRef = useRef<Record<string, number>>({});
+  const chatSessionNameByAgentRef = useRef<Record<string, string>>({});
+  const chatSessionModeRef = useRef<ChatSessionMode>("isolated");
+  const chatSendLockRef = useRef(false);
+  const lastSentFingerprintRef = useRef<Record<string, { text: string; at: number }>>({});
   const installLogBufferRef = useRef<string[]>([]);
   const installLogFlushTimerRef = useRef<number | null>(null);
 
@@ -355,16 +1128,19 @@ function App() {
   const [starting, setStarting] = useState(false);
   const [startResult, setStartResult] = useState<string | null>(null);
   const [telegramConfig, setTelegramConfig] = useState<ChannelConfig>({});
-  const [feishuConfig, setFeishuConfig] = useState<ChannelConfig>({});
-  const [qqConfig, setQqConfig] = useState<ChannelConfig>({});
-  const [discordConfig, setDiscordConfig] = useState<ChannelConfig>({});
-  const [dingtalkConfig, setDingtalkConfig] = useState<ChannelConfig>({});
-  const [channelSaving, setChannelSaving] = useState<string | null>(null);
-  const [channelTesting, setChannelTesting] = useState<string | null>(null);
   const [pairingLoading, setPairingLoading] = useState<string | null>(null);
-  const [telegramPairingCode, setTelegramPairingCode] = useState("");
+  const [pairingCodeByChannel, setPairingCodeByChannel] = useState<Record<PairingChannel, string>>({
+    telegram: "",
+    feishu: "",
+    qq: "",
+  });
+  const [pairingRequestsByChannel, setPairingRequestsByChannel] = useState<Record<PairingChannel, PairingRequestItem[]>>({
+    telegram: [],
+    feishu: [],
+    qq: [],
+  });
   const [channelResult, setChannelResult] = useState<string | null>(null);
-  const [telegramHealth, setTelegramHealth] = useState<{
+  const [, setTelegramHealth] = useState<{
     configured: HealthState;
     token: HealthState;
     gateway: HealthState;
@@ -377,43 +1153,12 @@ function App() {
     pairing: "unknown",
     detail: "未检测",
   });
-  const [feishuHealth, setFeishuHealth] = useState<ChannelHealthInfo>({
-    configured: "unknown",
-    token: "unknown",
-    gateway: "unknown",
-    pairing: "ok",
-    detail: "未检测",
-  });
-  const [qqHealth, setQqHealth] = useState<ChannelHealthInfo>({
-    configured: "unknown",
-    token: "unknown",
-    gateway: "unknown",
-    pairing: "ok",
-    detail: "未检测",
-  });
-  const [discordHealth, setDiscordHealth] = useState<ChannelHealthInfo>({
-    configured: "unknown",
-    token: "unknown",
-    gateway: "unknown",
-    pairing: "ok",
-    detail: "未检测",
-  });
-  const [dingtalkHealth, setDingtalkHealth] = useState<ChannelHealthInfo>({
-    configured: "unknown",
-    token: "unknown",
-    gateway: "unknown",
-    pairing: "ok",
-    detail: "未检测",
-  });
-  const [autoRefreshHealth, setAutoRefreshHealth] = useState(false);
+  const [autoRefreshHealth] = useState(false);
   const [savedAiHint, setSavedAiHint] = useState<string | null>(null);
   const [localInfo, setLocalInfo] = useState<LocalOpenclawInfo | null>(null);
   const [exeCheckInfo, setExeCheckInfo] = useState<ExecutableCheckInfo | null>(null);
   const [uninstalling, setUninstalling] = useState(false);
-  const [onboardCliLoading, setOnboardCliLoading] = useState(false);
-  const [selfCheckLoading, setSelfCheckLoading] = useState(false);
   const [selfCheckItems, setSelfCheckItems] = useState<SelfCheckItem[]>([]);
-  const [selfCheckFixingKey, setSelfCheckFixingKey] = useState<string | null>(null);
   const [selfCheckResult, setSelfCheckResult] = useState<string | null>(null);
   const [pluginSelection, setPluginSelection] = useState<Record<string, boolean>>({
     telegram: true,
@@ -426,25 +1171,35 @@ function App() {
   const [pluginInstallResult, setPluginInstallResult] = useState<string | null>(null);
   const [pluginInstallProgress, setPluginInstallProgress] = useState<PluginInstallProgressEvent | null>(null);
   const [pluginInstallProgressLog, setPluginInstallProgressLog] = useState<string[]>([]);
+  const pluginLogBufferRef = useRef<string[]>([]);
+  const pluginLogFlushTimerRef = useRef<number | null>(null);
   const [skillsLoading, setSkillsLoading] = useState(false);
   const [skillsResult, setSkillsResult] = useState<string | null>(null);
   const [skillsCatalogLoading, setSkillsCatalogLoading] = useState(false);
   const [skillsCatalog, setSkillsCatalog] = useState<SkillCatalogItem[]>([]);
+  const [skillsScopeSaving, setSkillsScopeSaving] = useState(false);
+  const [skillsSelectedAgentId, setSkillsSelectedAgentId] = useState("");
   const [selectedSkills, setSelectedSkills] = useState<Record<string, boolean>>({});
   const [skillsRepairLoading, setSkillsRepairLoading] = useState(false);
   const [skillsAction, setSkillsAction] = useState<"install" | "repair" | null>(null);
   const [skillsRepairProgress, setSkillsRepairProgress] = useState<SkillsRepairProgressEvent | null>(null);
   const [skillsRepairProgressLog, setSkillsRepairProgressLog] = useState<string[]>([]);
-  const [diagnosticLoading, setDiagnosticLoading] = useState(false);
-  const [diagnosticResult, setDiagnosticResult] = useState<string | null>(null);
-  const [snapshotsLoading, setSnapshotsLoading] = useState(false);
-  const [snapshots, setSnapshots] = useState<string[]>([]);
-  const [rollingBackSnapshot, setRollingBackSnapshot] = useState<string | null>(null);
+  const [serviceSkillsRenderLimit, setServiceSkillsRenderLimit] = useState(80);
+  const [marketQuery, setMarketQuery] = useState("");
+  const [marketLoading, setMarketLoading] = useState(false);
+  const [marketResults, setMarketResults] = useState<SkillCatalogItem[]>([]);
+  const [marketInstallKey, setMarketInstallKey] = useState<string | null>(null);
+  const [marketResult, setMarketResult] = useState<string | null>(null);
+  const [localSkillPath, setLocalSkillPath] = useState("");
+  const [localSkillInstalling, setLocalSkillInstalling] = useState(false);
+  const [skillRepairStateByName, setSkillRepairStateByName] = useState<Record<string, "fixed" | "still_missing" | "manual">>({});
+  const skillsLogBufferRef = useRef<string[]>([]);
+  const skillsLogFlushTimerRef = useRef<number | null>(null);
   const [startupMigrationResult, setStartupMigrationResult] = useState<StartupMigrationResult | null>(null);
   const [queueTasks, setQueueTasks] = useState<QueueTaskItem[]>([]);
   const queueRunnersRef = useRef<Record<string, () => Promise<void>>>({});
   const cancelledRunningTasksRef = useRef<Set<string>>(new Set());
-  const [ticketSummary, setTicketSummary] = useState<string | null>(null);
+  const [, setTicketSummary] = useState<string | null>(null);
 
   const [fixing, setFixing] = useState<"node" | "npm" | "git" | "openclaw" | null>(null);
   const [fixResult, setFixResult] = useState<string | null>(null);
@@ -455,19 +1210,174 @@ function App() {
   const [tuneProactivity, setTuneProactivity] = useState<TuneProactivity>("balanced");
   const [tunePermission, setTunePermission] = useState<TunePermission>("confirm");
   const [memoryMode, setMemoryMode] = useState<MemoryMode>("session");
+  const [tuningSection, setTuningSection] = useState<
+    "quick" | "scene" | "personal" | "memory" | "health" | "skills" | "agents" | "chat" | "control"
+  >("quick");
   const [memoryStatus, setMemoryStatus] = useState<MemoryCenterStatus | null>(null);
   const [memorySummary, setMemorySummary] = useState<string | null>(null);
   const [memoryLoading, setMemoryLoading] = useState(false);
   const [memoryActionLoading, setMemoryActionLoading] = useState<"read" | "clear" | "export" | "init" | null>(null);
   const [tuningActionLoading, setTuningActionLoading] = useState<"check" | "heal" | null>(null);
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [agentsList, setAgentsList] = useState<AgentsListPayload | null>(null);
+  const [agentsLoading, setAgentsLoading] = useState(false);
+  const [agentsError, setAgentsError] = useState<string | null>(null);
+  const [agentRuntimeSettings, setAgentRuntimeSettings] = useState<AgentRuntimeSettingsPayload | null>(null);
+  const [agentProfileDrafts, setAgentProfileDrafts] = useState<Record<string, { provider: string; model: string }>>({});
+  const [agentModelsByProvider, setAgentModelsByProvider] = useState<Record<string, string[]>>({});
+  const [agentModelsLoadingByProvider, setAgentModelsLoadingByProvider] = useState<Record<string, boolean>>({});
+  const [agentRuntimeSaving, setAgentRuntimeSaving] = useState(false);
+  const [agentRuntimeResult, setAgentRuntimeResult] = useState<string | null>(null);
+  const [channelRoutesDraft, setChannelRoutesDraft] = useState<AgentChannelRoute[]>([]);
+  const [gatewayBindingsDraft, setGatewayBindingsDraft] = useState<GatewayBinding[]>([]);
+  const [gatewaySelectedIdForRouteTest, setGatewaySelectedIdForRouteTest] = useState("");
+  const [gatewayActionLoadingById, setGatewayActionLoadingById] = useState<Record<string, boolean>>({});
+  const [gatewayLogsById, setGatewayLogsById] = useState<Record<string, string>>({});
+  const [gatewayLogViewerId, setGatewayLogViewerId] = useState<string | null>(null);
+  const [gatewayBatchLoading, setGatewayBatchLoading] = useState<"start" | "health" | "report" | null>(null);
+  const [telegramInstancesDraft, setTelegramInstancesDraft] = useState<TelegramBotInstance[]>([]);
+  const [channelInstancesDraft, setChannelInstancesDraft] = useState<ChannelBotInstance[]>([]);
+  const [activeChannelInstanceByChannel, setActiveChannelInstanceByChannel] = useState<Record<string, string>>({});
+  const [channelInstancesEditorChannel, setChannelInstancesEditorChannel] = useState<ChannelEditorChannel>("telegram");
+  const [channelBatchTestingByChannel, setChannelBatchTestingByChannel] = useState<Record<string, boolean>>({});
+  const [channelSingleTestingByInstanceId, setChannelSingleTestingByInstanceId] = useState<Record<string, boolean>>({});
+  const [channelWizardRunningByChannel, setChannelWizardRunningByChannel] = useState<Record<string, boolean>>({});
+  const [activeTelegramInstanceId, setActiveTelegramInstanceId] = useState("");
+  const [telegramWizardRunning, setTelegramWizardRunning] = useState(false);
+  const [telegramBatchTesting, setTelegramBatchTesting] = useState(false);
+  const [telegramSessionCleanupRunning, setTelegramSessionCleanupRunning] = useState(false);
+  const [telegramSingleTestingByInstanceId, setTelegramSingleTestingByInstanceId] = useState<Record<string, boolean>>({});
+  const [telegramUsernameByInstanceId, setTelegramUsernameByInstanceId] = useState<Record<string, string>>({});
+  const [routeTestBotInstance, setRouteTestBotInstance] = useState("");
+  const [routeTestChannel, setRouteTestChannel] = useState("telegram");
+  const [routeTestAccount, setRouteTestAccount] = useState("");
+  const [routeTestPeer, setRouteTestPeer] = useState("");
+  const [routeTesting, setRouteTesting] = useState(false);
+  const [routeTestResult, setRouteTestResult] = useState<string | null>(null);
+  const [showCreateAgent, setShowCreateAgent] = useState(false);
+  const [createAgentId, setCreateAgentId] = useState("");
+  const [createAgentName, setCreateAgentName] = useState("");
+  const [createAgentWorkspace, setCreateAgentWorkspace] = useState("");
+  const [creatingAgent, setCreatingAgent] = useState(false);
+  const [selectedAgentId, setSelectedAgentId] = useState<string>("");
+  const [messagesByAgent, setMessagesByAgent] = useState<Record<string, ChatUiMessage[]>>({});
+  const [chatHistorySuppressedByAgent, setChatHistorySuppressedByAgent] = useState<Record<string, boolean>>({});
+  const [chatRenderLimitByAgent, setChatRenderLimitByAgent] = useState<Record<string, number>>({});
+  const [chatDraft, setChatDraft] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatError, setChatError] = useState<string | null>(null);
+  const [routeMode, setRouteMode] = useState<"manual" | "auto">("manual");
+  const [simpleModeForAgent, setSimpleModeForAgent] = useState(true);
+  const [setupWizardStepMode, setSetupWizardStepMode] = useState(false);
+  const [setupWizardCurrentStep, setSetupWizardCurrentStep] = useState(1);
+  const [showAdvancedRouteRules, setShowAdvancedRouteRules] = useState(false);
+  const [showAgentAdvancedSettings, setShowAgentAdvancedSettings] = useState(false);
+  const [showGatewayAdvancedActions, setShowGatewayAdvancedActions] = useState(false);
+  const [chatExecutionMode, setChatExecutionMode] = useState<"orchestrator" | "direct">("direct");
+  const [chatSessionMode, setChatSessionMode] = useState<ChatSessionMode>("isolated");
+  const [routeHint, setRouteHint] = useState<string | null>(null);
+  const [unreadByAgent, setUnreadByAgent] = useState<Record<string, number>>({});
+  const [preferredGatewayByAgent, setPreferredGatewayByAgent] = useState<Record<string, string>>({});
+  const messagesByAgentRef = useRef<Record<string, ChatUiMessage[]>>({});
+  const chatRenderLimitByAgentRef = useRef<Record<string, number>>({});
+  const chatHistorySuppressedRef = useRef<Record<string, boolean>>({});
+  const lastTypingAtRef = useRef(0);
+  const chatInteractTimerRef = useRef<number | null>(null);
+  const [chatInteracting, setChatInteracting] = useState(false);
+  const [servicePanelExpanded, setServicePanelExpanded] = useState(false);
+  const [servicePanelMounted, setServicePanelMounted] = useState(false);
+  const [showServiceQueueDetails, setShowServiceQueueDetails] = useState(false);
+  const [showRouteTestPanel, setShowRouteTestPanel] = useState(false);
+  const [cpLoading, setCpLoading] = useState(false);
+  const [cpResult, setCpResult] = useState<string | null>(null);
+  const [cpTasks, setCpTasks] = useState<CpOrchestratorTask[]>([]);
+  const [cpGraphs, setCpGraphs] = useState<CpSkillGraph[]>([]);
+  const [cpTickets, setCpTickets] = useState<CpTicket[]>([]);
+  const [cpMemory, setCpMemory] = useState<CpMemoryRecord[]>([]);
+  const [cpSnapshots, setCpSnapshots] = useState<CpSnapshot[]>([]);
+  const [cpPrompts, setCpPrompts] = useState<CpPromptPolicyVersion[]>([]);
+  const [cpCapabilities, setCpCapabilities] = useState<CpAgentCapability[]>([]);
+  const [cpRoles, setCpRoles] = useState<CpRoleBinding[]>([]);
+  const [cpAudit, setCpAudit] = useState<CpAuditEvent[]>([]);
+  const [cpCost, setCpCost] = useState<CpCostSummary | null>(null);
+  const [cpTaskTitle, setCpTaskTitle] = useState("多Agent综合任务");
+  const [cpTaskInput, setCpTaskInput] = useState("");
+  const [cpVerifierOutput, setCpVerifierOutput] = useState("");
+  const [cpVerifierConstraints, setCpVerifierConstraints] = useState("结构完整\n给出步骤");
+  const [cpVerifierReport, setCpVerifierReport] = useState<CpVerifierReport | null>(null);
+  const [cpGraphName, setCpGraphName] = useState("抓取-清洗-生成-发送");
+  const [cpGraphNodesJson, setCpGraphNodesJson] = useState(
+    '[{"id":"n1","node_type":"fetch","config":{"url":"https://example.com"}},{"id":"n2","node_type":"clean","config":{}},{"id":"n3","node_type":"generate","config":{}},{"id":"n4","node_type":"send","config":{"channel":"telegram"}}]'
+  );
+  const [cpGraphEdgesJson, setCpGraphEdgesJson] = useState(
+    '[{"from":"n1","to":"n2"},{"from":"n2","to":"n3"},{"from":"n3","to":"n4"}]'
+  );
+  const [cpSelectedGraphId, setCpSelectedGraphId] = useState("");
+  const [cpTicketChannel, setCpTicketChannel] = useState("telegram");
+  const [cpTicketExternalRef, setCpTicketExternalRef] = useState("demo-ext");
+  const [cpTicketTitle, setCpTicketTitle] = useState("渠道消息工单");
+  const [cpTicketPayload, setCpTicketPayload] = useState('{"text":"need follow up"}');
+  const [cpMemoryLayer, setCpMemoryLayer] = useState("project");
+  const [cpMemoryScope, setCpMemoryScope] = useState("default");
+  const [cpMemoryContent, setCpMemoryContent] = useState("");
+  const [cpMemoryRationale, setCpMemoryRationale] = useState("");
+  const [cpMemoryTags, setCpMemoryTags] = useState("demo,important");
+  const [cpSandboxActionType, setCpSandboxActionType] = useState("write_file");
+  const [cpSandboxResource, setCpSandboxResource] = useState("./workspace/demo.txt");
+  const [cpSandboxPreview, setCpSandboxPreview] = useState<CpSandboxPreview | null>(null);
+  const [cpSandboxApproved, setCpSandboxApproved] = useState(false);
+  const [cpDebateTask, setCpDebateTask] = useState("给出代码+表格的协同方案");
+  const [cpDebateResult, setCpDebateResult] = useState<CpDebateResult | null>(null);
+  const [cpSnapshotTaskId, setCpSnapshotTaskId] = useState("");
+  const [cpSnapshotInput, setCpSnapshotInput] = useState("");
+  const [cpSnapshotTools, setCpSnapshotTools] = useState("fetch,clean,generate");
+  const [cpSnapshotConfig, setCpSnapshotConfig] = useState('{"mode":"demo"}');
+  const [cpPromptName, setCpPromptName] = useState("policy-a");
+  const [cpPromptRules, setCpPromptRules] = useState('{"tone":"professional","safety":"strict"}');
+  const [cpPromptTraffic, setCpPromptTraffic] = useState(50);
+  const [cpRoleUserId, setCpRoleUserId] = useState("local-admin");
+  const [cpRoleName, setCpRoleName] = useState("admin");
+  const [cpCapAgentId, setCpCapAgentId] = useState("code");
+  const [cpCapSpecialty, setCpCapSpecialty] = useState("code");
+  const [cpCapPrimaryModel, setCpCapPrimaryModel] = useState("code-optimized");
+  const [cpCapFallbackModel, setCpCapFallbackModel] = useState("general-balanced");
+  const [cpCapTools, setCpCapTools] = useState("filesystem,terminal,tests");
+  const [cpCapStrengths, setCpCapStrengths] = useState("代码实现,调试,重构");
+  const [cpCapCostTier, setCpCapCostTier] = useState("medium");
   const [wizardUseCase, setWizardUseCase] = useState<ScenarioPreset>("customer_support");
   const [wizardTone, setWizardTone] = useState<TuneTone>("friendly");
   const [wizardMemory, setWizardMemory] = useState<MemoryMode>("session");
-  const consistencyGuardRanRef = useRef(false);
-  const selectedSkillItems = skillsCatalog.filter((s) => !!selectedSkills[s.name]);
-  const selectedManualSkillItems = selectedSkillItems.filter((s) => hasManualSkillGaps(s));
-  const selectedAutoFixableItems = selectedSkillItems.filter((s) => isAutoFixableSkill(s));
+  const selectedSkillItems = useMemo(
+    () => skillsCatalog.filter((s) => !!selectedSkills[s.name]),
+    [skillsCatalog, selectedSkills]
+  );
+  const selectedManualSkillItems = useMemo(
+    () => selectedSkillItems.filter((s) => hasManualSkillGaps(s)),
+    [selectedSkillItems]
+  );
+  const selectedAutoFixableItems = useMemo(
+    () => selectedSkillItems.filter((s) => isAutoFixableSkill(s)),
+    [selectedSkillItems]
+  );
+  const currentSkillsScope = agentRuntimeSettings?.skills_scope === "agent_override" ? "agent_override" : "shared";
+  const skillsAgents = agentsList?.agents || [];
+  const effectiveSkillsAgentId = skillsSelectedAgentId || selectedAgentId || skillsAgents[0]?.id || "";
+  const currentAgentSkillBinding = useMemo(
+    () =>
+      (agentRuntimeSettings?.agent_skill_bindings || []).find((binding) => binding.agent_id === effectiveSkillsAgentId) || null,
+    [agentRuntimeSettings?.agent_skill_bindings, effectiveSkillsAgentId]
+  );
+  const effectiveAgentEnabledSkillSet = useMemo(() => {
+    const allNames = new Set(skillsCatalog.map((skill) => skill.name));
+    if (currentSkillsScope !== "agent_override") return allNames;
+    if (!currentAgentSkillBinding || currentAgentSkillBinding.mode !== "custom") return allNames;
+    return new Set(currentAgentSkillBinding.enabled_skills || []);
+  }, [skillsCatalog, currentSkillsScope, currentAgentSkillBinding]);
+  const effectiveAgentEnabledSkillCount = useMemo(
+    () => skillsCatalog.filter((skill) => effectiveAgentEnabledSkillSet.has(skill.name)).length,
+    [skillsCatalog, effectiveAgentEnabledSkillSet]
+  );
   const loadedStepDataRef = useRef<{ install: boolean; model: boolean; channel: boolean }>({
     install: false,
     model: false,
@@ -487,7 +1397,12 @@ function App() {
       .catch(() => {});
     const savedInstall = localStorage.getItem("openclaw_install_dir") ?? "";
     const savedConfig = localStorage.getItem("openclaw_config_dir") ?? "";
+    const savedChatSessionMode = localStorage.getItem("openclaw_chat_session_mode");
     if (savedInstall) setCustomInstallPath(savedInstall);
+    if (savedChatSessionMode === "isolated" || savedChatSessionMode === "synced") {
+      setChatSessionMode(savedChatSessionMode);
+      chatSessionModeRef.current = savedChatSessionMode;
+    }
     if (savedConfig) {
       if (!isLikelyConfigPath(savedConfig)) {
         localStorage.removeItem("openclaw_config_dir");
@@ -497,14 +1412,23 @@ function App() {
       } else {
         setCustomConfigPath(savedConfig);
       }
-    } else {
-      // 无保存路径时自动检测并填充
-      invoke<string | null>("detect_openclaw_config_path")
-        .then((p) => {
-          if (p && isLikelyConfigPath(p)) setCustomConfigPath(p);
-        })
-        .catch(() => {});
     }
+    // 无论是否有缓存路径，都主动对齐 Gateway 实际路径；是否三端共用会话由“会话模式”决定。
+    invoke<string | null>("detect_openclaw_config_path")
+      .then((p) => {
+        if (!p || !isLikelyConfigPath(p)) return;
+        const detected = normalizeConfigPath(p);
+        const cached = normalizeConfigPath(savedConfig);
+        if (detected && detected !== cached) {
+          setCustomConfigPath(detected);
+          localStorage.setItem("openclaw_config_dir", detected);
+          setSaveResult("已自动对齐到 Gateway 配置目录。");
+        } else if (!savedConfig) {
+          setCustomConfigPath(detected);
+          localStorage.setItem("openclaw_config_dir", detected);
+        }
+      })
+      .catch(() => {});
     runEnvCheck(savedInstall || undefined);
   }, []);
 
@@ -534,6 +1458,13 @@ function App() {
   }, []);
 
   useEffect(() => {
+    setServiceSkillsRenderLimit((prev) => {
+      const target = Math.min(80, skillsCatalog.length || 80);
+      return prev === target ? prev : target;
+    });
+  }, [skillsCatalog.length]);
+
+  useEffect(() => {
     const payload = {
       quickMode,
       scenarioPreset,
@@ -554,10 +1485,129 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (step < 3 || consistencyGuardRanRef.current) return;
-    consistencyGuardRanRef.current = true;
-    void runSelfCheck();
-  }, [step]);
+    if (step === 4 && tuningSection === "chat") {
+      setTuningSection("agents");
+      return;
+    }
+    if (step === 4 && tuningSection === "agents") {
+      void refreshAgentsList();
+      return;
+    }
+    if (step === 3) {
+      void refreshAgentsList();
+    }
+  }, [step, tuningSection, customConfigPath]);
+
+  useEffect(() => {
+    if (step !== 4) return;
+    if (tuningSection !== "memory") return;
+    if (memoryStatus || memoryLoading) return;
+    void refreshMemoryCenterStatus();
+  }, [step, tuningSection, memoryStatus, memoryLoading, customConfigPath]);
+
+  useEffect(() => {
+    // 新策略：每次启动都是新会话，不恢复历史缓存，避免重启后回放旧消息。
+    try {
+      sessionStorage.removeItem("openclaw_chat_cache");
+    } catch {
+      // ignore storage error
+    }
+  }, []);
+
+  const selectedChatMessagesLength = selectedAgentId ? (messagesByAgent[selectedAgentId] || []).length : 0;
+  const selectedChatHistorySuppressed = selectedAgentId ? !!chatHistorySuppressedByAgent[selectedAgentId] : false;
+
+  useEffect(() => {
+    messagesByAgentRef.current = messagesByAgent;
+  }, [messagesByAgent]);
+
+  useEffect(() => {
+    chatRenderLimitByAgentRef.current = chatRenderLimitByAgent;
+  }, [chatRenderLimitByAgent]);
+
+  useEffect(() => {
+    chatHistorySuppressedRef.current = chatHistorySuppressedByAgent;
+  }, [chatHistorySuppressedByAgent]);
+
+  useEffect(() => {
+    if (step !== 3) return;
+    if (!selectedAgentId) return;
+    if (selectedChatHistorySuppressed) return;
+    if (selectedChatMessagesLength > 0) return;
+    void loadAgentHistory(selectedAgentId);
+  }, [step, selectedAgentId, selectedChatHistorySuppressed, selectedChatMessagesLength]);
+
+  useEffect(() => {
+    if (!selectedAgentId) return;
+    if (chatStickBottomByAgentRef.current[selectedAgentId] === undefined) {
+      chatStickBottomByAgentRef.current[selectedAgentId] = true;
+    }
+    setChatRenderLimitByAgent((prev) => {
+      if (prev[selectedAgentId]) return prev;
+      return { ...prev, [selectedAgentId]: CHAT_RENDER_BATCH };
+    });
+  }, [selectedAgentId]);
+
+  useEffect(() => {
+    if (step !== 3 || !selectedAgentId) return;
+    if (!chatStickBottomByAgentRef.current[selectedAgentId]) return;
+    const timer = window.requestAnimationFrame(() => {
+      const el = chatViewportRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(timer);
+  }, [step, selectedAgentId, messagesByAgent[selectedAgentId]?.length, chatRenderLimitByAgent[selectedAgentId]]);
+
+  useEffect(() => {
+    if (step !== 3) return;
+    if (!selectedAgentId) return;
+    if (selectedChatHistorySuppressed) return;
+    const timer = window.setInterval(() => {
+      if (document.hidden) return;
+      if (chatSending) return;
+      if (Date.now() - lastTypingAtRef.current < 1200) return;
+      // 用户正在上滑查看历史时，暂停轮询，避免滚动卡顿和视图抖动
+      if (!chatStickBottomByAgentRef.current[selectedAgentId]) return;
+      const run = () => {
+        void loadAgentHistoryDelta(selectedAgentId, { silent: true });
+      };
+      const maybeWindow = window as Window & {
+        requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      };
+      if (typeof maybeWindow.requestIdleCallback === "function") {
+        maybeWindow.requestIdleCallback(run, { timeout: 1200 });
+      } else {
+        window.setTimeout(run, 80);
+      }
+    }, 7000);
+    return () => window.clearInterval(timer);
+  }, [step, selectedAgentId, customConfigPath, chatSending, selectedChatHistorySuppressed]);
+
+  const markChatInteracting = useCallback((cooldownMs = 900) => {
+    setChatInteracting(true);
+    if (chatInteractTimerRef.current) {
+      window.clearTimeout(chatInteractTimerRef.current);
+    }
+    chatInteractTimerRef.current = window.setTimeout(() => {
+      setChatInteracting(false);
+      chatInteractTimerRef.current = null;
+    }, cooldownMs);
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (chatInteractTimerRef.current) {
+        window.clearTimeout(chatInteractTimerRef.current);
+      }
+    },
+    []
+  );
+
+  const handleChatTypingActivity = useCallback(() => {
+    lastTypingAtRef.current = Date.now();
+    markChatInteracting(1000);
+  }, [markChatInteracting]);
 
   const enqueueTask = (
     name: string,
@@ -675,6 +1725,11 @@ function App() {
   }, [customConfigPath]);
 
   useEffect(() => {
+    chatSessionModeRef.current = chatSessionMode;
+    localStorage.setItem("openclaw_chat_session_mode", chatSessionMode);
+  }, [chatSessionMode]);
+
+  useEffect(() => {
     if (configReloadTimerRef.current !== null) {
       window.clearTimeout(configReloadTimerRef.current);
       configReloadTimerRef.current = null;
@@ -719,11 +1774,11 @@ function App() {
   useEffect(() => {
     const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
     const installHint = customInstallPath.trim() || undefined;
-    if (step >= 1 && !loadedStepDataRef.current.install) {
+    if (step === 1 && !loadedStepDataRef.current.install) {
       loadedStepDataRef.current.install = true;
       void refreshLocalInfo(installHint, cfgPath);
     }
-    if (step >= 2 && !loadedStepDataRef.current.model) {
+    if (step === 2 && !loadedStepDataRef.current.model) {
       loadedStepDataRef.current.model = true;
       void Promise.all([
         loadSavedAiConfig(cfgPath),
@@ -731,14 +1786,14 @@ function App() {
         loadKeySyncStatus(cfgPath),
       ]);
     }
-    if (step >= 3 && !loadedStepDataRef.current.channel) {
+    if (step === 3 && !loadedStepDataRef.current.channel) {
       loadedStepDataRef.current.channel = true;
-      void Promise.all([loadSavedChannels(cfgPath), loadSnapshots()]);
+      void loadSavedChannels(cfgPath);
     }
-    if (step >= 4) {
+    if (step === 4 && tuningSection === "memory") {
       void refreshMemoryCenterStatus();
     }
-  }, [step]);
+  }, [step, tuningSection, customConfigPath, customInstallPath]);
 
   useEffect(() => {
     if (!installing) return;
@@ -766,6 +1821,48 @@ function App() {
     }, 120);
   };
 
+  const flushPluginLogs = () => {
+    if (pluginLogFlushTimerRef.current !== null) {
+      window.clearTimeout(pluginLogFlushTimerRef.current);
+      pluginLogFlushTimerRef.current = null;
+    }
+    if (!pluginLogBufferRef.current.length) return;
+    const chunk = pluginLogBufferRef.current.splice(0, pluginLogBufferRef.current.length);
+    setPluginInstallProgressLog((prev) => {
+      const merged = [...prev, ...chunk];
+      return merged.length > 100 ? merged.slice(-100) : merged;
+    });
+  };
+
+  const appendPluginLog = (line: string) => {
+    pluginLogBufferRef.current.push(line);
+    if (pluginLogFlushTimerRef.current !== null) return;
+    pluginLogFlushTimerRef.current = window.setTimeout(() => {
+      flushPluginLogs();
+    }, 120);
+  };
+
+  const flushSkillsLogs = () => {
+    if (skillsLogFlushTimerRef.current !== null) {
+      window.clearTimeout(skillsLogFlushTimerRef.current);
+      skillsLogFlushTimerRef.current = null;
+    }
+    if (!skillsLogBufferRef.current.length) return;
+    const chunk = skillsLogBufferRef.current.splice(0, skillsLogBufferRef.current.length);
+    setSkillsRepairProgressLog((prev) => {
+      const merged = [...prev, ...chunk];
+      return merged.length > 140 ? merged.slice(-140) : merged;
+    });
+  };
+
+  const appendSkillsLog = (line: string) => {
+    skillsLogBufferRef.current.push(line);
+    if (skillsLogFlushTimerRef.current !== null) return;
+    skillsLogFlushTimerRef.current = window.setTimeout(() => {
+      flushSkillsLogs();
+    }, 120);
+  };
+
   useEffect(() => {
     setModelTestResult(null);
     const ids = FIXED_SILICONFLOW_MODELS.map((m) => m.id);
@@ -788,6 +1885,12 @@ function App() {
     return () => {
       if (installLogFlushTimerRef.current !== null) {
         window.clearTimeout(installLogFlushTimerRef.current);
+      }
+      if (pluginLogFlushTimerRef.current !== null) {
+        window.clearTimeout(pluginLogFlushTimerRef.current);
+      }
+      if (skillsLogFlushTimerRef.current !== null) {
+        window.clearTimeout(skillsLogFlushTimerRef.current);
       }
       if (configReloadTimerRef.current !== null) {
         window.clearTimeout(configReloadTimerRef.current);
@@ -917,23 +2020,6 @@ function App() {
     }
   };
 
-  const [channelConfigStatus, setChannelConfigStatus] = useState<
-    Record<string, boolean>
-  >({});
-  const [channelClearing, setChannelClearing] = useState<string | null>(null);
-
-  const loadChannelConfigStatus = async (cfgPath?: string) => {
-    try {
-      const customPath = normalizeConfigPath(cfgPath || customConfigPath) || undefined;
-      const status = await invoke<Record<string, boolean>>("get_channel_config_status", {
-        customPath,
-      });
-      setChannelConfigStatus(status || {});
-    } catch {
-      setChannelConfigStatus({});
-    }
-  };
-
   const loadSavedChannels = async (cfgPath?: string) => {
     try {
       const customPath = normalizeConfigPath(cfgPath || customConfigPath) || undefined;
@@ -948,24 +2034,10 @@ function App() {
         botToken: tg?.botToken ?? "",
         chatId: tg?.chatId ?? "",
       });
-      setFeishuConfig({
-        appId: fs?.appId ?? "",
-        appSecret: fs?.appSecret ?? "",
-      });
-      setQqConfig({
-        appId: qq?.appId ?? "",
-        token: qq?.token ?? "",
-      });
-      setDiscordConfig({
-        token: dc?.token ?? dc?.botToken ?? "",
-        botToken: dc?.botToken ?? dc?.token ?? "",
-      });
-      const dtAcc = (dt as { accounts?: { main?: ChannelConfig } })?.accounts?.main ?? dt;
-      setDingtalkConfig({
-        appKey: dtAcc?.appKey ?? "",
-        appSecret: dtAcc?.appSecret ?? "",
-      });
-      await loadChannelConfigStatus(cfgPath || customConfigPath);
+      void fs;
+      void qq;
+      void dc;
+      void dt;
     } catch {
       // ignore load failures to keep manual input path usable
     }
@@ -1156,108 +2228,77 @@ function App() {
     }
   };
 
-  const handleSaveChannel = async (
-    channel: "telegram" | "feishu" | "qq" | "discord" | "dingtalk",
-    config: ChannelConfig
-  ) => {
-    setChannelSaving(channel);
-    setChannelResult(null);
-    try {
-      const result = await invoke<string>("save_channel_config", {
+  const fetchPairingRequests = useCallback(
+    async (channel: PairingChannel): Promise<PairingRequestItem[]> => {
+      const jsonResp = await invoke<PairingListResponse>("list_pairings_json", {
         channel,
-        config,
         customPath: normalizeConfigPath(customConfigPath) || undefined,
       });
-      setChannelResult(result);
-      await loadSavedChannels();
-    } catch (e) {
-      setChannelResult(`保存失败: ${e}`);
-    } finally {
-      setChannelSaving(null);
-      if (step === 3) {
-        void refreshAllChannelHealth();
-      }
-    }
-  };
+      const requests = Array.isArray(jsonResp?.requests) ? jsonResp.requests : [];
+      setPairingRequestsByChannel((prev) => ({ ...prev, [channel]: requests }));
+      return requests;
+    },
+    [customConfigPath],
+  );
 
-  const handleTestChannel = async (
-    channel: "telegram" | "feishu" | "qq" | "discord" | "dingtalk",
-    config: ChannelConfig
-  ) => {
-    setChannelTesting(channel);
-    setChannelResult(null);
-    try {
-      const result = await invoke<string>("test_channel_connection", {
-        channel,
-        config,
-      });
-      setChannelResult(result);
-    } catch (e) {
-      setChannelResult(`测试失败: ${e}`);
-    } finally {
-      setChannelTesting(null);
-      if (step === 3) {
-        void refreshAllChannelHealth();
-      }
-    }
-  };
+  const refreshAllPairingRequests = useCallback(
+    async (channels?: PairingChannel[]) => {
+      const targets = channels ?? (["telegram", "feishu", "qq"] as PairingChannel[]);
+      await Promise.all(
+        targets.map(async (channel) => {
+          try {
+            await fetchPairingRequests(channel);
+          } catch {
+            // 静默轮询，不打断用户当前操作
+          }
+        }),
+      );
+    },
+    [fetchPairingRequests],
+  );
 
   const handleListPairings = async (channel: "telegram" | "feishu" | "qq") => {
     setPairingLoading(channel);
     setChannelResult(null);
     try {
+      const requests = await fetchPairingRequests(channel);
       const result = await invoke<string>("list_pairings", {
         channel,
         customPath: normalizeConfigPath(customConfigPath) || undefined,
       });
-      setChannelResult(result || "当前没有待审批配对请求。");
+      setChannelResult(result || (requests.length === 0 ? "当前没有待审批配对请求。" : `已找到 ${requests.length} 条待审批配对请求。`));
     } catch (e) {
+      setPairingRequestsByChannel((prev) => ({ ...prev, [channel]: [] }));
       setChannelResult(`查询配对失败: ${e}`);
     } finally {
       setPairingLoading(null);
     }
   };
 
-  const handleApprovePairing = async (channel: "telegram" | "feishu" | "qq") => {
-    setPairingLoading(channel);
-    setChannelResult(null);
-    try {
-      const result = await invoke<string>("approve_pairing", {
-        channel,
-        code: telegramPairingCode.trim(),
-        customPath: normalizeConfigPath(customConfigPath) || undefined,
-      });
-      setChannelResult(result);
-      setTelegramPairingCode("");
-    } catch (e) {
-      setChannelResult(`配对失败: ${e}`);
-    } finally {
-      setPairingLoading(null);
-    }
-  };
-
-  const handleClearChannel = async (channel: "telegram" | "feishu" | "qq" | "discord" | "dingtalk") => {
-    setChannelClearing(channel);
-    setChannelResult(null);
-    try {
-      const result = await invoke<string>("remove_channel_config", {
-        channel,
-        customPath: normalizeConfigPath(customConfigPath) || undefined,
-      });
-      setChannelResult(result);
-      await loadSavedChannels();
-      if (channel === "telegram") setTelegramConfig({ botToken: "", chatId: "" });
-      if (channel === "feishu") setFeishuConfig({ appId: "", appSecret: "" });
-      if (channel === "qq") setQqConfig({ appId: "", token: "" });
-      if (channel === "discord") setDiscordConfig({ token: "", botToken: "" });
-      if (channel === "dingtalk") setDingtalkConfig({ appKey: "", appSecret: "" });
-    } catch (e) {
-      setChannelResult(`清除失败: ${e}`);
-    } finally {
-      setChannelClearing(null);
-      if (step === 3) void refreshAllChannelHealth();
-    }
-  };
+  const handleApprovePairing = useCallback(
+    async (channel: "telegram" | "feishu" | "qq", codeOverride?: string) => {
+      setPairingLoading(channel);
+      setChannelResult(null);
+      try {
+        const code = (codeOverride ?? pairingCodeByChannel[channel]).trim();
+        const result = await invoke<string>("approve_pairing", {
+          channel,
+          code,
+          customPath: normalizeConfigPath(customConfigPath) || undefined,
+        });
+        setChannelResult(result);
+        setPairingCodeByChannel((prev) => ({ ...prev, [channel]: "" }));
+        try {
+          await fetchPairingRequests(channel);
+        } catch {}
+      } catch (e) {
+        setChannelResult(`配对失败: ${e}`);
+      } finally {
+        setPairingLoading(null);
+      }
+    },
+    [customConfigPath, fetchPairingRequests, pairingCodeByChannel],
+  );
 
   const getGatewayHealthState = async (): Promise<HealthState> => {
     const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
@@ -1312,135 +2353,42 @@ function App() {
       detail = "无法获取配对状态";
     }
 
-    setTelegramHealth({
+    const next: ChannelHealthInfo = {
       configured: hasToken ? "ok" : "error",
       token: tokenState,
       gateway: gatewayState,
       pairing: pairingState,
       detail,
-    });
+    };
+    setTelegramHealth((prev) => (isSameChannelHealthInfo(prev, next) ? prev : next));
   };
 
-  const refreshFeishuHealth = async (gatewayStateHint?: HealthState) => {
-    const hasCred = !!feishuConfig.appId?.trim() && !!feishuConfig.appSecret?.trim();
-    let tokenState: HealthState = hasCred ? "warn" : "error";
-    let detail = "飞书通常不需要配对码，保存凭证后可直接对话。";
-    if (hasCred) {
-      try {
-        await invoke<string>("test_channel_connection", {
-          channel: "feishu",
-          config: feishuConfig,
-        });
-        tokenState = "ok";
-      } catch (e) {
-        tokenState = "error";
-        detail = `飞书检测：${String(e)}`;
-      }
-    }
-    const gatewayState = gatewayStateHint ?? (await getGatewayHealthState());
-    setFeishuHealth({
-      configured: hasCred ? "ok" : "error",
-      token: tokenState,
-      gateway: gatewayState,
-      pairing: "ok",
-      detail,
-    });
-  };
-
-  const refreshQqHealth = async (gatewayStateHint?: HealthState) => {
-    const hasCred = !!qqConfig.appId?.trim() && !!qqConfig.token?.trim();
-    let tokenState: HealthState = hasCred ? "warn" : "error";
-    let detail = "QQ 通常不需要配对码，保存凭证后可直接对话。";
-    if (hasCred) {
-      try {
-        await invoke<string>("test_channel_connection", {
-          channel: "qq",
-          config: qqConfig,
-        });
-        tokenState = "ok";
-      } catch (e) {
-        tokenState = "error";
-        detail = `QQ 检测：${String(e)}`;
-      }
-    }
-    const gatewayState = gatewayStateHint ?? (await getGatewayHealthState());
-    setQqHealth({
-      configured: hasCred ? "ok" : "error",
-      token: tokenState,
-      gateway: gatewayState,
-      pairing: "ok",
-      detail,
-    });
-  };
-
-  const refreshDiscordHealth = async (gatewayStateHint?: HealthState) => {
-    const hasCred = !!(discordConfig.token?.trim() || discordConfig.botToken?.trim());
-    let tokenState: HealthState = hasCred ? "warn" : "error";
-    let detail = "Discord 需 Bot Token，保存后需 Gateway 运行。";
-    if (hasCred) {
-      try {
-        const cfg = { token: discordConfig.token || discordConfig.botToken, botToken: discordConfig.botToken || discordConfig.token };
-        await invoke<string>("test_channel_connection", { channel: "discord", config: cfg });
-        tokenState = "ok";
-      } catch (e) {
-        tokenState = "error";
-        detail = `Discord 检测：${String(e)}`;
-      }
-    }
-    const gatewayState = gatewayStateHint ?? (await getGatewayHealthState());
-    setDiscordHealth({
-      configured: hasCred ? "ok" : "error",
-      token: tokenState,
-      gateway: gatewayState,
-      pairing: "ok",
-      detail,
-    });
-  };
-
-  const refreshDingtalkHealth = async (gatewayStateHint?: HealthState) => {
-    const hasCred = !!dingtalkConfig.appKey?.trim() && !!dingtalkConfig.appSecret?.trim();
-    let tokenState: HealthState = hasCred ? "warn" : "error";
-    let detail = "钉钉需 AppKey + AppSecret，保存后需 Gateway 运行。";
-    if (hasCred) {
-      try {
-        await invoke<string>("test_channel_connection", { channel: "dingtalk", config: dingtalkConfig });
-        tokenState = "ok";
-      } catch (e) {
-        tokenState = "error";
-        detail = `钉钉检测：${String(e)}`;
-      }
-    }
-    const gatewayState = gatewayStateHint ?? (await getGatewayHealthState());
-    setDingtalkHealth({
-      configured: hasCred ? "ok" : "error",
-      token: tokenState,
-      gateway: gatewayState,
-      pairing: "ok",
-      detail,
-    });
-  };
-
-  const refreshAllChannelHealth = async () => {
-    if (starting) return;
+  const refreshAllChannelHealth = async (force = false) => {
+    if (starting || chatSending || chatInteracting) return;
+    if (!force && (!servicePanelMounted || !servicePanelExpanded)) return;
     const gatewayState = await getGatewayHealthState();
     await Promise.all([
       refreshTelegramHealth(gatewayState),
-      refreshFeishuHealth(gatewayState),
-      refreshQqHealth(gatewayState),
-      refreshDiscordHealth(gatewayState),
-      refreshDingtalkHealth(gatewayState),
     ]);
   };
 
   useEffect(() => {
-    if (step !== 3 || starting || !autoRefreshHealth) return;
+    if (step !== 3 || starting || chatInteracting || !autoRefreshHealth || !servicePanelMounted || !servicePanelExpanded) return;
     void refreshAllChannelHealth();
+    void refreshAllPairingRequests();
     const timer = window.setInterval(() => {
       if (document.hidden) return;
       void refreshAllChannelHealth();
+      void refreshAllPairingRequests();
     }, 60000);
     return () => window.clearInterval(timer);
-  }, [step, customConfigPath, starting, autoRefreshHealth]);
+  }, [step, customConfigPath, starting, autoRefreshHealth, chatSending, chatInteracting, servicePanelMounted, servicePanelExpanded, refreshAllPairingRequests]);
+
+  useEffect(() => {
+    if (step !== 3 || !servicePanelMounted || !servicePanelExpanded) return;
+    void refreshAllChannelHealth(true);
+    void refreshAllPairingRequests();
+  }, [step, servicePanelMounted, servicePanelExpanded, refreshAllPairingRequests]);
 
   const handleFix = async (type: "node" | "npm" | "git" | "openclaw") => {
     setFixing(type);
@@ -1480,12 +2428,7 @@ function App() {
         installHint,
       });
       setStartResult(stripAnsi(result));
-      try {
-        const url = await invoke<string>("get_gateway_dashboard_url", { customPath: cfgPath });
-        await invoke<string>("open_external_url", { url });
-      } catch {
-        // ignore browser open errors; keep startup success
-      }
+      setStep(3);
       window.alert(DEPLOY_SUCCESS_DIALOG);
     } catch (e) {
       setStartResult(stripAnsi(`启动失败: ${e}`));
@@ -1497,13 +2440,14 @@ function App() {
     }
   };
 
-  const handleOpenDashboard = async () => {
-    const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+  const handleOpenBrowserChat = async () => {
     try {
-      const url = await invoke<string>("get_gateway_dashboard_url", { customPath: cfgPath });
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const gatewayId = selectedAgentId ? getPreferredGatewayIdForAgent(selectedAgentId) : undefined;
+      const url = await invoke<string>("get_gateway_dashboard_url", { customPath: cfgPath, gatewayId });
       await invoke<string>("open_external_url", { url });
     } catch (e) {
-      setStartResult(`打开失败: ${e}`);
+      setStartResult(`打开浏览器对话失败: ${e}`);
     }
   };
 
@@ -1518,118 +2462,12 @@ function App() {
         installHint,
       });
       setStartResult(stripAnsi(result));
-      try {
-        const url = await invoke<string>("get_gateway_dashboard_url", { customPath: cfgPath });
-        await invoke<string>("open_external_url", { url });
-      } catch {
-        // ignore open errors
-      }
+      setStep(3);
     } catch (e) {
       setStartResult(stripAnsi(`重置认证失败: ${e}`));
     } finally {
       setStarting(false);
     }
-  };
-
-  const handleStartForeground = async () => {
-    const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
-    const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
-    try {
-      const result = await invoke<string>("start_gateway_foreground", {
-        customPath: cfgPath,
-        installHint,
-      });
-      setStartResult(stripAnsi(result));
-      try {
-        const url = await invoke<string>("get_gateway_dashboard_url", { customPath: cfgPath });
-        await invoke<string>("open_external_url", { url });
-      } catch {
-        // ignore browser open errors; foreground window already started
-      }
-      window.alert(DEPLOY_SUCCESS_DIALOG);
-    } catch (e) {
-      setStartResult(stripAnsi(`前台启动失败: ${e}`));
-    }
-  };
-
-  const handleOpenSkillsOnboard = async () => {
-    if (onboardCliLoading) return;
-    setOnboardCliLoading(true);
-    setStartResult(null);
-    const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
-    try {
-      const result = await invoke<string>("run_onboard_cli", {
-        customPath: normalizeConfigPath(customConfigPath) || undefined,
-        installHint,
-      });
-      setStartResult(stripAnsi(`${result}\n提示：在打开的终端里选择安装 Skills，即可一键补齐能力。`));
-    } catch (e) {
-      setStartResult(stripAnsi(`打开 Skills 安装向导失败: ${e}`));
-    } finally {
-      setOnboardCliLoading(false);
-    }
-  };
-
-  const runSelfCheck = async () => {
-    enqueueTask("自检总控", async () => {
-      if (selfCheckLoading) return;
-      setSelfCheckLoading(true);
-      setSelfCheckResult(null);
-      try {
-        const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
-        const items = await invoke<SelfCheckItem[]>("run_self_check", {
-          customPath: normalizeConfigPath(customConfigPath) || undefined,
-          installHint,
-        });
-        setSelfCheckItems(items || []);
-        setSelfCheckResult("自检完成");
-      } catch (e) {
-        setSelfCheckResult(`自检失败: ${e}`);
-        setTicketSummary(makeTicketSummary("自检总控", e, "run_self_check"));
-        throw e;
-      } finally {
-        setSelfCheckLoading(false);
-      }
-    });
-  };
-
-  const handleFixSelfCheck = async (key: string) => {
-    if (selfCheckFixingKey) return;
-    setSelfCheckFixingKey(key);
-    setSelfCheckResult(null);
-    try {
-      const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
-      const result = await invoke<string>("fix_self_check_item", {
-        key,
-        customPath: normalizeConfigPath(customConfigPath) || undefined,
-        installHint,
-      });
-      setSelfCheckResult(result);
-      await runSelfCheck();
-    } catch (e) {
-      setSelfCheckResult(`修复失败: ${e}`);
-    } finally {
-      setSelfCheckFixingKey(null);
-    }
-  };
-
-  const handleMinimalRepair = async () => {
-    enqueueTask("一键最小修复", async () => {
-      setSelfCheckResult(null);
-      try {
-        const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
-        const result = await invoke<string>("run_minimal_repair", {
-          customPath: normalizeConfigPath(customConfigPath) || undefined,
-          installHint,
-        });
-        setSelfCheckResult(clampLogText(`最小修复完成\n${result}`));
-        await runSelfCheck();
-      } catch (e) {
-        setSelfCheckResult(`最小修复失败: ${e}`);
-        setTicketSummary(makeTicketSummary("一键最小修复", e, "run_minimal_repair"));
-        throw e;
-      }
-    });
   };
 
   const handleAutoInstallPlugins = async () => {
@@ -1639,15 +2477,16 @@ function App() {
       setPluginInstallResult(null);
       setPluginInstallProgress(null);
       setPluginInstallProgressLog([]);
+      pluginLogBufferRef.current = [];
+      if (pluginLogFlushTimerRef.current !== null) {
+        window.clearTimeout(pluginLogFlushTimerRef.current);
+        pluginLogFlushTimerRef.current = null;
+      }
       const unlisten = await listen<PluginInstallProgressEvent>("plugin-install-progress", (e) => {
         const payload = e.payload;
         if (!payload) return;
         setPluginInstallProgress(payload);
-        setPluginInstallProgressLog((prev) => {
-          const line = `[${payload.current}/${payload.total}] ${payload.channel}: ${payload.message}`;
-          const next = [...prev, line];
-          return next.length > 80 ? next.slice(-80) : next;
-        });
+        appendPluginLog(`[${payload.current}/${payload.total}] ${payload.channel}: ${payload.message}`);
       });
       try {
         const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
@@ -1663,6 +2502,7 @@ function App() {
         setTicketSummary(makeTicketSummary("渠道插件自动安装", e, "auto_install_channel_plugins"));
         throw e;
       } finally {
+        flushPluginLogs();
         unlisten();
         setPluginInstallLoading(false);
       }
@@ -1688,8 +2528,8 @@ function App() {
     }
   };
 
-  const loadSkillsCatalog = async () => {
-    if (skillsCatalogLoading) return;
+  const loadSkillsCatalog = async (): Promise<SkillCatalogItem[]> => {
+    if (skillsCatalogLoading) return skillsCatalog;
     setSkillsCatalogLoading(true);
     setSkillsResult(null);
     try {
@@ -1706,12 +2546,224 @@ function App() {
         }
         return next;
       });
+      return list || [];
     } catch (e) {
       setSkillsResult(`加载 Skills 列表失败: ${e}`);
+      return [];
     } finally {
       setSkillsCatalogLoading(false);
     }
   };
+
+  const persistAgentSkillBinding = useCallback(
+    async (agentId: string, mode: "inherit" | "custom", enabledSkills: string[], message: string) => {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const resp = await invoke<AgentRuntimeSettingsPayload>("save_agent_skill_binding", {
+        agentId,
+        mode,
+        enabledSkills,
+        customPath: cfgPath,
+      });
+      setAgentRuntimeSettings(resp);
+      setSkillsResult(message);
+    },
+    [customConfigPath]
+  );
+
+  const handleSaveSkillsScope = useCallback(
+    async (nextScope: "shared" | "agent_override") => {
+      if (skillsScopeSaving) return;
+      setSkillsScopeSaving(true);
+      setSkillsResult(null);
+      try {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        const resp = await invoke<AgentRuntimeSettingsPayload>("save_skills_scope", {
+          skillsScope: nextScope,
+          customPath: cfgPath,
+        });
+        setAgentRuntimeSettings(resp);
+        setSkillsResult(nextScope === "shared" ? "已切换为共享 Skills 模式" : "已切换为 Agent 覆盖模式");
+      } catch (e) {
+        setSkillsResult(`切换 Skills 作用域失败: ${e}`);
+      } finally {
+        setSkillsScopeSaving(false);
+      }
+    },
+    [customConfigPath, skillsScopeSaving]
+  );
+
+  const handleRestoreAgentSkillInheritance = useCallback(async () => {
+    if (!effectiveSkillsAgentId) return;
+    setSkillsScopeSaving(true);
+    try {
+      await persistAgentSkillBinding(effectiveSkillsAgentId, "inherit", [], `已恢复 ${effectiveSkillsAgentId} 的共享继承`);
+    } catch (e) {
+      setSkillsResult(`恢复共享继承失败: ${e}`);
+    } finally {
+      setSkillsScopeSaving(false);
+    }
+  }, [effectiveSkillsAgentId, persistAgentSkillBinding]);
+
+  const handleMakeAgentSkillCustom = useCallback(async () => {
+    if (!effectiveSkillsAgentId) return;
+    setSkillsScopeSaving(true);
+    try {
+      await persistAgentSkillBinding(
+        effectiveSkillsAgentId,
+        "custom",
+        skillsCatalog.map((skill) => skill.name),
+        `已为 ${effectiveSkillsAgentId} 创建独立 Skills 清单`
+      );
+    } catch (e) {
+      setSkillsResult(`创建独立 Skills 清单失败: ${e}`);
+    } finally {
+      setSkillsScopeSaving(false);
+    }
+  }, [effectiveSkillsAgentId, persistAgentSkillBinding, skillsCatalog]);
+
+  const handleToggleSkillForAgent = useCallback(
+    async (skillName: string, enabled: boolean) => {
+      if (!effectiveSkillsAgentId) return;
+      if (currentSkillsScope !== "agent_override") {
+        setSkillsResult("请先切到“Agent 覆盖”模式，再单独启用/禁用 Skills");
+        return;
+      }
+      setSkillsScopeSaving(true);
+      try {
+        const baseSet =
+          currentAgentSkillBinding?.mode === "custom"
+            ? new Set(currentAgentSkillBinding.enabled_skills || [])
+            : new Set(skillsCatalog.map((skill) => skill.name));
+        if (enabled) baseSet.add(skillName);
+        else baseSet.delete(skillName);
+        await persistAgentSkillBinding(
+          effectiveSkillsAgentId,
+          "custom",
+          Array.from(baseSet),
+          `${effectiveSkillsAgentId} 已${enabled ? "启用" : "禁用"} ${skillName}`
+        );
+      } catch (e) {
+        setSkillsResult(`更新 Agent Skills 清单失败: ${e}`);
+      } finally {
+        setSkillsScopeSaving(false);
+      }
+    },
+    [currentAgentSkillBinding, currentSkillsScope, effectiveSkillsAgentId, persistAgentSkillBinding, skillsCatalog]
+  );
+
+  const handleSearchMarketSkills = useCallback(async () => {
+    if (marketLoading) return;
+    const query = marketQuery.trim();
+    if (!query) {
+      setMarketResult("请先输入要搜索的 skill 关键词");
+      return;
+    }
+    setMarketLoading(true);
+    setMarketResult(null);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const list = await invoke<SkillCatalogItem[]>("search_market_skills", {
+        query,
+        customPath: cfgPath,
+        limit: 12,
+      });
+      setMarketResults(list || []);
+      setMarketResult(`已找到 ${(list || []).length} 条第三方 Skills 结果`);
+    } catch (e) {
+      setMarketResult(`搜索第三方 Skills 失败: ${e}`);
+      setMarketResults([]);
+    } finally {
+      setMarketLoading(false);
+    }
+  }, [customConfigPath, marketLoading, marketQuery]);
+
+  const handleInstallMarketSkill = useCallback(
+    async (skill: SkillCatalogItem, enableForCurrentAgent = false) => {
+      const key = `${skill.source_type || "remote"}:${skill.package_name || skill.name}`;
+      if (marketInstallKey) return;
+      setMarketInstallKey(key);
+      setMarketResult(`正在安装 ${skill.name} 到共享 Skills 层...`);
+      try {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        const result = await invoke<string>("install_market_skill", {
+          sourceType: skill.source_type || "github",
+          packageName: skill.package_name || skill.name,
+          repoUrl: skill.repo_url || undefined,
+          version: skill.version || undefined,
+          customPath: cfgPath,
+        });
+        await loadSkillsCatalog();
+        if (enableForCurrentAgent && effectiveSkillsAgentId) {
+          const baseSet =
+            currentAgentSkillBinding?.mode === "custom"
+              ? new Set(currentAgentSkillBinding.enabled_skills || [])
+              : new Set(skillsCatalog.map((item) => item.name));
+          baseSet.add(skill.package_name || skill.name);
+          await persistAgentSkillBinding(
+            effectiveSkillsAgentId,
+            "custom",
+            Array.from(baseSet),
+            `${result}\n\n并已加入 ${effectiveSkillsAgentId} 的独立 Skills 清单`
+          );
+          setMarketResult(`${result}\n\n并已加入 ${effectiveSkillsAgentId} 的独立 Skills 清单`);
+        } else {
+          setMarketResult(result);
+        }
+      } catch (e) {
+        setMarketResult(`安装第三方 Skill 失败: ${e}`);
+      } finally {
+        setMarketInstallKey(null);
+      }
+    },
+    [customConfigPath, currentAgentSkillBinding, effectiveSkillsAgentId, loadSkillsCatalog, marketInstallKey, persistAgentSkillBinding, skillsCatalog]
+  );
+
+  const handlePickLocalSkillFolder = useCallback(async () => {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "选择本地 Skill 目录",
+    });
+    if (typeof selected === "string") {
+      setLocalSkillPath(selected);
+    }
+  }, []);
+
+  const handlePickLocalSkillZip = useCallback(async () => {
+    const selected = await open({
+      directory: false,
+      multiple: false,
+      title: "选择 Skill ZIP 压缩包",
+      filters: [{ name: "ZIP", extensions: ["zip"] }],
+    });
+    if (typeof selected === "string") {
+      setLocalSkillPath(selected);
+    }
+  }, []);
+
+  const handleInstallLocalSkill = useCallback(async () => {
+    if (localSkillInstalling) return;
+    const path = localSkillPath.trim();
+    if (!path) {
+      setMarketResult("请先选择或粘贴本地 Skill 目录 / ZIP 路径");
+      return;
+    }
+    setLocalSkillInstalling(true);
+    setMarketResult("正在导入本地 Skill 到共享层...");
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const result = await invoke<string>("install_local_skill", {
+        localPath: path,
+        customPath: cfgPath,
+      });
+      await loadSkillsCatalog();
+      setMarketResult(result);
+    } catch (e) {
+      setMarketResult(`导入本地 Skill 失败: ${e}`);
+    } finally {
+      setLocalSkillInstalling(false);
+    }
+  }, [customConfigPath, loadSkillsCatalog, localSkillInstalling, localSkillPath]);
 
   const handleInstallSelectedSkills = async () => {
     enqueueTask("安装选中Skills", async () => {
@@ -1726,15 +2778,16 @@ function App() {
       setSkillsResult("安装任务已开始，请稍候...");
       setSkillsRepairProgress(null);
       setSkillsRepairProgressLog([]);
+      skillsLogBufferRef.current = [];
+      if (skillsLogFlushTimerRef.current !== null) {
+        window.clearTimeout(skillsLogFlushTimerRef.current);
+        skillsLogFlushTimerRef.current = null;
+      }
       const unlisten = await listen<SkillsRepairProgressEvent>("skills-repair-progress", (e) => {
         const payload = e.payload;
         if (!payload) return;
         setSkillsRepairProgress(payload);
-        setSkillsRepairProgressLog((prev) => {
-          const line = `[${payload.current}/${payload.total}] ${payload.skill}: ${payload.message}`;
-          const next = [...prev, line];
-          return next.length > 120 ? next.slice(-120) : next;
-        });
+        appendSkillsLog(`[${payload.current}/${payload.total}] ${payload.skill}: ${payload.message}`);
       });
       try {
         const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
@@ -1745,12 +2798,22 @@ function App() {
         });
         const text = clampLogText(result || "").trim();
         setSkillsResult(text || "安装任务已完成（无详细日志返回）");
-        await loadSkillsCatalog();
+        const refreshed = await loadSkillsCatalog();
+        setSkillRepairStateByName((prev) => {
+          const next = { ...prev };
+          for (const name of selected) {
+            const hit = refreshed.find((item) => item.name === name);
+            if (!hit) continue;
+            next[name] = hit.eligible ? "fixed" : hasManualSkillGaps(hit) ? "manual" : "still_missing";
+          }
+          return next;
+        });
       } catch (e) {
         setSkillsResult(`安装失败: ${e}`);
         setTicketSummary(makeTicketSummary("安装选中Skills", e, "install_selected_skills"));
         throw e;
       } finally {
+        flushSkillsLogs();
         unlisten();
         setSkillsRepairLoading(false);
         setSkillsAction(null);
@@ -1771,15 +2834,16 @@ function App() {
       setSkillsResult("修复任务已开始，请稍候...");
       setSkillsRepairProgress(null);
       setSkillsRepairProgressLog([]);
+      skillsLogBufferRef.current = [];
+      if (skillsLogFlushTimerRef.current !== null) {
+        window.clearTimeout(skillsLogFlushTimerRef.current);
+        skillsLogFlushTimerRef.current = null;
+      }
       const unlisten = await listen<SkillsRepairProgressEvent>("skills-repair-progress", (e) => {
         const payload = e.payload;
         if (!payload) return;
         setSkillsRepairProgress(payload);
-        setSkillsRepairProgressLog((prev) => {
-          const line = `[${payload.current}/${payload.total}] ${payload.skill}: ${payload.message}`;
-          const next = [...prev, line];
-          return next.length > 120 ? next.slice(-120) : next;
-        });
+        appendSkillsLog(`[${payload.current}/${payload.total}] ${payload.skill}: ${payload.message}`);
       });
       try {
         const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
@@ -1790,72 +2854,27 @@ function App() {
         });
         const text = clampLogText(result || "").trim();
         setSkillsResult(text || "修复任务已完成（无详细日志返回）");
-        await loadSkillsCatalog();
+        const refreshed = await loadSkillsCatalog();
+        setSkillRepairStateByName((prev) => {
+          const next = { ...prev };
+          for (const name of selected) {
+            const hit = refreshed.find((item) => item.name === name);
+            if (!hit) continue;
+            next[name] = hit.eligible ? "fixed" : hasManualSkillGaps(hit) ? "manual" : "still_missing";
+          }
+          return next;
+        });
       } catch (e) {
         setSkillsResult(`修复失败: ${e}`);
         setTicketSummary(makeTicketSummary("修复选中Skills", e, "repair_selected_skills"));
         throw e;
       } finally {
+        flushSkillsLogs();
         unlisten();
         setSkillsRepairLoading(false);
         setSkillsAction(null);
       }
     });
-  };
-
-  const handleExportDiagnosticBundle = async () => {
-    enqueueTask("导出诊断包", async () => {
-      if (diagnosticLoading) return;
-      setDiagnosticLoading(true);
-      setDiagnosticResult(null);
-      try {
-        const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
-        const result = await invoke<string>("export_diagnostic_bundle", {
-          customPath: normalizeConfigPath(customConfigPath) || undefined,
-          installHint,
-        });
-        setDiagnosticResult(`诊断包已导出: ${result}`);
-      } catch (e) {
-        setDiagnosticResult(`导出诊断包失败: ${e}`);
-        setTicketSummary(makeTicketSummary("导出诊断包", e, "export_diagnostic_bundle"));
-        throw e;
-      } finally {
-        setDiagnosticLoading(false);
-      }
-    });
-  };
-
-  const loadSnapshots = async () => {
-    if (snapshotsLoading) return;
-    setSnapshotsLoading(true);
-    try {
-      const list = await invoke<string[]>("list_config_snapshots", {
-        customPath: normalizeConfigPath(customConfigPath) || undefined,
-      });
-      setSnapshots(list || []);
-    } catch {
-      setSnapshots([]);
-    } finally {
-      setSnapshotsLoading(false);
-    }
-  };
-
-  const handleRollbackSnapshot = async (snapshotDir: string) => {
-    if (rollingBackSnapshot) return;
-    setRollingBackSnapshot(snapshotDir);
-    setDiagnosticResult(null);
-    try {
-      const result = await invoke<string>("rollback_config_snapshot", {
-        snapshotDir,
-        customPath: normalizeConfigPath(customConfigPath) || undefined,
-      });
-      setDiagnosticResult(result);
-      await Promise.all([loadSavedAiConfig(), loadSavedChannels(), loadSnapshots(), runSelfCheck()]);
-    } catch (e) {
-      setDiagnosticResult(`回滚失败: ${e}`);
-    } finally {
-      setRollingBackSnapshot(null);
-    }
   };
 
   const applyQuickModePreset = (mode: QuickMode) => {
@@ -1910,6 +2929,1726 @@ function App() {
     }
     setSkillsResult("已应用场景模板（行为偏好已更新）。");
   };
+
+  const refreshAgentsList = async () => {
+    setAgentsLoading(true);
+    setAgentsError(null);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const resp = await invoke<AgentsListPayload>("read_agents_list", {
+        customPath: cfgPath,
+      });
+      setAgentsList(resp);
+      for (const a of resp.agents || []) {
+        chatSessionNameByAgentRef.current[a.id] =
+          chatSessionModeRef.current === "synced" ? DEFAULT_SYNC_SESSION_NAME : DEFAULT_ISOLATED_SESSION_NAME;
+      }
+      const def = resp.agents.find((a) => a.default)?.id || resp.agents[0]?.id || "";
+      setSelectedAgentId((prev) => prev || def);
+      setUnreadByAgent((prev) => {
+        const next = { ...prev };
+        for (const a of resp.agents) {
+          if (typeof next[a.id] !== "number") next[a.id] = 0;
+        }
+        return next;
+      });
+    } catch (e) {
+      setAgentsError(String(e));
+      setAgentsList(null);
+    } finally {
+      setAgentsLoading(false);
+    }
+  };
+
+  const parseProviderAndModelFromPrimary = useCallback((primary?: string): { provider: string; model: string } => {
+    const raw = (primary || "").trim();
+    if (!raw) return { provider: "openai", model: RECOMMENDED_MODEL_FALLBACK };
+    const [prefix, ...rest] = raw.split("/");
+    if (rest.length === 0) {
+      return { provider: "openai", model: raw };
+    }
+    const providerGuess = prefix === "anthropic" ? "anthropic" : "openai";
+    return { provider: providerGuess, model: rest.join("/") };
+  }, []);
+
+  const summarizeGatewayHealthDetail = useCallback((detail?: string | null) => {
+    const raw = String(detail || "").replace(/\s+/g, " ").trim();
+    if (!raw) return "未探活";
+    if (raw.includes("Service: Scheduled Task")) return "运行中";
+    if (raw.includes("running") || raw.includes("listening on")) return "运行中";
+    if (raw.includes("loopback-only")) return "仅本机可访问";
+    return raw.length > 72 ? `${raw.slice(0, 72)}...` : raw;
+  }, []);
+
+  const formatOrderedChannelBindings = useCallback((binding?: Record<string, string>, fallback?: { channel?: string; instance_id?: string }) => {
+    const order = ["telegram", "qq", "feishu", "discord", "dingtalk"];
+    const entries = Object.entries(binding || {}).filter(([, iid]) => String(iid || "").trim());
+    if (entries.length === 0) {
+      const ch = String(fallback?.channel || "").trim();
+      const iid = String(fallback?.instance_id || "").trim();
+      return ch && iid ? `${ch}: ${iid}` : "-";
+    }
+    return entries
+      .sort((a, b) => {
+        const ai = order.indexOf(a[0]);
+        const bi = order.indexOf(b[0]);
+        const av = ai >= 0 ? ai : 999;
+        const bv = bi >= 0 ? bi : 999;
+        return av - bv || a[0].localeCompare(b[0]);
+      })
+      .map(([ch, iid]) => `${ch}: ${iid}`)
+      .join(" | ");
+  }, []);
+
+  const refreshAgentRuntimeSettings = useCallback(async (agentsForFallback?: AgentListItem[]) => {
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const resp = await invoke<AgentRuntimeSettingsPayload>("read_agent_runtime_settings", {
+        customPath: cfgPath,
+      });
+      setAgentRuntimeSettings(resp);
+      setChannelRoutesDraft(resp.channel_routes || []);
+      setGatewayBindingsDraft(resp.gateways || []);
+      setTelegramInstancesDraft(resp.telegram_instances || []);
+      setChannelInstancesDraft(resp.channel_instances || []);
+      setActiveChannelInstanceByChannel(resp.active_channel_instances || {});
+      setTelegramUsernameByInstanceId((prev) => {
+        const next: Record<string, string> = {};
+        for (const it of resp.telegram_instances || []) {
+          if (prev[it.id]) next[it.id] = prev[it.id];
+        }
+        return next;
+      });
+      setActiveTelegramInstanceId(resp.active_telegram_instance || resp.telegram_instances?.[0]?.id || "");
+      setGatewaySelectedIdForRouteTest((prev) => {
+        if (prev && (resp.gateways || []).some((g) => g.gateway_id === prev)) return prev;
+        return (resp.gateways || [])[0]?.gateway_id || "";
+      });
+      const profiles = new Map((resp.profiles || []).map((p) => [p.agent_id, p]));
+      const drafts: Record<string, { provider: string; model: string }> = {};
+      const sourceAgents = agentsForFallback || agentsList?.agents || [];
+      for (const a of sourceAgents) {
+        const p = profiles.get(a.id);
+        if (p) {
+          drafts[a.id] = { provider: p.provider || "openai", model: p.model || RECOMMENDED_MODEL_FALLBACK };
+        } else {
+          drafts[a.id] = parseProviderAndModelFromPrimary(a.model);
+        }
+      }
+      setAgentProfileDrafts(drafts);
+    } catch (e) {
+      setAgentRuntimeResult(`读取 Agent 运行时配置失败: ${e}`);
+    }
+  }, [customConfigPath, agentsList?.agents, parseProviderAndModelFromPrimary]);
+
+  useEffect(() => {
+    if (step !== 4 || !["agents", "skills"].includes(tuningSection)) return;
+    const list = agentsList?.agents || [];
+    if (list.length === 0) return;
+    void refreshAgentRuntimeSettings(list);
+  }, [step, tuningSection, agentsList, refreshAgentRuntimeSettings]);
+
+  useEffect(() => {
+    if (skillsSelectedAgentId) return;
+    const fallback = selectedAgentId || agentsList?.agents?.[0]?.id || "";
+    if (fallback) setSkillsSelectedAgentId(fallback);
+  }, [skillsSelectedAgentId, selectedAgentId, agentsList?.agents]);
+
+  const refreshModelsForProvider = useCallback(
+    async (providerName: string) => {
+      const normalizedProvider = (providerName || "openai").trim() || "openai";
+      setAgentModelsLoadingByProvider((prev) => ({ ...prev, [normalizedProvider]: true }));
+      try {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        const models = await invoke<string[]>("discover_available_models", {
+          provider: normalizedProvider,
+          baseUrl: defaultBaseUrlForProvider(normalizedProvider),
+          apiKey: apiKey.trim() || undefined,
+          customPath: cfgPath,
+        });
+        const next = (models || []).filter((m) => !!m && m.trim().length > 0);
+        setAgentModelsByProvider((prev) => ({ ...prev, [normalizedProvider]: next }));
+        setAgentRuntimeResult(`已刷新 ${normalizedProvider} 模型 ${next.length} 个`);
+      } catch (e) {
+        setAgentRuntimeResult(`刷新模型失败（${normalizedProvider}）: ${e}`);
+      } finally {
+        setAgentModelsLoadingByProvider((prev) => ({ ...prev, [normalizedProvider]: false }));
+      }
+    },
+    [customConfigPath, apiKey]
+  );
+
+  const saveAgentProfile = useCallback(
+    async (agentId: string) => {
+      const draft = agentProfileDrafts[agentId];
+      if (!draft || !draft.provider || !draft.model) {
+        setAgentRuntimeResult("请先选择 provider 与 model");
+        return;
+      }
+      setAgentRuntimeSaving(true);
+      setAgentRuntimeResult(null);
+      try {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        await invoke("upsert_agent_runtime_profile", {
+          agentId,
+          provider: draft.provider,
+          model: draft.model,
+          customPath: cfgPath,
+        });
+        await Promise.all([refreshAgentsList(), refreshAgentRuntimeSettings()]);
+        setAgentRuntimeResult(`已保存 ${agentId} 的模型配置`);
+      } catch (e) {
+        setAgentRuntimeResult(`保存失败: ${e}`);
+      } finally {
+        setAgentRuntimeSaving(false);
+      }
+    },
+    [agentProfileDrafts, customConfigPath, refreshAgentsList, refreshAgentRuntimeSettings]
+  );
+
+  const saveChannelRoutes = useCallback(async () => {
+    setAgentRuntimeSaving(true);
+    setAgentRuntimeResult(null);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const cleaned = channelRoutesDraft.map((r) => ({
+        ...r,
+        channel: (r.channel || "").trim(),
+        agent_id: (r.agent_id || "").trim(),
+        gateway_id: (r.gateway_id || "").trim() || undefined,
+        bot_instance: (r.bot_instance || "").trim() || undefined,
+        account: (r.account || "").trim() || undefined,
+        peer: (r.peer || "").trim() || undefined,
+      }));
+      await invoke("save_agent_channel_routes", {
+        routes: cleaned,
+        customPath: cfgPath,
+      });
+      await refreshAgentRuntimeSettings();
+      setAgentRuntimeResult("渠道调阅路由已保存");
+    } catch (e) {
+      setAgentRuntimeResult(`保存渠道路由失败: ${e}`);
+    } finally {
+      setAgentRuntimeSaving(false);
+    }
+  }, [channelRoutesDraft, customConfigPath, refreshAgentRuntimeSettings]);
+
+  const parseGatewayChannelInstances = useCallback((input: unknown, fallbackChannel?: string, fallbackInstanceId?: string) => {
+    const out: Record<string, string> = {};
+    if (input && typeof input === "object") {
+      for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+        const ch = (k || "").trim().toLowerCase();
+        const iid = typeof v === "string" ? v.trim() : "";
+        if (!ch || !iid) continue;
+        out[ch] = iid;
+      }
+    }
+    const fallbackCh = (fallbackChannel || "").trim().toLowerCase();
+    const fallbackIid = (fallbackInstanceId || "").trim();
+    if (fallbackCh && fallbackIid && !out[fallbackCh]) {
+      out[fallbackCh] = fallbackIid;
+    }
+    return out;
+  }, []);
+
+  const parseGatewayChannelInstancesText = useCallback(
+    (text: string, fallbackChannel?: string, fallbackInstanceId?: string): Record<string, string> => {
+      const out: Record<string, string> = {};
+      for (const part of (text || "").split(",")) {
+        const seg = part.trim();
+        if (!seg) continue;
+        const idx = seg.indexOf(":");
+        if (idx <= 0) continue;
+        const ch = seg.slice(0, idx).trim().toLowerCase();
+        const iid = seg.slice(idx + 1).trim();
+        if (!ch || !iid) continue;
+        out[ch] = iid;
+      }
+      return parseGatewayChannelInstances(out, fallbackChannel, fallbackInstanceId);
+    },
+    [parseGatewayChannelInstances]
+  );
+
+  const stringifyGatewayChannelInstances = useCallback(
+    (input: unknown, fallbackChannel?: string, fallbackInstanceId?: string): string =>
+      Object.entries(parseGatewayChannelInstances(input, fallbackChannel, fallbackInstanceId))
+        .map(([ch, iid]) => `${ch}:${iid}`)
+        .join(","),
+    [parseGatewayChannelInstances]
+  );
+
+  const buildCurrentActiveChannelInstanceMap = useCallback((): Record<string, string> => {
+    const out: Record<string, string> = {};
+    const tg = (activeTelegramInstanceId || "").trim();
+    if (tg) out.telegram = tg;
+    for (const [ch, iid] of Object.entries(activeChannelInstanceByChannel || {})) {
+      const chNorm = (ch || "").trim().toLowerCase();
+      const iidNorm = (iid || "").trim();
+      if (!chNorm || !iidNorm) continue;
+      out[chNorm] = iidNorm;
+    }
+    return out;
+  }, [activeTelegramInstanceId, activeChannelInstanceByChannel]);
+
+  const buildChannelInstanceMapForAgent = useCallback(
+    (agentId: string): Record<string, string> => {
+      const base = buildCurrentActiveChannelInstanceMap();
+      const aid = (agentId || "").trim();
+      if (!aid) return base;
+
+      // 优先使用“路由里该 Agent 的 bot_instance”，避免多个网关抢同一个 Telegram token。
+      for (const r of channelRoutesDraft || []) {
+        if (!r.enabled) continue;
+        if ((r.agent_id || "").trim() !== aid) continue;
+        const ch = (r.channel || "").trim().toLowerCase();
+        const iid = (r.bot_instance || "").trim();
+        if (!ch || !iid) continue;
+        base[ch] = iid;
+      }
+
+      // Telegram 兜底：常见命名 tg-<agentId>
+      if (!base.telegram) {
+        const fallbackTgId = `tg-${aid}`;
+        if ((telegramInstancesDraft || []).some((x) => (x.id || "").trim() === fallbackTgId)) {
+          base.telegram = fallbackTgId;
+        }
+      }
+      return base;
+    },
+    [buildCurrentActiveChannelInstanceMap, channelRoutesDraft, telegramInstancesDraft]
+  );
+
+  const buildAutoGatewayBindingsDraft = useCallback((existingDraft?: GatewayBinding[]) => {
+    const agents = agentsList?.agents || [];
+    const globalActiveMap = buildCurrentActiveChannelInstanceMap();
+    if (agents.length === 0 || Object.keys(globalActiveMap).length === 0) return [];
+
+    const existingByAgent = new Map<string, GatewayBinding[]>();
+    for (const row of existingDraft || gatewayBindingsDraft || []) {
+      const aid = (row.agent_id || "").trim();
+      if (!aid) continue;
+      if (!existingByAgent.has(aid)) existingByAgent.set(aid, []);
+      existingByAgent.get(aid)!.push(row);
+    }
+
+    return agents.map((a) => {
+      const channelMap = buildChannelInstanceMapForAgent(a.id);
+      const old = (existingByAgent.get(a.id) || [])[0];
+      const fallbackChannel = old?.channel || (Object.keys(channelMap)[0] || "telegram");
+      const fallbackInstance =
+        old?.instance_id || channelMap[fallbackChannel] || channelMap.telegram || Object.values(channelMap)[0] || "";
+      return {
+        gateway_id: old?.gateway_id || `gw-agent-${a.id}`,
+        agent_id: a.id,
+        channel: fallbackChannel,
+        instance_id: fallbackInstance,
+        channel_instances: { ...channelMap },
+        enabled: old?.enabled ?? true,
+        auto_restart: old?.auto_restart ?? true,
+        state_dir: old?.state_dir,
+        listen_port: old?.listen_port,
+        pid: old?.pid,
+        last_error: old?.last_error,
+        health: old?.health,
+      };
+    });
+  }, [agentsList?.agents, buildCurrentActiveChannelInstanceMap, buildChannelInstanceMapForAgent, gatewayBindingsDraft]);
+
+  const persistGatewayBindingsDraft = useCallback(async (draft: GatewayBinding[]) => {
+    const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+    const cleaned = (draft || []).map((g) => ({
+      ...g,
+      gateway_id: (g.gateway_id || "").trim(),
+      agent_id: (g.agent_id || "").trim(),
+      channel: (g.channel || "").trim(),
+      instance_id: (g.instance_id || "").trim(),
+      channel_instances: parseGatewayChannelInstances(g.channel_instances, g.channel, g.instance_id),
+      state_dir: (g.state_dir || "").trim() || undefined,
+      listen_port: Number.isFinite(Number(g.listen_port)) ? Number(g.listen_port) : undefined,
+    }));
+    return invoke<GatewayBinding[]>("save_gateway_bindings", {
+      gateways: cleaned,
+      customPath: cfgPath,
+    });
+  }, [customConfigPath, parseGatewayChannelInstances]);
+
+  const generateGatewayBindingsByAgent = useCallback(() => {
+    const next = buildAutoGatewayBindingsDraft();
+    if (next.length === 0) {
+      setAgentRuntimeResult("当前没有可自动生成的 Agent 网关。请先保存实例池并选择激活实例。");
+      return;
+    }
+    setGatewayBindingsDraft(next);
+    setAgentRuntimeResult(
+      `已按 Agent 自动生成 ${next.length} 条网关：每个 Agent 一条，并自动挂上该 Agent 的多渠道配置。`
+    );
+  }, [buildAutoGatewayBindingsDraft]);
+
+  const saveGatewayBindings = useCallback(async () => {
+    setAgentRuntimeSaving(true);
+    setAgentRuntimeResult(null);
+    try {
+      const next = await persistGatewayBindingsDraft(gatewayBindingsDraft || []);
+      setGatewayBindingsDraft(next || []);
+      setAgentRuntimeResult(`已保存网关绑定 ${next?.length || 0} 项`);
+    } catch (e) {
+      setAgentRuntimeResult(`保存网关绑定失败: ${e}`);
+    } finally {
+      setAgentRuntimeSaving(false);
+    }
+  }, [gatewayBindingsDraft, persistGatewayBindingsDraft]);
+
+  const refreshGatewayInstances = useCallback(async () => {
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const list = await invoke<GatewayBinding[]>("list_gateway_instances", {
+        customPath: cfgPath,
+      });
+      setGatewayBindingsDraft(list || []);
+    } catch (e) {
+      setAgentRuntimeResult(`刷新网关实例失败: ${e}`);
+    }
+  }, [customConfigPath]);
+
+  const runGatewayAction = useCallback(
+    async (action: "start" | "stop" | "restart" | "health" | "logs", gatewayId: string) => {
+      const gid = (gatewayId || "").trim();
+      if (!gid) return;
+      setGatewayActionLoadingById((prev) => ({ ...prev, [gid]: true }));
+      try {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+        if (action === "start") {
+          const msg = await invoke<string>("start_gateway_instance", {
+            gatewayId: gid,
+            customPath: cfgPath,
+            installHint,
+          });
+          setAgentRuntimeResult(msg);
+        } else if (action === "stop") {
+          const msg = await invoke<string>("stop_gateway_instance", {
+            gatewayId: gid,
+            customPath: cfgPath,
+            installHint,
+          });
+          setAgentRuntimeResult(msg);
+        } else if (action === "restart") {
+          const msg = await invoke<string>("restart_gateway_instance", {
+            gatewayId: gid,
+            customPath: cfgPath,
+            installHint,
+          });
+          setAgentRuntimeResult(msg);
+        } else if (action === "health") {
+          const row = await invoke<GatewayBinding>("health_gateway_instance", {
+            gatewayId: gid,
+            customPath: cfgPath,
+          });
+          setGatewayBindingsDraft((prev) => prev.map((g) => (g.gateway_id === gid ? row : g)));
+          setAgentRuntimeResult(
+            `网关 ${gid} 状态：${row.health?.status || "unknown"}${row.health?.detail ? `\n${row.health.detail}` : ""}`
+          );
+        } else {
+          const logs = await invoke<string>("tail_gateway_logs", {
+            gatewayId: gid,
+            lines: 200,
+            customPath: cfgPath,
+          });
+          setGatewayLogsById((prev) => ({ ...prev, [gid]: logs || "" }));
+          setGatewayLogViewerId(gid);
+        }
+        if (action !== "logs") {
+          await refreshGatewayInstances();
+        }
+      } catch (e) {
+        setAgentRuntimeResult(`网关操作失败(${action}/${gid}): ${e}`);
+      } finally {
+        setGatewayActionLoadingById((prev) => ({ ...prev, [gid]: false }));
+      }
+    },
+    [customConfigPath, localInfo?.install_dir, customInstallPath, lastInstallDir, refreshGatewayInstances]
+  );
+
+  const runStartAllEnabledGateways = useCallback(async () => {
+    setGatewayBatchLoading("start");
+    try {
+      const enabled = (gatewayBindingsDraft || []).filter((g) => g.enabled);
+      const telegramOwnerByInstance: Record<string, string[]> = {};
+      for (const g of enabled) {
+        const mapping = parseGatewayChannelInstances(g.channel_instances, g.channel, g.instance_id);
+        const tg = (mapping.telegram || "").trim();
+        if (!tg) continue;
+        if (!telegramOwnerByInstance[tg]) telegramOwnerByInstance[tg] = [];
+        telegramOwnerByInstance[tg].push(g.gateway_id);
+      }
+      const conflicts = Object.entries(telegramOwnerByInstance).filter(([, gids]) => gids.length > 1);
+      if (conflicts.length > 0) {
+        const detail = conflicts
+          .map(([iid, gids]) => `Telegram 实例 ${iid} 被多个网关同时绑定: ${gids.join(", ")}`)
+          .join("\n");
+        setAgentRuntimeResult(`已拦截批量启动：检测到 Telegram 轮询冲突（会导致 409）。\n${detail}\n请先改为每个 Telegram 实例只被一个网关绑定。`);
+        return;
+      }
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const installHint = (localInfo?.install_dir || customInstallPath || lastInstallDir || "").trim() || undefined;
+      const msg = await invoke<string>("start_all_enabled_gateways", {
+        customPath: cfgPath,
+        installHint,
+      });
+      setAgentRuntimeResult(msg);
+      await refreshGatewayInstances();
+    } catch (e) {
+      setAgentRuntimeResult(`批量启动失败: ${e}`);
+    } finally {
+      setGatewayBatchLoading(null);
+    }
+  }, [
+    customConfigPath,
+    localInfo?.install_dir,
+    customInstallPath,
+    lastInstallDir,
+    refreshGatewayInstances,
+    gatewayBindingsDraft,
+    parseGatewayChannelInstances,
+  ]);
+
+  const runHealthAllEnabledGateways = useCallback(async () => {
+    setGatewayBatchLoading("health");
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const list = await invoke<GatewayBinding[]>("health_all_enabled_gateways", {
+        customPath: cfgPath,
+      });
+      setGatewayBindingsDraft(list || []);
+      const ok = (list || []).filter((g) => g.health?.status === "ok").length;
+      setAgentRuntimeResult(`批量健康检查完成：ok ${ok} / total ${(list || []).length}`);
+    } catch (e) {
+      setAgentRuntimeResult(`批量健康检查失败: ${e}`);
+    } finally {
+      setGatewayBatchLoading(null);
+    }
+  }, [customConfigPath]);
+
+  const exportGatewayDiagnosticReport = useCallback(async () => {
+    setGatewayBatchLoading("report");
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const path = await invoke<string>("export_multi_gateway_diagnostic_report", {
+        customPath: cfgPath,
+      });
+      setAgentRuntimeResult(`多网关诊断报告已导出：${path}`);
+    } catch (e) {
+      setAgentRuntimeResult(`导出多网关诊断报告失败: ${e}`);
+    } finally {
+      setGatewayBatchLoading(null);
+    }
+  }, [customConfigPath]);
+
+  const saveTelegramInstances = useCallback(async () => {
+    setAgentRuntimeSaving(true);
+    setAgentRuntimeResult(null);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const cleaned = telegramInstancesDraft
+        .map((it) => ({
+          ...it,
+          id: (it.id || "").trim(),
+          name: (it.name || "").trim(),
+          bot_token: (it.bot_token || "").trim(),
+          chat_id: (it.chat_id || "").trim() || undefined,
+        }))
+        .filter((it) => it.id && it.bot_token);
+      const resp = await invoke<AgentRuntimeSettingsPayload>("save_telegram_instances", {
+        instances: cleaned,
+        activeInstanceId: (activeTelegramInstanceId || "").trim() || undefined,
+        customPath: cfgPath,
+      });
+      setAgentRuntimeSettings(resp);
+      setGatewayBindingsDraft(resp.gateways || []);
+      setChannelRoutesDraft(resp.channel_routes || []);
+      setTelegramInstancesDraft(resp.telegram_instances || []);
+      setTelegramUsernameByInstanceId((prev) => {
+        const next: Record<string, string> = {};
+        for (const it of resp.telegram_instances || []) {
+          if (prev[it.id]) next[it.id] = prev[it.id];
+        }
+        return next;
+      });
+      setActiveTelegramInstanceId(resp.active_telegram_instance || resp.telegram_instances?.[0]?.id || "");
+      setAgentRuntimeResult("Telegram 机器人实例已保存");
+      return resp;
+    } catch (e) {
+      setAgentRuntimeResult(`保存 Telegram 实例失败: ${e}`);
+      return null;
+    } finally {
+      setAgentRuntimeSaving(false);
+    }
+  }, [telegramInstancesDraft, activeTelegramInstanceId, customConfigPath]);
+
+  const buildTelegramPerAgentDraft = useCallback(() => {
+    const agents = agentsList?.agents || [];
+    if (agents.length === 0) {
+      setAgentRuntimeResult("当前没有 Agent，无法生成按 Agent 的 Telegram 配置。");
+      return;
+    }
+    const existingById = new Map(telegramInstancesDraft.map((x) => [x.id, x]));
+    const nextInstances: TelegramBotInstance[] = agents.map((a) => {
+      const iid = `tg-${a.id}`;
+      const old = existingById.get(iid);
+      return {
+        id: iid,
+        name: a.name || a.id,
+        bot_token: old?.bot_token || "",
+        chat_id: old?.chat_id || "",
+        enabled: old?.enabled ?? true,
+      };
+    });
+
+    const oldTelegramRoutes = channelRoutesDraft.filter((r) => r.channel === "telegram");
+    const nonTelegramRoutes = channelRoutesDraft.filter((r) => r.channel !== "telegram");
+    const nextTelegramRoutes: AgentChannelRoute[] = agents.map((a) => {
+      const iid = `tg-${a.id}`;
+      const old = oldTelegramRoutes.find((r) => (r.bot_instance || "") === iid && r.agent_id === a.id);
+      return {
+        id: old?.id || "",
+        channel: "telegram",
+        agent_id: a.id,
+        bot_instance: iid,
+        account: old?.account || "",
+        peer: old?.peer || "",
+        enabled: old?.enabled ?? true,
+      };
+    });
+
+    const defaultAgent = agents.find((a) => a.default)?.id || agents[0].id;
+    const defaultInstance = `tg-${defaultAgent}`;
+    setTelegramInstancesDraft(nextInstances);
+    setChannelRoutesDraft([...nonTelegramRoutes, ...nextTelegramRoutes]);
+    setActiveTelegramInstanceId((prev) => prev || defaultInstance);
+    setRouteTestChannel("telegram");
+    setRouteTestBotInstance(defaultInstance);
+    setAgentRuntimeResult("已按当前 Agent 自动生成 Telegram 实例与路由。请逐个填写 Token 后保存。");
+  }, [agentsList, telegramInstancesDraft, channelRoutesDraft]);
+
+  const runTelegramFirstSetupWizard = useCallback(async () => {
+    if (telegramWizardRunning) return;
+    const agents = agentsList?.agents || [];
+    if (agents.length === 0) {
+      setAgentRuntimeResult("向导失败：当前没有 Agent。");
+      return;
+    }
+    setTelegramWizardRunning(true);
+    setAgentRuntimeResult(null);
+    try {
+      // Step 1: 自动生成“每个 Agent 一个实例 + 对应路由”
+      const existingById = new Map(telegramInstancesDraft.map((x) => [x.id, x]));
+      const instances = agents.map((a) => {
+        const iid = `tg-${a.id}`;
+        const old = existingById.get(iid);
+        return {
+          id: iid,
+          name: a.name || a.id,
+          bot_token: (old?.bot_token || "").trim(),
+          chat_id: (old?.chat_id || "").trim() || undefined,
+          enabled: old?.enabled ?? true,
+        };
+      });
+      const missing = instances.filter((x) => !x.bot_token).map((x) => x.id);
+      if (missing.length > 0) {
+        setTelegramInstancesDraft(instances.map((x) => ({ ...x, chat_id: x.chat_id || "" })));
+        setAgentRuntimeResult(
+          `向导第1步已生成实例，但这些实例缺少 Token：${missing.join(
+            ", "
+          )}\n请先填写后，再点“首次配置向导”。`
+        );
+        return;
+      }
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const defaultAgent = agents.find((a) => a.default)?.id || agents[0].id;
+      const activeInstanceId = `tg-${defaultAgent}`;
+      const saveResp = await invoke<AgentRuntimeSettingsPayload>("save_telegram_instances", {
+        instances,
+        activeInstanceId,
+        customPath: cfgPath,
+      });
+      setAgentRuntimeSettings(saveResp);
+      setTelegramInstancesDraft(
+        (saveResp.telegram_instances || []).map((x) => ({ ...x, chat_id: x.chat_id || "" }))
+      );
+      setActiveTelegramInstanceId(saveResp.active_telegram_instance || activeInstanceId);
+
+      // Step 2: 应用实例到网关
+      await invoke<string>("apply_telegram_instance", {
+        instanceId: saveResp.active_telegram_instance || activeInstanceId,
+        customPath: cfgPath,
+      });
+
+      // Step 3: 保存路由（每个 agent 对应一个 bot_instance）
+      const routes: AgentChannelRoute[] = agents.map((a) => ({
+        id: "",
+        channel: "telegram",
+        agent_id: a.id,
+        bot_instance: `tg-${a.id}`,
+        account: "",
+        peer: "",
+        enabled: true,
+      }));
+      const nonTelegram = channelRoutesDraft.filter((r) => r.channel !== "telegram");
+      const merged = [...nonTelegram, ...routes];
+      await invoke("save_agent_channel_routes", {
+        routes: merged,
+        customPath: cfgPath,
+      });
+      setChannelRoutesDraft(merged);
+
+      // Step 4: 命中测试
+      const testResp = await invoke<AgentRouteResolveResult>("resolve_agent_channel_route", {
+        channel: "telegram",
+        botInstance: `tg-${defaultAgent}`,
+        fallbackAgent: defaultAgent,
+        customPath: cfgPath,
+      });
+      setRouteTestChannel("telegram");
+      setRouteTestBotInstance(`tg-${defaultAgent}`);
+      setRouteTestResult(
+        `命中 Agent: ${testResp.agent_id}${testResp.matched_route_id ? `（路由ID: ${testResp.matched_route_id}）` : ""}\n${
+          testResp.detail
+        }`
+      );
+      setAgentRuntimeResult(
+        `首次配置向导完成：\n1) 实例池已保存\n2) 已应用实例 ${saveResp.active_telegram_instance || activeInstanceId}\n3) 路由已保存\n4) 测试已执行`
+      );
+    } catch (e) {
+      setAgentRuntimeResult(`首次配置向导失败: ${e}`);
+    } finally {
+      setTelegramWizardRunning(false);
+    }
+  }, [telegramWizardRunning, agentsList, telegramInstancesDraft, customConfigPath, channelRoutesDraft]);
+
+  const applyTelegramInstance = useCallback(
+    async (instanceId: string) => {
+      if (!instanceId) return;
+      setAgentRuntimeSaving(true);
+      setAgentRuntimeResult(null);
+      try {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        const result = await invoke<string>("apply_telegram_instance", {
+          instanceId,
+          customPath: cfgPath,
+        });
+        setActiveTelegramInstanceId(instanceId);
+        const tg = await invoke<ChannelConfig>("read_channel_config", { channel: "telegram", customPath: cfgPath });
+        setTelegramConfig({
+          botToken: tg?.botToken ?? "",
+          chatId: tg?.chatId ?? "",
+        });
+        await refreshAgentRuntimeSettings();
+        setAgentRuntimeResult(result || `已应用实例 ${instanceId}`);
+        return result || `已应用实例 ${instanceId}`;
+      } catch (e) {
+        setAgentRuntimeResult(`应用 Telegram 实例失败: ${e}`);
+        return null;
+      } finally {
+        setAgentRuntimeSaving(false);
+      }
+    },
+    [customConfigPath, refreshAgentRuntimeSettings]
+  );
+
+  const testTelegramInstancesBatch = useCallback(async () => {
+    setTelegramBatchTesting(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const result = await invoke<TelegramInstanceHealth[]>("test_telegram_instances", {
+        customPath: cfgPath,
+      });
+      if (!result.length) {
+        setAgentRuntimeResult("批量检查完成：没有可检查的 Telegram 实例。");
+        return;
+      }
+      const usernameMap: Record<string, string> = {};
+      for (const r of result) {
+        const uname = (r.username || "").trim();
+        if (uname) usernameMap[r.id] = uname;
+      }
+      setTelegramUsernameByInstanceId((prev) => ({ ...prev, ...usernameMap }));
+      const lines = result.map((r) => {
+        const uname = (r.username || "").trim();
+        return `${r.ok ? "✅" : "❌"} ${r.id}${uname ? ` (@${uname})` : ""} - ${r.detail}`;
+      });
+      const okCount = result.filter((r) => r.ok).length;
+      setAgentRuntimeResult(`批量 getMe 检查完成：${okCount}/${result.length} 通过\n${lines.join("\n")}`);
+    } catch (e) {
+      setAgentRuntimeResult(`批量 getMe 检查失败: ${e}`);
+    } finally {
+      setTelegramBatchTesting(false);
+    }
+  }, [customConfigPath]);
+
+  const getChannelInstanceIdsByChannel = useCallback(
+    (channel: string): string[] => {
+      const ch = (channel || "").trim().toLowerCase();
+      if (ch === "telegram") {
+        return telegramInstancesDraft.map((it) => it.id).filter(Boolean);
+      }
+      return channelInstancesDraft
+        .filter((it) => (it.channel || "").trim().toLowerCase() === ch)
+        .map((it) => it.id)
+        .filter(Boolean);
+    },
+    [telegramInstancesDraft, channelInstancesDraft]
+  );
+
+  const channelEditorCredential1Label = useMemo(() => {
+    if (channelInstancesEditorChannel === "telegram") return "botToken";
+    if (channelInstancesEditorChannel === "feishu") return "appId";
+    if (channelInstancesEditorChannel === "dingtalk") return "appKey";
+    if (channelInstancesEditorChannel === "qq") return "appId";
+    return "token";
+  }, [channelInstancesEditorChannel]);
+
+  const channelEditorCredential2Label = useMemo(() => {
+    if (channelInstancesEditorChannel === "feishu") return "appSecret";
+    if (channelInstancesEditorChannel === "dingtalk") return "appSecret";
+    if (channelInstancesEditorChannel === "qq") return "appSecret";
+    return "";
+  }, [channelInstancesEditorChannel]);
+
+  const hasRequiredChannelCredentials = useCallback((channel: NonTelegramChannel, row: ChannelBotInstance): boolean => {
+    const c1 = (row.credential1 || "").trim();
+    const c2 = (row.credential2 || "").trim();
+    if (channel === "discord") return !!c1;
+    return !!c1 && !!c2;
+  }, []);
+
+  const buildChannelPerAgentDraft = useCallback(
+    (channel: NonTelegramChannel) => {
+      const agents = agentsList?.agents || [];
+      if (agents.length === 0) {
+        setAgentRuntimeResult("当前没有 Agent，无法生成渠道实例。");
+        return;
+      }
+      const oldById = new Map(
+        channelInstancesDraft
+          .filter((x) => (x.channel || "").trim().toLowerCase() === channel)
+          .map((x) => [x.id, x])
+      );
+      const nextInstances: ChannelBotInstance[] = agents.map((a) => {
+        const iid = `${channel}-${a.id}`;
+        const old = oldById.get(iid);
+        return {
+          id: iid,
+          name: a.name || a.id,
+          channel,
+          credential1: old?.credential1 || "",
+          credential2: old?.credential2 || "",
+          chat_id: old?.chat_id || "",
+          enabled: old?.enabled ?? true,
+        };
+      });
+      setChannelInstancesDraft((prev) => [
+        ...prev.filter((x) => (x.channel || "").trim().toLowerCase() !== channel),
+        ...nextInstances,
+      ]);
+
+      const oldRoutes = channelRoutesDraft.filter((r) => (r.channel || "").trim().toLowerCase() === channel);
+      const nonTargetRoutes = channelRoutesDraft.filter((r) => (r.channel || "").trim().toLowerCase() !== channel);
+      const nextRoutes: AgentChannelRoute[] = agents.map((a) => {
+        const iid = `${channel}-${a.id}`;
+        const old = oldRoutes.find((r) => (r.bot_instance || "") === iid && r.agent_id === a.id);
+        return {
+          id: old?.id || "",
+          channel,
+          agent_id: a.id,
+          bot_instance: iid,
+          account: old?.account || "",
+          peer: old?.peer || "",
+          enabled: old?.enabled ?? true,
+        };
+      });
+      setChannelRoutesDraft([...nonTargetRoutes, ...nextRoutes]);
+
+      const defaultAgent = agents.find((a) => a.default)?.id || agents[0].id;
+      const defaultInstanceId = `${channel}-${defaultAgent}`;
+      setActiveChannelInstanceByChannel((prev) => ({
+        ...prev,
+        [channel]: prev[channel] || defaultInstanceId,
+      }));
+      setRouteTestChannel(channel);
+      setRouteTestBotInstance(defaultInstanceId);
+      setAgentRuntimeResult(`已按 Agent 自动生成 ${channel} 实例与路由，请填写凭据后保存并应用。`);
+    },
+    [agentsList, channelInstancesDraft, channelRoutesDraft]
+  );
+
+  const saveChannelInstances = useCallback(
+    async (channel: NonTelegramChannel) => {
+      setAgentRuntimeSaving(true);
+      setAgentRuntimeResult(null);
+      try {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        const cleaned = channelInstancesDraft
+          .filter((x) => (x.channel || "").trim().toLowerCase() === channel)
+          .map((it) => ({
+            ...it,
+            id: (it.id || "").trim(),
+            name: (it.name || "").trim(),
+            channel,
+            credential1: (it.credential1 || "").trim(),
+            credential2: (it.credential2 || "").trim() || undefined,
+            chat_id: (it.chat_id || "").trim() || undefined,
+          }))
+          .filter((it) => it.id);
+        const resp = await invoke<AgentRuntimeSettingsPayload>("save_channel_instances", {
+          channel,
+          instances: cleaned,
+          activeInstanceId: (activeChannelInstanceByChannel[channel] || "").trim() || undefined,
+          customPath: cfgPath,
+        });
+        setAgentRuntimeSettings(resp);
+        setGatewayBindingsDraft(resp.gateways || []);
+        setChannelRoutesDraft(resp.channel_routes || []);
+        setTelegramInstancesDraft(resp.telegram_instances || []);
+        setChannelInstancesDraft(resp.channel_instances || []);
+        setActiveTelegramInstanceId(resp.active_telegram_instance || resp.telegram_instances?.[0]?.id || "");
+        setActiveChannelInstanceByChannel(resp.active_channel_instances || {});
+        setAgentRuntimeResult(`${channel} 实例池已保存`);
+        return resp;
+      } catch (e) {
+        setAgentRuntimeResult(`保存 ${channel} 实例池失败: ${e}`);
+        return null;
+      } finally {
+        setAgentRuntimeSaving(false);
+      }
+    },
+    [customConfigPath, channelInstancesDraft, activeChannelInstanceByChannel]
+  );
+
+  const applyChannelInstance = useCallback(
+    async (channel: NonTelegramChannel, instanceId: string) => {
+      if (!instanceId) return;
+      setAgentRuntimeSaving(true);
+      setAgentRuntimeResult(null);
+      try {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        const result = await invoke<string>("apply_channel_instance", {
+          channel,
+          instanceId,
+          customPath: cfgPath,
+        });
+        setActiveChannelInstanceByChannel((prev) => ({ ...prev, [channel]: instanceId }));
+        await refreshAgentRuntimeSettings();
+        setAgentRuntimeResult(result || `已应用 ${channel} 实例 ${instanceId}`);
+        return result || `已应用 ${channel} 实例 ${instanceId}`;
+      } catch (e) {
+        setAgentRuntimeResult(`应用 ${channel} 实例失败: ${e}`);
+        return null;
+      } finally {
+        setAgentRuntimeSaving(false);
+      }
+    },
+    [customConfigPath, refreshAgentRuntimeSettings]
+  );
+
+  const saveAndApplyTelegramSetup = useCallback(async () => {
+    if (!activeTelegramInstanceId) {
+      setAgentRuntimeResult("请先选择一个 Telegram 激活实例");
+      return;
+    }
+    const saved = await saveTelegramInstances();
+    if (!saved) return;
+    const applied = await applyTelegramInstance(activeTelegramInstanceId);
+    if (!applied) return;
+    try {
+      const nextDraft = buildAutoGatewayBindingsDraft(saved.gateways || gatewayBindingsDraft);
+      if (nextDraft.length > 0) {
+        setGatewayBindingsDraft(nextDraft);
+        const savedGateways = await persistGatewayBindingsDraft(nextDraft);
+        setGatewayBindingsDraft(savedGateways || []);
+      }
+      setAgentRuntimeResult(`已保存 Telegram 实例、应用到网关，并同步更新 Agent 网关。`);
+    } catch (e) {
+      setAgentRuntimeResult(`Telegram 网关同步失败: ${e}`);
+    }
+  }, [
+    activeTelegramInstanceId,
+    saveTelegramInstances,
+    applyTelegramInstance,
+    buildAutoGatewayBindingsDraft,
+    gatewayBindingsDraft,
+    persistGatewayBindingsDraft,
+  ]);
+
+  const saveAndApplyChannelSetup = useCallback(async (channel: NonTelegramChannel) => {
+    const activeId = (activeChannelInstanceByChannel[channel] || "").trim();
+    if (!activeId) {
+      setAgentRuntimeResult(`请先选择 ${channel} 的激活实例`);
+      return;
+    }
+    const saved = await saveChannelInstances(channel);
+    if (!saved) return;
+    const applied = await applyChannelInstance(channel, activeId);
+    if (!applied) return;
+    try {
+      const nextDraft = buildAutoGatewayBindingsDraft(saved.gateways || gatewayBindingsDraft);
+      if (nextDraft.length > 0) {
+        setGatewayBindingsDraft(nextDraft);
+        const savedGateways = await persistGatewayBindingsDraft(nextDraft);
+        setGatewayBindingsDraft(savedGateways || []);
+      }
+      setAgentRuntimeResult(`已保存 ${channel} 实例、应用到网关，并同步更新 Agent 网关。`);
+    } catch (e) {
+      setAgentRuntimeResult(`${channel} 网关同步失败: ${e}`);
+    }
+  }, [
+    activeChannelInstanceByChannel,
+    saveChannelInstances,
+    applyChannelInstance,
+    buildAutoGatewayBindingsDraft,
+    gatewayBindingsDraft,
+    persistGatewayBindingsDraft,
+  ]);
+
+  const testChannelInstancesBatch = useCallback(
+    async (channel: NonTelegramChannel) => {
+      setChannelBatchTestingByChannel((prev) => ({ ...prev, [channel]: true }));
+      try {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        const result = await invoke<ChannelInstanceHealth[]>("test_channel_instances", {
+          channel,
+          customPath: cfgPath,
+        });
+        if (!result.length) {
+          setAgentRuntimeResult(`${channel} 批量检测完成：没有可检查的实例。`);
+          return;
+        }
+        const okCount = result.filter((r) => r.ok).length;
+        const lines = result.map((r) => `${r.ok ? "✅" : "❌"} ${r.id} - ${r.detail}`);
+        setAgentRuntimeResult(`${channel} 批量检测完成：${okCount}/${result.length} 通过\n${lines.join("\n")}`);
+      } catch (e) {
+        setAgentRuntimeResult(`${channel} 批量检测失败: ${e}`);
+      } finally {
+        setChannelBatchTestingByChannel((prev) => ({ ...prev, [channel]: false }));
+      }
+    },
+    [customConfigPath]
+  );
+
+  const testSingleChannelInstance = useCallback(
+    async (channel: NonTelegramChannel, instanceId: string) => {
+      if (!instanceId) return;
+      setChannelSingleTestingByInstanceId((prev) => ({ ...prev, [`${channel}:${instanceId}`]: true }));
+      try {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        const r = await invoke<ChannelInstanceHealth>("test_single_channel_instance", {
+          channel,
+          instanceId,
+          customPath: cfgPath,
+        });
+        setAgentRuntimeResult(`${r.ok ? "✅" : "❌"} ${r.channel}/${r.id} - ${r.detail}`);
+      } catch (e) {
+        const err = String(e);
+        const hint =
+          err.includes("未找到")
+            ? "\n💡 建议：请先点“保存实例池”，再检测这一行。"
+            : 
+          err.includes("401") || err.includes("Unauthorized") || err.includes("invalid")
+            ? "\n💡 建议：请检查 AppID / AppSecret 是否正确；QQ 会自动拼成 AppID:AppSecret。"
+            : err.includes("network") || err.includes("timeout")
+              ? "\n💡 建议：请检查网络连接。"
+              : "\n💡 建议：请检查凭据是否完整、格式是否正确。";
+        setAgentRuntimeResult(`❌ 单实例检测失败(${channel}/${instanceId}): ${err}${hint}`);
+      } finally {
+        setChannelSingleTestingByInstanceId((prev) => ({ ...prev, [`${channel}:${instanceId}`]: false }));
+      }
+    },
+    [customConfigPath]
+  );
+
+  const runChannelFirstSetupWizard = useCallback(
+    async (channel: NonTelegramChannel) => {
+      if (channelWizardRunningByChannel[channel]) return;
+      const agents = agentsList?.agents || [];
+      if (agents.length === 0) {
+        setAgentRuntimeResult("向导失败：当前没有 Agent。");
+        return;
+      }
+      setChannelWizardRunningByChannel((prev) => ({ ...prev, [channel]: true }));
+      setAgentRuntimeResult(null);
+      try {
+        const oldById = new Map(
+          channelInstancesDraft
+            .filter((x) => (x.channel || "").trim().toLowerCase() === channel)
+            .map((x) => [x.id, x])
+        );
+        const instances: ChannelBotInstance[] = agents.map((a) => {
+          const iid = `${channel}-${a.id}`;
+          const old = oldById.get(iid);
+          return {
+            id: iid,
+            name: a.name || a.id,
+            channel,
+            credential1: (old?.credential1 || "").trim(),
+            credential2: (old?.credential2 || "").trim() || undefined,
+            chat_id: (old?.chat_id || "").trim() || undefined,
+            enabled: old?.enabled ?? true,
+          };
+        });
+        const missing = instances.filter((x) => !hasRequiredChannelCredentials(channel, x)).map((x) => x.id);
+        if (missing.length > 0) {
+          setChannelInstancesDraft((prev) => [
+            ...prev.filter((x) => (x.channel || "").trim().toLowerCase() !== channel),
+            ...instances.map((x) => ({ ...x, credential2: x.credential2 || "", chat_id: x.chat_id || "" })),
+          ]);
+          setAgentRuntimeResult(
+            `向导第1步已生成 ${channel} 实例，但这些实例缺少必填凭据：${missing.join(
+              ", "
+            )}\n请先填写后，再点“首次配置向导”。`
+          );
+          return;
+        }
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        const defaultAgent = agents.find((a) => a.default)?.id || agents[0].id;
+        const activeInstanceId = `${channel}-${defaultAgent}`;
+        const saveResp = await invoke<AgentRuntimeSettingsPayload>("save_channel_instances", {
+          channel,
+          instances,
+          activeInstanceId,
+          customPath: cfgPath,
+        });
+        setAgentRuntimeSettings(saveResp);
+        setChannelInstancesDraft(saveResp.channel_instances || []);
+        setActiveChannelInstanceByChannel(saveResp.active_channel_instances || {});
+        setChannelRoutesDraft(saveResp.channel_routes || []);
+
+        await invoke<string>("apply_channel_instance", {
+          channel,
+          instanceId: saveResp.active_channel_instances?.[channel] || activeInstanceId,
+          customPath: cfgPath,
+        });
+
+        const routes: AgentChannelRoute[] = agents.map((a) => ({
+          id: "",
+          channel,
+          agent_id: a.id,
+          bot_instance: `${channel}-${a.id}`,
+          account: "",
+          peer: "",
+          enabled: true,
+        }));
+        const nonTarget = channelRoutesDraft.filter((r) => (r.channel || "").trim().toLowerCase() !== channel);
+        const merged = [...nonTarget, ...routes];
+        await invoke("save_agent_channel_routes", {
+          routes: merged,
+          customPath: cfgPath,
+        });
+        setChannelRoutesDraft(merged);
+
+        const testResp = await invoke<AgentRouteResolveResult>("resolve_agent_channel_route", {
+          channel,
+          botInstance: `${channel}-${defaultAgent}`,
+          fallbackAgent: defaultAgent,
+          customPath: cfgPath,
+        });
+        setRouteTestChannel(channel);
+        setRouteTestBotInstance(`${channel}-${defaultAgent}`);
+        setRouteTestResult(
+          `命中 Agent: ${testResp.agent_id}${testResp.matched_route_id ? `（路由ID: ${testResp.matched_route_id}）` : ""}\n${
+            testResp.detail
+          }`
+        );
+        setAgentRuntimeResult(
+          `${channel} 首次配置向导完成：\n1) 实例池已保存\n2) 已应用实例 ${
+            saveResp.active_channel_instances?.[channel] || activeInstanceId
+          }\n3) 路由已保存\n4) 测试已执行`
+        );
+      } catch (e) {
+        setAgentRuntimeResult(`${channel} 首次配置向导失败: ${e}`);
+      } finally {
+        setChannelWizardRunningByChannel((prev) => ({ ...prev, [channel]: false }));
+      }
+    },
+    [
+      channelWizardRunningByChannel,
+      agentsList,
+      channelInstancesDraft,
+      hasRequiredChannelCredentials,
+      customConfigPath,
+      channelRoutesDraft,
+    ]
+  );
+
+  const cleanupBrowserSessionsForTelegramBindings = useCallback(async () => {
+    setTelegramSessionCleanupRunning(true);
+    setAgentRuntimeResult(null);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const result = await invoke<string>("cleanup_browser_sessions_for_telegram_bindings", {
+        customPath: cfgPath,
+      });
+      setAgentRuntimeResult(`${result}\n如浏览器对话页已打开，请刷新页面后查看会话列表。`);
+    } catch (e) {
+      setAgentRuntimeResult(`清理浏览器会话失败: ${e}`);
+    } finally {
+      setTelegramSessionCleanupRunning(false);
+    }
+  }, [customConfigPath]);
+
+  const testSingleTelegramInstance = useCallback(
+    async (instanceId: string) => {
+      if (!instanceId) return;
+      setTelegramSingleTestingByInstanceId((prev) => ({ ...prev, [instanceId]: true }));
+      try {
+        const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+        const r = await invoke<TelegramInstanceHealth>("test_single_telegram_instance", {
+          instanceId,
+          customPath: cfgPath,
+        });
+        const uname = (r.username || "").trim();
+        if (uname) {
+          setTelegramUsernameByInstanceId((prev) => ({ ...prev, [instanceId]: uname }));
+        }
+        setAgentRuntimeResult(
+          `${r.ok ? "✅" : "❌"} ${r.id}${uname ? ` (@${uname})` : ""} - ${r.detail}`
+        );
+      } catch (e) {
+        const err = String(e);
+        const hint =
+          err.includes("401") || err.includes("Unauthorized")
+            ? "\n💡 建议：请检查 Token 是否正确，是否从 @BotFather 获取。"
+            : err.includes("404") || err.includes("not found")
+              ? "\n💡 建议：Token 格式可能错误，请确认复制完整。"
+              : err.includes("network") || err.includes("timeout") || err.includes("fetch")
+                ? "\n💡 建议：请检查网络连接，或配置代理后重试。"
+                : "\n💡 建议：请检查 Token 是否正确、网络是否可达。";
+        setAgentRuntimeResult(`❌ 单实例检测失败(${instanceId}): ${err}${hint}`);
+      } finally {
+        setTelegramSingleTestingByInstanceId((prev) => ({ ...prev, [instanceId]: false }));
+      }
+    },
+    [customConfigPath]
+  );
+
+  const testChannelRoute = useCallback(async () => {
+    setRouteTesting(true);
+    setRouteTestResult(null);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const fallback = agentsList?.agents?.find((a) => a.default)?.id || agentsList?.agents?.[0]?.id || "main";
+      const resp = await invoke<AgentRouteResolveResult>("resolve_agent_channel_route", {
+        channel: routeTestChannel,
+        gatewayId: gatewaySelectedIdForRouteTest.trim() || undefined,
+        botInstance: routeTestBotInstance.trim() || undefined,
+        account: routeTestAccount.trim() || undefined,
+        peer: routeTestPeer.trim() || undefined,
+        fallbackAgent: fallback,
+        customPath: cfgPath,
+      });
+      setRouteTestResult(
+        `命中 Agent: ${resp.agent_id}${resp.gateway_id ? ` · 网关:${resp.gateway_id}` : ""}${
+          resp.matched_route_id ? `（路由ID: ${resp.matched_route_id}）` : "（默认回退）"
+        }\n${resp.detail}`
+      );
+    } catch (e) {
+      setRouteTestResult(`测试失败: ${e}`);
+    } finally {
+      setRouteTesting(false);
+    }
+  }, [customConfigPath, agentsList, gatewaySelectedIdForRouteTest, routeTestChannel, routeTestBotInstance, routeTestAccount, routeTestPeer]);
+
+  const getAgentSpecialty = useCallback((agentId: string): "代码" | "表格" | "通用" => {
+    const id = agentId.toLowerCase();
+    if (id.includes("code") || id.includes("dev")) return "代码";
+    if (id.includes("sheet") || id.includes("excel") || id.includes("table")) return "表格";
+    return "通用";
+  }, []);
+
+  const enabledGatewaysByAgent = useMemo(() => {
+    const map: Record<string, GatewayBinding[]> = {};
+    for (const g of gatewayBindingsDraft || []) {
+      if (!g.enabled) continue;
+      const aid = (g.agent_id || "").trim();
+      if (!aid) continue;
+      if (!map[aid]) map[aid] = [];
+      map[aid].push(g);
+    }
+    return map;
+  }, [gatewayBindingsDraft]);
+
+  const getPreferredGatewayIdForAgent = useCallback(
+    (agentId: string): string | undefined => {
+      const list = enabledGatewaysByAgent[agentId] || [];
+      if (list.length === 0) return undefined;
+      const preferred = (preferredGatewayByAgent[agentId] || "").trim();
+      if (preferred && list.some((g) => g.gateway_id === preferred)) return preferred;
+      return list[0]?.gateway_id;
+    },
+    [enabledGatewaysByAgent, preferredGatewayByAgent]
+  );
+
+  const resolveTargetAgent = useCallback((draft: string): { targetId: string; normalizedText: string; hint: string | null } => {
+    const text = draft.trim();
+    if (!agentsList?.agents?.length) return { targetId: selectedAgentId, normalizedText: text, hint: null };
+
+    const atMatch = text.match(/^@([a-zA-Z0-9_-]+)\s+(.*)$/s);
+    if (atMatch) {
+      const target = atMatch[1];
+      const normalizedText = atMatch[2].trim();
+      const found = agentsList.agents.find((a) => a.id === target);
+      if (found) {
+        return { targetId: found.id, normalizedText, hint: `手动路由 -> ${found.id}` };
+      }
+    }
+
+    if (routeMode === "auto") {
+      const lower = text.toLowerCase();
+      const looksSheet =
+        lower.includes("excel") ||
+        lower.includes("表格") ||
+        lower.includes("透视") ||
+        lower.includes("公式") ||
+        lower.includes("csv");
+      if (looksSheet) {
+        const sheet = agentsList.agents.find((a) => getAgentSpecialty(a.id) === "表格");
+        if (sheet) {
+          return { targetId: sheet.id, normalizedText: text, hint: `自动路由 -> ${sheet.id}` };
+        }
+      }
+    }
+    return { targetId: selectedAgentId, normalizedText: text, hint: null };
+  }, [agentsList, selectedAgentId, routeMode, getAgentSpecialty]);
+
+  const getOrCreateChatSessionName = useCallback((agentId: string) => {
+    const existing = chatSessionNameByAgentRef.current[agentId];
+    if (existing) return existing;
+    const next = chatSessionModeRef.current === "synced" ? DEFAULT_SYNC_SESSION_NAME : DEFAULT_ISOLATED_SESSION_NAME;
+    chatSessionNameByAgentRef.current[agentId] = next;
+    return next;
+  }, []);
+
+  const loadAgentHistory = async (agentId: string, options?: { silent?: boolean; force?: boolean }) => {
+    if (!agentId) return;
+    const force = !!options?.force;
+    if (!force && chatHistorySuppressedByAgent[agentId]) return;
+    const silent = !!options?.silent;
+    if (!silent) {
+      setChatLoading(true);
+      setChatError(null);
+    }
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const sessionName = getOrCreateChatSessionName(agentId);
+      const gatewayId = getPreferredGatewayIdForAgent(agentId);
+      const resp = await invoke<{ session_key: string; messages: ChatUiMessage[] }>("chat_list_history", {
+        agentId,
+        sessionName,
+        gatewayId,
+        customPath: cfgPath,
+        preferGatewayDir: chatSessionModeRef.current === "synced",
+      });
+      const nextMessages = trimChatMessagesForUi((resp.messages || []).map((m) => ({ ...m, status: "sent" as const })));
+      chatCursorByAgentRef.current[agentId] = nextMessages.length;
+      setMessagesByAgent((prev) => {
+        const current = prev[agentId] || [];
+        if (isSameChatMessageList(current, nextMessages)) return prev;
+        return {
+          ...prev,
+          [agentId]: nextMessages,
+        };
+      });
+      setUnreadByAgent((prev) => {
+        if ((prev[agentId] || 0) === 0) return prev;
+        return { ...prev, [agentId]: 0 };
+      });
+    } catch (e) {
+      if (!silent) setChatError(String(e));
+    } finally {
+      if (!silent) setChatLoading(false);
+    }
+  };
+
+  const loadAgentHistoryDelta = async (agentId: string, options?: { silent?: boolean; force?: boolean }) => {
+    if (!agentId) return;
+    const force = !!options?.force;
+    if (!force && chatHistorySuppressedByAgent[agentId]) return;
+    const silent = !!options?.silent;
+    const cursor = chatCursorByAgentRef.current[agentId] || 0;
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const sessionName = getOrCreateChatSessionName(agentId);
+      const gatewayId = getPreferredGatewayIdForAgent(agentId);
+      const resp = await invoke<{ session_key: string; cursor: number; messages: ChatUiMessage[] }>(
+        "chat_list_history_delta",
+        {
+          agentId,
+          sessionName,
+          cursor,
+          gatewayId,
+          customPath: cfgPath,
+          preferGatewayDir: chatSessionModeRef.current === "synced",
+        }
+      );
+      const delta = (resp.messages || []).map((m) => ({ ...m, status: "sent" as const }));
+      chatCursorByAgentRef.current[agentId] = resp.cursor || cursor;
+      if (delta.length === 0) return;
+      startTransition(() => {
+        setMessagesByAgent((prev) => {
+          const current = prev[agentId] || [];
+          const merged = trimChatMessagesForUi(appendDeltaUniqueMessages(current, delta));
+          if (isSameChatMessageList(current, merged)) return prev;
+          return {
+            ...prev,
+            [agentId]: merged,
+          };
+        });
+      });
+    } catch (e) {
+      if (!silent) setChatError(String(e));
+    }
+  };
+
+  const setAgentSpecialtyIdentity = async (agentId: string) => {
+    if (!agentId) return;
+    const specialty = getAgentSpecialty(agentId);
+    const identity =
+      specialty === "代码"
+        ? `# 代码专家（${agentId}）
+
+- 角色：资深工程助手
+- 擅长：代码实现、调试、重构、脚本自动化
+- 风格：先给可执行方案，再解释原因
+`
+        : specialty === "表格"
+        ? `# 表格专家（${agentId}）
+
+- 角色：数据与表格分析助手
+- 擅长：Excel/CSV 清洗、公式设计、透视分析、报表结论
+- 风格：结构化步骤 + 可复用模板
+`
+        : `# 通用助手（${agentId}）
+
+- 角色：通用工作助手
+- 风格：清晰、简洁、结果导向
+`;
+    try {
+      await invoke("write_workspace_file", {
+        agentId,
+        relativePath: "IDENTITY.md",
+        content: identity,
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+      });
+    } catch {
+      // ignore identity write error, not blocking chat
+    }
+  };
+
+  const handleSelectAgentForChat = useCallback(
+    async (agentId: string) => {
+      setSelectedAgentId(agentId);
+      setUnreadByAgent((prev) => ({ ...prev, [agentId]: 0 }));
+      void setAgentSpecialtyIdentity(agentId);
+      if (!chatHistorySuppressedRef.current[agentId]) {
+        await loadAgentHistory(agentId);
+      }
+    },
+    [loadAgentHistory, setAgentSpecialtyIdentity]
+  );
+
+  const handleSendChat = useCallback(async (draftText?: string): Promise<boolean> => {
+    if (chatSending || chatSendLockRef.current) return false;
+    markChatInteracting(1500);
+    const raw = (draftText ?? chatDraft).trim();
+    if (!raw) return false;
+    const { targetId, normalizedText, hint } = resolveTargetAgent(raw);
+    if (!targetId || !normalizedText) return false;
+    const dedupText = normalizeChatText(normalizedText);
+    const lastSent = lastSentFingerprintRef.current[targetId];
+    if (lastSent && lastSent.text === dedupText && Date.now() - lastSent.at < 8000) {
+      setRouteHint("已拦截短时间重复发送（同 Agent 同内容）。");
+      return false;
+    }
+    lastSentFingerprintRef.current[targetId] = { text: dedupText, at: Date.now() };
+    chatSendLockRef.current = true;
+    setChatHistorySuppressedByAgent((prev) => {
+      if (!prev[targetId]) return prev;
+      return { ...prev, [targetId]: false };
+    });
+    if (draftText === undefined) setChatDraft("");
+    setChatSending(true);
+    setChatError(null);
+
+    const userMsg: ChatUiMessage = {
+      id: `local-user-${Date.now()}`,
+      role: "user",
+      text: normalizedText,
+      status: "sending",
+    };
+    const thinkingMsg: ChatUiMessage = {
+      id: `local-assistant-thinking-${Date.now()}`,
+      role: "assistant",
+      text: "思考中...",
+      status: "sending",
+    };
+    setMessagesByAgent((prev) => ({
+      ...prev,
+      [targetId]: trimChatMessagesForUi([...(prev[targetId] || []), userMsg, thinkingMsg]),
+    }));
+
+    const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+    const preferGatewayDir = chatSessionModeRef.current === "synced";
+    const sessionName = getOrCreateChatSessionName(targetId);
+    const targetGatewayId = getPreferredGatewayIdForAgent(targetId);
+    const routeHintText = hint ? `${hint}${targetGatewayId ? ` · 网关 ${targetGatewayId}` : ""}` : (targetGatewayId ? `网关 ${targetGatewayId}` : null);
+    setRouteHint(routeHintText);
+    try {
+      if (chatExecutionMode === "orchestrator") {
+        const task = await invoke<CpOrchestratorTask>("orchestrator_submit_task", {
+          title: `聊天流程 · ${targetId}`,
+          input: normalizedText,
+          customPath: cfgPath,
+        });
+        setCpTasks((prev) => [task, ...prev]);
+
+        // 编排后继续真实执行：把任务转发给被分配的执行 Agent，拿到真实回答再回填。
+        const executionAgent =
+          task.steps.find((s) => s.name === "task_execution")?.assigned_agent ||
+          task.steps.find((s) => s.assigned_agent !== "orchestrator" && s.assigned_agent !== "verifier")?.assigned_agent ||
+          targetId;
+        const executionSession = getOrCreateChatSessionName(executionAgent);
+        const executionGatewayId = getPreferredGatewayIdForAgent(executionAgent);
+        await invoke("chat_send", {
+          agentId: executionAgent,
+          sessionName: executionSession,
+          text: normalizedText,
+          gatewayId: executionGatewayId,
+          customPath: cfgPath,
+          preferGatewayDir,
+        });
+
+        let finalAnswer = "";
+        for (let i = 0; i < 12; i++) {
+          await new Promise((r) => setTimeout(r, 1200));
+          const resp = await invoke<{ session_key: string; cursor: number; messages: ChatUiMessage[] }>(
+            "chat_list_history_delta",
+            {
+              agentId: executionAgent,
+              sessionName: executionSession,
+              cursor: chatCursorByAgentRef.current[executionAgent] || 0,
+              gatewayId: executionGatewayId,
+              customPath: cfgPath,
+              preferGatewayDir,
+            }
+          );
+          chatCursorByAgentRef.current[executionAgent] = resp.cursor || chatCursorByAgentRef.current[executionAgent] || 0;
+          const delta = (resp.messages || []).map((m) => ({ ...m, status: "sent" as const }));
+          const assistantDelta = delta.filter((m) => m.role === "assistant" && normalizeChatText(m.text).length > 0);
+          if (assistantDelta.length > 0) {
+            finalAnswer = assistantDelta[assistantDelta.length - 1].text;
+            break;
+          }
+        }
+        if (!finalAnswer) {
+          const full = await invoke<{ session_key: string; messages: ChatUiMessage[] }>("chat_list_history", {
+            agentId: executionAgent,
+            sessionName: executionSession,
+            gatewayId: executionGatewayId,
+            customPath: cfgPath,
+            preferGatewayDir,
+          });
+          const all = (full.messages || []).map((m) => ({ ...m, status: "sent" as const }));
+          const lastAssistant = [...all].reverse().find((m) => m.role === "assistant" && normalizeChatText(m.text).length > 0);
+          if (lastAssistant) finalAnswer = lastAssistant.text;
+        }
+
+        const flowSummary = `【流程】编排:${targetId} -> 执行:${executionAgent}${executionGatewayId ? `@${executionGatewayId}` : ""} -> 验收:${
+          task.verifier ? `${task.verifier.passed ? "通过" : "未通过"}(${task.verifier.score.toFixed(2)})` : "无"
+        }${task.route_decision ? ` -> 意图:${task.route_decision.intent}` : ""}`;
+
+        const assistantMsg: ChatUiMessage = {
+          id: `local-assistant-flow-${Date.now()}`,
+          role: "assistant",
+          text: finalAnswer
+            ? `${flowSummary}\n${finalAnswer}`
+            : `${flowSummary}\n暂未获取到最终回答（可切到“直连对话”重试）。`,
+          status: "sent",
+        };
+
+        setMessagesByAgent((prev) => ({
+          ...prev,
+          [targetId]: trimChatMessagesForUi(
+            (prev[targetId] || [])
+              .map((m) => (m.id === userMsg.id ? { ...m, status: "sent" as const } : m))
+              .filter((m) => m.id !== thinkingMsg.id)
+              .concat(assistantMsg)
+          ),
+        }));
+        if (targetId !== selectedAgentId) {
+          setUnreadByAgent((prev) => ({ ...prev, [targetId]: (prev[targetId] || 0) + 1 }));
+        }
+        return true;
+      }
+
+      await invoke("chat_send", {
+        agentId: targetId,
+        sessionName,
+        text: normalizedText,
+        gatewayId: targetGatewayId,
+        customPath: cfgPath,
+        preferGatewayDir,
+      });
+      setMessagesByAgent((prev) => ({
+        ...prev,
+        [targetId]: (prev[targetId] || []).map((m) =>
+          m.id === userMsg.id ? { ...m, status: "sent" } : m
+        ),
+      }));
+
+      // 发送成功后走后端增量接口，低频拉取减少卡顿
+      let gotAssistant = false;
+      for (let i = 0; i < 12; i++) {
+        await new Promise((r) => setTimeout(r, 1200));
+        const resp = await invoke<{ session_key: string; cursor: number; messages: ChatUiMessage[] }>(
+          "chat_list_history_delta",
+          {
+            agentId: targetId,
+            sessionName,
+            cursor: chatCursorByAgentRef.current[targetId] || 0,
+            gatewayId: targetGatewayId,
+            customPath: cfgPath,
+            preferGatewayDir,
+          }
+        );
+        chatCursorByAgentRef.current[targetId] = resp.cursor || chatCursorByAgentRef.current[targetId] || 0;
+        const delta = (resp.messages || []).map((m) => ({ ...m, status: "sent" as const }));
+        if (delta.length > 0) {
+          const hasAssistantReply = delta.some((m) => m.role === "assistant");
+          startTransition(() => {
+            setMessagesByAgent((prev) => {
+              const local = prev[targetId] || [];
+              const merged = trimChatMessagesForUi(
+                appendDeltaUniqueMessages(local, delta, { removeMessageId: thinkingMsg.id })
+              );
+              if (isSameChatMessageList(local, merged)) return prev;
+              return {
+                ...prev,
+                [targetId]: merged,
+              };
+            });
+          });
+          if (hasAssistantReply) {
+            gotAssistant = true;
+            break;
+          }
+        }
+      }
+      if (!gotAssistant) {
+        const full = await invoke<{ session_key: string; messages: ChatUiMessage[] }>("chat_list_history", {
+          agentId: targetId,
+          sessionName,
+          gatewayId: targetGatewayId,
+          customPath: cfgPath,
+          preferGatewayDir,
+        });
+        const all = (full.messages || []).map((m) => ({ ...m, status: "sent" as const }));
+        const hasAssistantReply = all.some((m) => m.role === "assistant");
+        startTransition(() => {
+          setMessagesByAgent((prev) => {
+            const local = prev[targetId] || [];
+            const merged = trimChatMessagesForUi(
+              appendDeltaUniqueMessages(local, all, { removeMessageId: thinkingMsg.id })
+            );
+            if (isSameChatMessageList(local, merged)) return prev;
+            return {
+              ...prev,
+              [targetId]: merged,
+            };
+          });
+        });
+        gotAssistant = hasAssistantReply;
+      }
+
+      // 没拿到新消息时，移除占位“思考中...”
+      setMessagesByAgent((prev) => ({
+        ...prev,
+        [targetId]: (prev[targetId] || []).filter((m) => m.id !== thinkingMsg.id),
+      }));
+
+      if (targetId !== selectedAgentId) {
+        setUnreadByAgent((prev) => ({ ...prev, [targetId]: (prev[targetId] || 0) + 1 }));
+      }
+      return true;
+    } catch (e) {
+      setChatError(String(e));
+      setMessagesByAgent((prev) => ({
+        ...prev,
+        [targetId]: (prev[targetId] || [])
+          .filter((m) => m.id !== thinkingMsg.id)
+          .map((m) => (m.id === userMsg.id ? { ...m, status: "failed" } : m)),
+      }));
+      return false;
+    } finally {
+      setChatSending(false);
+      chatSendLockRef.current = false;
+    }
+  }, [chatSending, chatDraft, resolveTargetAgent, selectedAgentId, chatExecutionMode, customConfigPath, getOrCreateChatSessionName, markChatInteracting, getPreferredGatewayIdForAgent]);
+
+  const handleAbortChat = useCallback(async () => {
+    if (!selectedAgentId) return;
+    try {
+      const sessionName = getOrCreateChatSessionName(selectedAgentId);
+      await invoke("chat_abort", {
+        agentId: selectedAgentId,
+        sessionName,
+        gatewayId: getPreferredGatewayIdForAgent(selectedAgentId),
+        customPath: normalizeConfigPath(customConfigPath) || undefined,
+        preferGatewayDir: chatSessionModeRef.current === "synced",
+      });
+      await loadAgentHistory(selectedAgentId);
+    } catch (e) {
+      setChatError(String(e));
+    }
+  }, [selectedAgentId, customConfigPath, getOrCreateChatSessionName, getPreferredGatewayIdForAgent]);
+
+  const handleNewSessionLocal = useCallback(() => {
+    if (!selectedAgentId) return;
+    if (chatSessionModeRef.current === "synced") {
+      // 同步模式下保持 main，只清本地视图。
+      chatSessionNameByAgentRef.current[selectedAgentId] = DEFAULT_SYNC_SESSION_NAME;
+      chatCursorByAgentRef.current[selectedAgentId] = (messagesByAgentRef.current[selectedAgentId] || []).length;
+      setRouteHint("已清空本地视图；当前为同步模式，与网页/Telegram 共用 main 会话。");
+    } else {
+      // 隔离模式下切换到新的本地会话桶，避免串到三端共享会话。
+      chatSessionNameByAgentRef.current[selectedAgentId] = `${DEFAULT_ISOLATED_SESSION_NAME}-${Date.now().toString(36)}`;
+      chatCursorByAgentRef.current[selectedAgentId] = 0;
+      setRouteHint("已切换到新的隔离会话（仅客户端可见）。");
+    }
+    setChatHistorySuppressedByAgent((prev) => ({ ...prev, [selectedAgentId]: true }));
+    setMessagesByAgent((prev) => ({ ...prev, [selectedAgentId]: [] }));
+  }, [selectedAgentId]);
+
+  const handleChatViewportScroll = useCallback(
+    (evt: UIEvent<HTMLDivElement>) => {
+      if (!selectedAgentId) return;
+      const viewport = evt.currentTarget;
+      const distanceToBottom = viewport.scrollHeight - (viewport.scrollTop + viewport.clientHeight);
+      chatStickBottomByAgentRef.current[selectedAgentId] = distanceToBottom <= 40;
+      if (viewport.scrollTop > 100) return;
+      const total = (messagesByAgentRef.current[selectedAgentId] || []).length;
+      const currentLimit = chatRenderLimitByAgentRef.current[selectedAgentId] || CHAT_RENDER_BATCH;
+      if (currentLimit >= total) return;
+      const prevHeight = viewport.scrollHeight;
+      const prevTop = viewport.scrollTop;
+      const nextLimit = Math.min(total, currentLimit + CHAT_RENDER_BATCH);
+      setChatRenderLimitByAgent((prev) => ({ ...prev, [selectedAgentId]: nextLimit }));
+      window.requestAnimationFrame(() => {
+        const el = chatViewportRef.current;
+        if (!el) return;
+        const nextHeight = el.scrollHeight;
+        el.scrollTop = prevTop + (nextHeight - prevHeight);
+      });
+    },
+    [selectedAgentId]
+  );
 
   const refreshMemoryCenterStatus = async () => {
     setMemoryLoading(true);
@@ -2036,6 +4775,399 @@ function App() {
     }
   };
 
+  const loadControlPlaneOverview = useCallback(async () => {
+    setCpLoading(true);
+    setCpResult(null);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const [tasks, graphs, tickets, memories, snapshotsList, prompts, capabilities, roles, audits, cost] = await Promise.all([
+        invoke<CpOrchestratorTask[]>("orchestrator_list_tasks", { customPath: cfgPath }),
+        invoke<CpSkillGraph[]>("skill_graph_list", { customPath: cfgPath }),
+        invoke<CpTicket[]>("ticket_list", { customPath: cfgPath }),
+        invoke<CpMemoryRecord[]>("memory_query_layered", { layer: undefined, query: undefined, customPath: cfgPath }),
+        invoke<CpSnapshot[]>("replay_snapshot_list", { customPath: cfgPath }),
+        invoke<CpPromptPolicyVersion[]>("promptops_list", { customPath: cfgPath }),
+        invoke<CpAgentCapability[]>("capabilities_list", { customPath: cfgPath }),
+        invoke<CpRoleBinding[]>("enterprise_list_roles", { customPath: cfgPath }),
+        invoke<CpAuditEvent[]>("enterprise_list_audit", { category: undefined, customPath: cfgPath }),
+        invoke<CpCostSummary>("enterprise_cost_summary", { customPath: cfgPath }),
+      ]);
+      setCpTasks(tasks || []);
+      setCpGraphs(graphs || []);
+      setCpTickets(tickets || []);
+      setCpMemory(memories || []);
+      setCpSnapshots(snapshotsList || []);
+      setCpPrompts(prompts || []);
+      setCpCapabilities(capabilities || []);
+      setCpRoles(roles || []);
+      setCpAudit(audits || []);
+      setCpCost(cost || null);
+      if (!cpSelectedGraphId && (graphs || []).length > 0) {
+        setCpSelectedGraphId((graphs || [])[0].id);
+      }
+    } catch (e) {
+      setCpResult(`读取控制平面失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  }, [customConfigPath, cpSelectedGraphId]);
+
+  const parseJsonInput = <T,>(raw: string, fallback: T): T => {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed as T;
+    } catch {
+      return fallback;
+    }
+  };
+
+  const handleSeedControlPlane = async () => {
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const result = await invoke<string>("control_plane_seed_demo", { customPath: cfgPath });
+      setCpResult(result);
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`初始化失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleOrchestratorSubmit = async () => {
+    if (!cpTaskInput.trim()) return;
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const task = await invoke<CpOrchestratorTask>("orchestrator_submit_task", {
+        title: cpTaskTitle.trim() || "综合任务",
+        input: cpTaskInput.trim(),
+        customPath: cfgPath,
+      });
+      setCpTasks((prev) => [task, ...prev]);
+      setCpTaskInput("");
+      setCpResult(`任务已提交: ${task.id}`);
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`提交任务失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleRetryTaskStep = async (taskId: string, stepId: string) => {
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const task = await invoke<CpOrchestratorTask>("orchestrator_retry_step", {
+        taskId,
+        stepId,
+        customPath: cfgPath,
+      });
+      setCpTasks((prev) => prev.map((t) => (t.id === task.id ? task : t)));
+      setCpResult(`步骤重试成功: ${stepId}`);
+    } catch (e) {
+      setCpResult(`步骤重试失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleVerifierCheck = async () => {
+    setCpLoading(true);
+    try {
+      const constraints = cpVerifierConstraints
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const report = await invoke<CpVerifierReport>("verifier_check_output", {
+        output: cpVerifierOutput,
+        constraints,
+      });
+      setCpVerifierReport(report);
+      setCpResult(report.passed ? "验收通过" : "验收不通过，建议回炉");
+    } catch (e) {
+      setCpResult(`验收失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleSaveSkillGraph = async () => {
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const nodes = parseJsonInput<CpGraphNode[]>(cpGraphNodesJson, []);
+      const edges = parseJsonInput<CpGraphEdge[]>(cpGraphEdgesJson, []);
+      const graph = await invoke<CpSkillGraph>("skill_graph_save", {
+        name: cpGraphName,
+        nodes,
+        edges,
+        customPath: cfgPath,
+      });
+      setCpResult(`技能图已保存: ${graph.id}`);
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`保存技能图失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleExecuteSkillGraph = async () => {
+    if (!cpSelectedGraphId) return;
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const task = await invoke<CpOrchestratorTask>("skill_graph_execute", {
+        graphId: cpSelectedGraphId,
+        input: cpTaskInput.trim() || "执行技能流水线",
+        customPath: cfgPath,
+      });
+      setCpTasks((prev) => [task, ...prev]);
+      setCpResult(`技能流水线执行完成: ${task.id}`);
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`执行技能图失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleCreateTicket = async () => {
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const payload = parseJsonInput<Record<string, unknown>>(cpTicketPayload, {});
+      await invoke<CpTicket>("ticket_ingest", {
+        channel: cpTicketChannel,
+        externalRef: cpTicketExternalRef,
+        title: cpTicketTitle,
+        payload,
+        customPath: cfgPath,
+      });
+      setCpResult("工单已入池");
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`入池失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleUpdateTicket = async (ticketId: string, status: string) => {
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      await invoke<CpTicket>("ticket_update", {
+        ticketId,
+        status,
+        assignee: selectedAgentId || undefined,
+        customPath: cfgPath,
+      });
+      setCpResult(`工单已更新为 ${status}`);
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`更新工单失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleMemoryWriteLayered = async () => {
+    if (!cpMemoryContent.trim()) return;
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      await invoke<CpMemoryRecord>("memory_write_layered", {
+        layer: cpMemoryLayer,
+        scope: cpMemoryScope,
+        content: cpMemoryContent,
+        rationale: cpMemoryRationale,
+        tags: cpMemoryTags.split(",").map((x) => x.trim()).filter(Boolean),
+        customPath: cfgPath,
+      });
+      setCpMemoryContent("");
+      setCpResult("分层记忆已写入");
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`写入分层记忆失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleSandboxPreview = async () => {
+    setCpLoading(true);
+    try {
+      const preview = await invoke<CpSandboxPreview>("sandbox_preview_action", {
+        actionType: cpSandboxActionType,
+        resource: cpSandboxResource,
+      });
+      setCpSandboxPreview(preview);
+      setCpResult("沙箱预览已生成");
+    } catch (e) {
+      setCpResult(`沙箱预览失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleSandboxExecute = async () => {
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const out = await invoke<string>("sandbox_execute_action", {
+        actionType: cpSandboxActionType,
+        resource: cpSandboxResource,
+        approved: cpSandboxApproved,
+        customPath: cfgPath,
+      });
+      setCpResult(out);
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`沙箱执行失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleDebateRun = async () => {
+    setCpLoading(true);
+    try {
+      const res = await invoke<CpDebateResult>("debate_run", { task: cpDebateTask });
+      setCpDebateResult(res);
+      setCpResult("辩论完成");
+    } catch (e) {
+      setCpResult(`辩论失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleCreateSnapshot = async () => {
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const result = await invoke<CpSnapshot>("replay_snapshot_create", {
+        taskId: cpSnapshotTaskId || cpTasks[0]?.id || "manual-task",
+        input: cpSnapshotInput || cpTaskInput || "snapshot input",
+        toolCalls: cpSnapshotTools.split(",").map((x) => x.trim()).filter(Boolean),
+        config: parseJsonInput<Record<string, unknown>>(cpSnapshotConfig, {}),
+        customPath: cfgPath,
+      });
+      setCpResult(`快照已创建: ${result.id}`);
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`创建快照失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleReplaySnapshot = async (snapshotId: string) => {
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const task = await invoke<CpOrchestratorTask>("replay_snapshot_replay", {
+        snapshotId,
+        customPath: cfgPath,
+      });
+      setCpTasks((prev) => [task, ...prev]);
+      setCpResult(`快照回放完成: ${task.id}`);
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`回放失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleCreatePromptVersion = async () => {
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      await invoke<CpPromptPolicyVersion>("promptops_create_version", {
+        name: cpPromptName,
+        rules: parseJsonInput<Record<string, string>>(cpPromptRules, {}),
+        trafficPercent: cpPromptTraffic,
+        customPath: cfgPath,
+      });
+      setCpResult("Prompt 策略版本已创建");
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`创建 Prompt 版本失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleActivatePromptVersion = async (versionId: string) => {
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      const versions = await invoke<CpPromptPolicyVersion[]>("promptops_activate", {
+        versionId,
+        customPath: cfgPath,
+      });
+      setCpPrompts(versions || []);
+      setCpResult(`策略已激活: ${versionId}`);
+    } catch (e) {
+      setCpResult(`激活失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleSetRoleBinding = async () => {
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      await invoke<CpRoleBinding>("enterprise_set_role", {
+        userId: cpRoleUserId,
+        role: cpRoleName,
+        customPath: cfgPath,
+      });
+      setCpResult("角色绑定已更新");
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`设置角色失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  const handleUpsertCapability = async () => {
+    if (!cpCapAgentId.trim()) return;
+    setCpLoading(true);
+    try {
+      const cfgPath = normalizeConfigPath(customConfigPath) || undefined;
+      await invoke<CpAgentCapability>("capabilities_upsert", {
+        agentId: cpCapAgentId.trim(),
+        specialty: cpCapSpecialty.trim() || "general",
+        primaryModel: cpCapPrimaryModel.trim() || "general-balanced",
+        fallbackModel: cpCapFallbackModel.trim() || undefined,
+        tools: cpCapTools.split(",").map((x) => x.trim()).filter(Boolean),
+        strengths: cpCapStrengths.split(",").map((x) => x.trim()).filter(Boolean),
+        maxCostTier: cpCapCostTier.trim() || "medium",
+        customPath: cfgPath,
+      });
+      setCpResult("能力画像已更新");
+      await loadControlPlaneOverview();
+    } catch (e) {
+      setCpResult(`能力画像更新失败: ${e}`);
+    } finally {
+      setCpLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (step !== 4) return;
+    if (tuningSection !== "control") return;
+    void loadControlPlaneOverview();
+  }, [step, tuningSection, loadControlPlaneOverview]);
+
   const tuningPromptPreview = [
     `场景模板: ${scenarioPreset}`,
     `回答长度: ${tuneLength}`,
@@ -2057,33 +5189,9 @@ function App() {
     }
     localStorage.setItem("openclaw_easy_onboarding_done", "1");
     setWizardOpen(false);
-    setStep(4);
+    handleStepChange(4);
     setSelfCheckResult("已完成首次向导：建议点击“一键体检”确认环境状态。");
   };
-
-  const globalGatewayState: HealthState = selfCheckItems.find((x) => x.key === "gateway")?.status === "ok"
-    ? "ok"
-    : selfCheckItems.find((x) => x.key === "gateway")
-    ? "warn"
-    : "unknown";
-  const globalModelState: HealthState = runtimeProbeResult?.includes("失败")
-    ? "error"
-    : runtimeProbeResult
-    ? "ok"
-    : "unknown";
-  const globalMemoryState: HealthState = memoryStatus?.enabled
-    ? memoryStatus.memory_file_count > 0
-      ? "ok"
-      : "warn"
-    : "warn";
-  const globalSkillsState: HealthState = skillsCatalog.length
-    ? skillsCatalog.some((s) => s.eligible)
-      ? "ok"
-      : "warn"
-    : "unknown";
-  const globalChannelState: HealthState = telegramHealth.gateway === "ok" || feishuHealth.gateway === "ok" || qqHealth.gateway === "ok" || discordHealth.gateway === "ok" || dingtalkHealth.gateway === "ok"
-    ? "ok"
-    : "warn";
 
   const latestIssueText =
     (selfCheckResult || "") +
@@ -2093,12 +5201,83 @@ function App() {
     (modelTestResult || "") +
     "\n" +
     (skillsResult || "");
+  const chatAgents = agentsList?.agents ?? EMPTY_AGENTS;
+  const selectedChatMessages = selectedAgentId ? messagesByAgent[selectedAgentId] || EMPTY_CHAT_MESSAGES : EMPTY_CHAT_MESSAGES;
+  const selectedChatRenderLimit = selectedAgentId ? chatRenderLimitByAgent[selectedAgentId] || CHAT_RENDER_BATCH : CHAT_RENDER_BATCH;
   const lowerIssue = latestIssueText.toLowerCase();
   const suggestModelFix = lowerIssue.includes("model") || lowerIssue.includes("401") || lowerIssue.includes("api key");
-  const suggestGatewayFix = lowerIssue.includes("token mismatch") || lowerIssue.includes("gateway") || lowerIssue.includes("端口");
+  const suggestGatewayFix =
+    lowerIssue.includes("token mismatch") ||
+    lowerIssue.includes("gateway 启动失败") ||
+    lowerIssue.includes("gateway start failed") ||
+    lowerIssue.includes("端口占用") ||
+    lowerIssue.includes("address already in use");
   const suggestSkillsFix = lowerIssue.includes("skills") || lowerIssue.includes("缺失依赖") || lowerIssue.includes("bins:");
-  const configGuardItem = selfCheckItems.find((x) => x.key === "config" && x.status !== "ok");
-  const versionGuardItem = selfCheckItems.find((x) => x.key === "version" && x.status !== "ok");
+  const serviceStartSummary = useMemo(() => {
+    if (!startResult) return "";
+    const lines = startResult
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length <= 6) return lines.join("\n");
+    return ["...", ...lines.slice(-6)].join("\n");
+  }, [startResult]);
+  const serviceQueueSummary = useMemo(() => {
+    const running = queueTasks.filter((t) => t.status === "running").length;
+    const queued = queueTasks.filter((t) => t.status === "queued").length;
+    const failed = queueTasks.filter((t) => t.status === "error").length;
+    const cancelled = queueTasks.filter((t) => t.status === "cancelled").length;
+    return { running, queued, failed, cancelled, total: queueTasks.length };
+  }, [queueTasks]);
+  const serviceRecentQueueTasks = useMemo(() => queueTasks.slice().reverse().slice(0, 5), [queueTasks]);
+  const skillsLogText = useMemo(() => {
+    const progressText = skillsRepairProgressLog.join("\n").trim();
+    const resultText = (skillsResult || "").trim();
+    if (progressText && resultText) return `${progressText}\n\n----- 结果日志 -----\n${resultText}`;
+    if (progressText) return progressText;
+    if (resultText) return resultText;
+    return "暂无日志。点击“安装选中”或“修复缺失依赖（选中）”后，这里会实时显示执行输出。";
+  }, [skillsRepairProgressLog, skillsResult]);
+
+  const toggleSkillSelection = useCallback((name: string, checked: boolean) => {
+    setSelectedSkills((prev) => {
+      if (prev[name] === checked) return prev;
+      return { ...prev, [name]: checked };
+    });
+  }, []);
+
+  const handleCopyManualHint = useCallback(async (skill: SkillCatalogItem) => {
+    const hint = buildManualFixHint(skill);
+    try {
+      await navigator.clipboard.writeText(hint);
+      setSkillsResult(`已复制 ${skill.name} 的手动修复指引`);
+    } catch {
+      setSkillsResult(`复制失败，请手动复制：\n\n${hint}`);
+    }
+  }, []);
+
+  const handleStepChange = useCallback((nextStep: number) => {
+    startTransition(() => {
+      setStep(nextStep);
+    });
+  }, []);
+
+  const handleToggleServicePanel = useCallback(() => {
+    setServicePanelExpanded((prev) => {
+      const next = !prev;
+      setServicePanelMounted(next);
+      return next;
+    });
+  }, []);
+
+  const heavyPanelStyle = useMemo(
+    () =>
+      ({
+        contentVisibility: "auto",
+        containIntrinsicSize: "520px",
+      }) as CSSProperties,
+    []
+  );
 
   const envReady = nodeCheck?.ok && npmCheck?.ok;
   const canProceed = step === 0 ? envReady : true;
@@ -2119,7 +5298,7 @@ function App() {
         {STEPS.map((s, i) => (
           <button
             key={s.id}
-            onClick={() => setStep(s.id)}
+            onClick={() => handleStepChange(s.id)}
             className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition ${
               step === s.id
                 ? "bg-emerald-600 text-white"
@@ -2135,30 +5314,15 @@ function App() {
         ))}
       </div>
 
-      <div className="px-6 py-3 border-b border-slate-700 bg-slate-900/40 flex flex-wrap items-center gap-2 text-xs">
-        <span className="text-slate-400">当前可用性：</span>
-        <MiniLamp label="模型" state={globalModelState} />
-        <MiniLamp label="网关" state={globalGatewayState} />
-        <MiniLamp label="记忆" state={globalMemoryState} />
-        <MiniLamp label="Skills" state={globalSkillsState} />
-        <MiniLamp label="渠道" state={globalChannelState} />
-        <button
-          onClick={handleTuningHealthCheck}
-          className="ml-auto px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded"
-        >
-          快速体检
-        </button>
-      </div>
-
       {/* Content */}
-      <main className="flex-1 p-6 overflow-auto">
+      <main className="flex-1 p-6 overflow-auto flex flex-col">
         {(suggestModelFix || suggestGatewayFix || suggestSkillsFix) && (
           <div className="w-full max-w-[1200px] mx-auto mb-4 rounded-lg border border-amber-700 bg-amber-900/20 p-3 text-xs space-y-2">
             <p className="text-amber-200">检测到可能异常，建议下一步：</p>
             <div className="flex flex-wrap gap-2">
               {suggestModelFix && (
                 <button
-                  onClick={() => setStep(2)}
+                  onClick={() => handleStepChange(2)}
                   className="px-2 py-1 bg-sky-700 hover:bg-sky-600 rounded"
                 >
                   去模型配置
@@ -2174,7 +5338,7 @@ function App() {
               )}
               {suggestSkillsFix && (
                 <button
-                  onClick={() => setStep(3)}
+                  onClick={() => handleStepChange(3)}
                   className="px-2 py-1 bg-amber-700 hover:bg-amber-600 rounded"
                 >
                   去 Skills 修复
@@ -2697,10 +5861,10 @@ function App() {
           </div>
         )}
 
-        {/* Step 3: 启动服务 */}
+        {/* Step 3: 服务与对话 */}
         {step === 3 && (
-          <div className="w-full max-w-[1200px] mx-auto space-y-6">
-            <h2 className="text-lg font-semibold">启动服务</h2>
+          <div className="w-full max-w-[1200px] mx-auto space-y-6 order-2">
+            <h2 className="text-lg font-semibold">服务与对话</h2>
             {customConfigPath && (
               <div className="bg-slate-800/50 rounded-lg p-3 text-sm text-slate-400">
                 配置路径: {normalizeConfigPath(customConfigPath)}
@@ -2730,255 +5894,2495 @@ function App() {
                 </p>
               </div>
             )}
-            <p className="text-slate-400">
-              启动 OpenClaw Gateway，AI 助手将在后台运行。渠道配置已支持图形化，不再依赖黑色终端窗口。
-            </p>
-            <button
-              onClick={handleStart}
-              disabled={starting}
-              className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg font-medium"
-            >
-              {starting ? (
-                <>
-                  <Loader2 className="w-5 h-5 animate-spin" />
-                  启动中...
-                </>
-              ) : (
-                <>
-                  <Play className="w-5 h-5" />
-                  启动 Gateway 并自动打开对话网页
-                </>
-              )}
-            </button>
-            <button
-              onClick={handleOpenDashboard}
-              className="flex items-center gap-2 px-6 py-3 bg-sky-700 hover:bg-sky-600 rounded-lg font-medium text-sm"
-            >
-              <ExternalLink className="w-5 h-5" />
-              打开对话界面（带 token）
-            </button>
-            <details className="bg-slate-900/40 border border-slate-700 rounded-lg p-3">
-              <summary className="cursor-pointer text-slate-300 text-sm">高级启动/修复选项（一般不用）</summary>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <button
-                  onClick={handleResetGatewayAuth}
-                  disabled={starting}
-                  className="flex items-center gap-2 px-4 py-2 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs"
-                >
-                  <Wrench className="w-4 h-4" />
-                  强制重置认证/修复UI并重启
-                </button>
-                <button
-                  onClick={handleStartForeground}
-                  className="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded text-xs"
-                >
-                  <Wrench className="w-4 h-4" />
-                  前台启动 Gateway
-                </button>
-                <button
-                  onClick={handleOpenSkillsOnboard}
-                  disabled={onboardCliLoading}
-                  className="flex items-center gap-2 px-4 py-2 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-xs"
-                >
-                  {onboardCliLoading ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      打开中...
-                    </>
-                  ) : (
-                    <>
-                      <Wrench className="w-4 h-4" />
-                      安装/更新官方 Skills
-                    </>
-                  )}
-                </button>
-              </div>
-            </details>
-            {startResult && (
-              <pre className="bg-slate-800 rounded-lg p-4 text-sm overflow-auto max-h-40">
-                {startResult}
-              </pre>
-            )}
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
-              <p className="font-medium text-slate-200">任务队列中心（防卡死）</p>
-              {queueTasks.length === 0 ? (
-                <p className="text-xs text-slate-500">暂无任务。重操作会进入队列并串行执行。</p>
-              ) : (
-                <div className="space-y-2 max-h-44 overflow-auto">
-                  {queueTasks
-                    .slice()
-                    .reverse()
-                    .map((t) => (
-                      <div key={t.id} className="bg-slate-900/40 border border-slate-700 rounded p-2">
-                        <div className="flex items-center justify-between gap-2">
-                          <p className="text-xs text-slate-200">
-                            {t.name}
-                            <span className="ml-2 text-slate-400">[{t.status}]</span>
-                          </p>
-                          <div className="flex gap-1">
-                            {(t.status === "queued" || t.status === "running") && (
-                              <button
-                                onClick={() => cancelTask(t.id)}
-                                className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
-                              >
-                                取消
-                              </button>
-                            )}
-                            {(t.status === "error" || t.status === "cancelled") &&
-                              t.retryCount < t.maxRetries && (
-                                <button
-                                  onClick={() => retryTask(t.id)}
-                                  className="px-2 py-1 bg-amber-700 hover:bg-amber-600 rounded text-[11px]"
-                                >
-                                  重试
-                                </button>
-                              )}
-                          </div>
-                        </div>
-                        {t.error && <p className="text-[11px] text-rose-300 mt-1">{t.error}</p>}
-                      </div>
-                    ))}
-                </div>
+            <div className="bg-slate-800/40 border border-slate-700 rounded-lg p-3 transition-colors duration-150 hover:border-slate-600">
+              <button
+                onClick={handleToggleServicePanel}
+                className="w-full text-left flex items-center justify-between text-sm text-slate-200"
+              >
+                <span>服务卡片（自检 / 修复）</span>
+                <span className="text-xs text-slate-400 transition-all duration-150">{servicePanelExpanded ? "收起" : "展开"}</span>
+              </button>
+              {!servicePanelExpanded && (
+                <p className="text-xs text-slate-500 mt-2">
+                  默认收起以减少渲染压力，聊天区优先显示在上方。
+                </p>
               )}
             </div>
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="font-medium text-slate-200">安装后自检总控页</p>
-                <div className="flex gap-2">
-                  <button
-                    onClick={runSelfCheck}
-                    disabled={selfCheckLoading}
-                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
-                  >
-                    {selfCheckLoading ? "检测中..." : "一键自检"}
-                  </button>
-                  <button
-                    onClick={handleMinimalRepair}
-                    className="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 rounded text-xs"
-                  >
-                    一键最小修复
-                  </button>
-                </div>
+            {servicePanelMounted && servicePanelExpanded && (chatInteracting || chatSending) && (
+              <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-3 text-xs text-slate-400">
+                聊天交互中，服务区暂时降载以保证输入、等待回复与滚动流畅度；本轮对话结束后自动恢复显示。
               </div>
-              {(configGuardItem || versionGuardItem) && (
-                <div className="rounded border border-amber-700 bg-amber-900/20 p-3 text-xs space-y-2">
-                  <p className="text-amber-200">检测到版本/配置一致性异常，建议先处理再继续调教。</p>
-                  {configGuardItem && <p className="text-slate-300">配置异常：{configGuardItem.detail}</p>}
-                  {versionGuardItem && <p className="text-slate-300">版本提示：{versionGuardItem.detail}</p>}
-                  <div className="flex flex-wrap gap-2">
-                    {configGuardItem && (
-                      <button
-                        onClick={() => handleFixSelfCheck("config")}
-                        disabled={selfCheckFixingKey === "config"}
-                        className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded"
-                      >
-                        {selfCheckFixingKey === "config" ? "修复中..." : "修复配置一致性"}
-                      </button>
-                    )}
-                    {versionGuardItem && (
-                      <button
-                        onClick={() => handleFixSelfCheck("version")}
-                        disabled={selfCheckFixingKey === "version"}
-                        className="px-2 py-1 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded"
-                      >
-                        {selfCheckFixingKey === "version" ? "处理中..." : "执行版本守护"}
-                      </button>
-                    )}
-                  </div>
+            )}
+            {servicePanelMounted && servicePanelExpanded && !chatInteracting && !chatSending && (
+            <div style={heavyPanelStyle} className="space-y-3">
+            {startResult && (
+              <div className="bg-slate-800 rounded-lg p-3 text-sm text-slate-300 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="font-medium text-slate-200">最近输出</p>
+                  <span className="text-[11px] text-slate-500">仅显示最近几行</span>
                 </div>
-              )}
-              {!!selfCheckItems.length && (
-                <div className="space-y-2">
-                  {selfCheckItems.map((item) => (
-                    <div key={item.key} className="rounded border border-slate-700 bg-slate-900/40 p-3">
+                <pre className="overflow-auto max-h-28 whitespace-pre-wrap text-xs text-slate-300">
+                  {serviceStartSummary}
+                </pre>
+              </div>
+            )}
+            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3" style={heavyPanelStyle}>
+              <div className="flex items-center justify-between gap-2 flex-wrap">
+                <div>
+                  <p className="font-medium text-slate-200">任务队列中心（防卡死）</p>
+                  <p className="text-xs text-slate-500 mt-1">
+                    共 {serviceQueueSummary.total} 个任务
+                    {serviceQueueSummary.running ? ` · 运行中 ${serviceQueueSummary.running}` : ""}
+                    {serviceQueueSummary.queued ? ` · 排队 ${serviceQueueSummary.queued}` : ""}
+                    {serviceQueueSummary.failed ? ` · 失败 ${serviceQueueSummary.failed}` : ""}
+                    {serviceQueueSummary.cancelled ? ` · 已取消 ${serviceQueueSummary.cancelled}` : ""}
+                  </p>
+                </div>
+                {queueTasks.length > 0 && (
+                  <button
+                    onClick={() => setShowServiceQueueDetails((prev) => !prev)}
+                    className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                  >
+                    {showServiceQueueDetails ? "收起任务详情" : "展开任务详情"}
+                  </button>
+                )}
+              </div>
+              {queueTasks.length === 0 ? (
+                <p className="text-xs text-slate-500">暂无任务。重操作会进入队列并串行执行。</p>
+              ) : showServiceQueueDetails ? (
+                <div className="space-y-2 max-h-44 overflow-auto">
+                  {serviceRecentQueueTasks.map((t) => (
+                    <div key={t.id} className="bg-slate-900/40 border border-slate-700 rounded p-2">
                       <div className="flex items-center justify-between gap-2">
-                        <p className="text-slate-200 text-sm">
-                          {item.label}
-                          <span className={`ml-2 text-xs ${
-                            item.status === "ok"
-                              ? "text-emerald-400"
-                              : item.status === "warn"
-                                ? "text-amber-300"
-                                : "text-red-400"
-                          }`}>
-                            {item.status}
-                          </span>
+                        <p className="text-xs text-slate-200">
+                          {t.name}
+                          <span className="ml-2 text-slate-400">[{t.status}]</span>
                         </p>
-                        {item.status !== "ok" && (
-                          <button
-                            onClick={() => handleFixSelfCheck(item.key)}
-                            disabled={selfCheckFixingKey === item.key}
-                            className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
-                          >
-                            {selfCheckFixingKey === item.key ? "修复中..." : "立即修复"}
-                          </button>
-                        )}
+                        <div className="flex gap-1">
+                          {(t.status === "queued" || t.status === "running") && (
+                            <button
+                              onClick={() => cancelTask(t.id)}
+                              className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                            >
+                              取消
+                            </button>
+                          )}
+                          {(t.status === "error" || t.status === "cancelled") &&
+                            t.retryCount < t.maxRetries && (
+                              <button
+                                onClick={() => retryTask(t.id)}
+                                className="px-2 py-1 bg-amber-700 hover:bg-amber-600 rounded text-[11px]"
+                              >
+                                重试
+                              </button>
+                            )}
+                        </div>
                       </div>
-                      <pre className="mt-2 text-xs text-slate-400 whitespace-pre-wrap">{item.detail}</pre>
+                      {t.error && <p className="text-[11px] text-rose-300 mt-1">{t.error}</p>}
                     </div>
                   ))}
                 </div>
+              ) : (
+                <p className="text-xs text-slate-500">默认仅显示摘要，点击“展开任务详情”查看最近 5 条任务。</p>
               )}
-              {selfCheckResult && <p className="text-xs text-sky-300">{selfCheckResult}</p>}
             </div>
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
-              <p className="font-medium text-slate-200">渠道驱动的插件自动安装</p>
-              <div className="flex flex-wrap gap-3">
-                {["telegram", "qq", "feishu", "discord", "dingtalk"].map((id) => (
-                  <label key={id} className="flex items-center gap-1 text-xs text-slate-300">
-                    <input
-                      type="checkbox"
-                      checked={!!pluginSelection[id]}
-                      onChange={(e) =>
-                        setPluginSelection((prev) => ({ ...prev, [id]: e.target.checked }))
-                      }
-                    />
-                    {id}
-                  </label>
+            </div>
+            )}
+            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-2">
+              <p className="font-medium text-slate-200">渠道配置入口已统一</p>
+              <p className="text-slate-400">
+                渠道凭据（Telegram / 飞书 / 钉钉 / Discord / QQ）已统一迁移至
+                <strong className="text-slate-200"> 调教中心 → Agent 管理 → 渠道实例池</strong>。
+                首次配对审批也已迁过去，请在那里按 Agent 配置 Token / appId / appSecret 等，并保存、应用到网关。
+              </p>
+              <button
+                onClick={() => { setStep(4); setTuningSection("agents"); }}
+                className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs"
+              >
+                前往渠道实例池
+              </button>
+            </div>
+            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-2">
+              <p className="font-medium text-slate-200">后续如何交互（推荐顺序）</p>
+              <p>1) 在「聊天对话」标题右侧点击「启动 Gateway」，若提示服务缺失会自动安装并重试。</p>
+              <p>2) 前往「调教中心 → Agent 管理 → 渠道实例池」统一配置 Telegram / 飞书 / QQ / Discord / 钉钉，并处理首次配对审批。</p>
+              <p>3) 配好后，在对应聊天应用里给机器人发消息即可对话。</p>
+              <p className="text-slate-400">
+                说明：敏感信息不会在页面回显，避免泄露；请妥善保存凭证。
+              </p>
+            </div>
+          </div>
+        )}
+
+        {step === 3 && (
+          <div className="w-full max-w-[1200px] mx-auto space-y-4 order-1">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-lg font-semibold">聊天对话</h2>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleStart}
+                  disabled={starting}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-xs font-medium"
+                >
+                  {starting ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      启动中...
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-4 h-4" />
+                      启动 Gateway
+                    </>
+                  )}
+                </button>
+                <button
+                  onClick={() => void runStartAllEnabledGateways()}
+                  disabled={gatewayBatchLoading === "start"}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs font-medium"
+                >
+                  {gatewayBatchLoading === "start" ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      启动中...
+                    </>
+                  ) : (
+                    <>
+                      <Zap className="w-4 h-4" />
+                      一键启动所有 Gateway
+                    </>
+                  )}
+                </button>
+                <button
+                  onClick={handleOpenBrowserChat}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-sky-700 hover:bg-sky-600 rounded text-xs font-medium"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  打开浏览器对话框
+                </button>
+              </div>
+            </div>
+            <ChatWorkbench
+              agents={chatAgents}
+              selectedAgentId={selectedAgentId}
+              unreadByAgent={unreadByAgent}
+              routeMode={routeMode}
+              chatExecutionMode={chatExecutionMode}
+              chatSessionMode={chatSessionMode}
+              chatLoading={chatLoading}
+              chatSending={chatSending}
+              chatError={chatError}
+              routeHint={routeHint}
+              messages={selectedChatMessages}
+              renderLimit={selectedChatRenderLimit}
+              chatViewportRef={chatViewportRef}
+              onRouteModeChange={setRouteMode}
+              onExecutionModeChange={setChatExecutionMode}
+              onSessionModeChange={setChatSessionMode}
+              onSelectAgent={handleSelectAgentForChat}
+              onNewSession={handleNewSessionLocal}
+              onClearSession={handleNewSessionLocal}
+              onAbort={handleAbortChat}
+              onSend={handleSendChat}
+              onTypingActivity={handleChatTypingActivity}
+              onViewportScroll={handleChatViewportScroll}
+              getAgentSpecialty={getAgentSpecialty}
+              gatewayOptionsByAgent={enabledGatewaysByAgent}
+              preferredGatewayByAgent={preferredGatewayByAgent}
+              onPreferredGatewayChange={(agentId, gatewayId) =>
+                setPreferredGatewayByAgent((prev) => ({ ...prev, [agentId]: gatewayId }))
+              }
+            />
+          </div>
+        )}
+
+        {step === 4 && (
+          <div className="w-full max-w-[1200px] mx-auto space-y-6">
+            <h2 className="text-lg font-semibold">调教中心（小白模式）</h2>
+            <div className="flex flex-wrap gap-2">
+              {[
+                { id: "agents", label: "Agent 管理" },
+                { id: "control", label: "总控编排" },
+                { id: "quick", label: "快速模式" },
+                { id: "scene", label: "场景模板" },
+                { id: "personal", label: "个性调教" },
+                { id: "memory", label: "记忆中心" },
+                { id: "skills", label: "Skills" },
+                { id: "health", label: "健康自愈" },
+              ].map((tab) => (
+                <button
+                  key={tab.id}
+                  onClick={() =>
+                    setTuningSection(
+                      tab.id as "quick" | "scene" | "personal" | "memory" | "health" | "skills" | "agents" | "chat" | "control"
+                    )
+                  }
+                  className={`px-3 py-1.5 rounded text-xs border ${
+                    tuningSection === tab.id
+                      ? "bg-sky-800/60 border-sky-600 text-sky-100"
+                      : "bg-slate-700/60 border-slate-600 hover:bg-slate-700"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+
+            {tuningSection === "agents" && (
+            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+              <p className="font-medium text-slate-200 flex items-center gap-2">
+                <Users className="w-4 h-4 text-sky-400" />
+                Agent 管理
+              </p>
+              {agentsLoading ? (
+                <p className="text-xs text-slate-400">加载中...</p>
+              ) : agentsError ? (
+                <p className="text-xs text-rose-400">{agentsError}</p>
+              ) : agentsList ? (
+                <>
+                  <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 space-y-2">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div>
+                        <p className="text-sm text-slate-200 font-medium">极简模式</p>
+                        <p className="text-[11px] text-slate-400">
+                          默认只保留「按 Agent 配置」「保存并应用」「网关状态」。其它功能都收进高级设置。
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => setShowAgentAdvancedSettings((prev) => !prev)}
+                        className="px-3 py-1.5 rounded border border-slate-600 text-xs text-slate-200 hover:border-slate-500 hover:bg-slate-800/70"
+                      >
+                        {showAgentAdvancedSettings ? "收起高级设置" : "展开高级设置"}
+                      </button>
+                    </div>
+                  </div>
+                  {showAgentAdvancedSettings && (
+                    <>
+                  <p className="text-xs text-slate-400">配置: {agentsList.config_path}</p>
+                  <p className="text-xs text-slate-400">点击「设为默认」切换用于对话的 Agent，新对话将使用默认 Agent。</p>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs border-collapse">
+                      <thead>
+                        <tr className="border-b border-slate-600">
+                          <th className="text-left py-1.5 px-2">ID</th>
+                          <th className="text-left py-1.5 px-2">名称</th>
+                          <th className="text-left py-1.5 px-2">默认</th>
+                          <th className="text-left py-1.5 px-2">Workspace</th>
+                          <th className="text-left py-1.5 px-2">操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {agentsList.agents.map((a) => (
+                          <tr key={a.id} className="border-b border-slate-700/50">
+                            <td className="py-1.5 px-2 font-mono">{a.id}</td>
+                            <td className="py-1.5 px-2">{a.name || "-"}</td>
+                            <td className="py-1.5 px-2">{a.default ? "✓" : ""}</td>
+                            <td className="py-1.5 px-2 font-mono text-slate-400 truncate max-w-[120px]">{a.workspace || "-"}</td>
+                            <td className="py-1.5 px-2 flex gap-1 flex-wrap">
+                              {!a.default && (
+                                <button
+                                  onClick={async () => {
+                                    try {
+                                      await invoke("set_default_agent", {
+                                        id: a.id,
+                                        customPath: normalizeConfigPath(customConfigPath) || undefined,
+                                      });
+                                      await refreshAgentsList();
+                                    } catch (e) {
+                                      alert(String(e));
+                                    }
+                                  }}
+                                  className="text-emerald-400 hover:text-emerald-300 text-xs"
+                                >
+                                  设为默认
+                                </button>
+                              )}
+                              {a.id !== "main" && (
+                                <button
+                                  onClick={async () => {
+                                    if (!confirm(`确定删除 Agent "${a.id}"？`)) return;
+                                    try {
+                                      await invoke("delete_agent", {
+                                        id: a.id,
+                                        force: true,
+                                        customPath: normalizeConfigPath(customConfigPath) || undefined,
+                                      });
+                                      await refreshAgentsList();
+                                    } catch (e) {
+                                      alert(String(e));
+                                    }
+                                  }}
+                                  className="text-rose-400 hover:text-rose-300 text-xs"
+                                >
+                                  删除
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      onClick={() => setShowCreateAgent(true)}
+                      className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 rounded text-xs"
+                    >
+                      新建 Agent
+                    </button>
+                    <button
+                      onClick={refreshAgentsList}
+                      className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                    >
+                      刷新
+                    </button>
+                  </div>
+                  <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-3 space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-sm text-slate-200 font-medium">Agent 模型分配（按 Agent 独立）</p>
+                      <button
+                        onClick={() => {
+                          const providers = new Set<string>();
+                          for (const a of agentsList.agents) {
+                            const p = agentProfileDrafts[a.id]?.provider;
+                            if (p) providers.add(p);
+                          }
+                          providers.forEach((p) => {
+                            void refreshModelsForProvider(p);
+                          });
+                        }}
+                        className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                      >
+                        刷新已选 Provider 模型列表
+                      </button>
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      模型来源于你当前 Provider 的“刷新模型”结果；保存后将同步写入对应 Agent 的主模型。
+                    </p>
+                    {agentRuntimeSettings && (
+                      <p className="text-[11px] text-slate-500">运行时配置文件：{agentRuntimeSettings.settings_path}</p>
+                    )}
+                    <div className="space-y-2">
+                      {agentsList.agents.map((a) => {
+                        const draft = agentProfileDrafts[a.id] || { provider: "openai", model: RECOMMENDED_MODEL_FALLBACK };
+                        const models = agentModelsByProvider[draft.provider] || [];
+                        const providerLoading = !!agentModelsLoadingByProvider[draft.provider];
+                        return (
+                          <div key={`runtime-${a.id}`} className="border border-slate-700 rounded p-2 space-y-2">
+                            <div className="text-xs text-slate-300">
+                              <span className="font-mono">{a.id}</span>
+                              <span className="text-slate-500 ml-2">{a.name || "-"}</span>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
+                              <select
+                                value={draft.provider}
+                                onChange={(e) => {
+                                  const nextProvider = e.target.value;
+                                  setAgentProfileDrafts((prev) => ({
+                                    ...prev,
+                                    [a.id]: {
+                                      provider: nextProvider,
+                                      model: prev[a.id]?.model || RECOMMENDED_MODEL_FALLBACK,
+                                    },
+                                  }));
+                                }}
+                                className="bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs"
+                              >
+                                {AGENT_PROVIDER_OPTIONS.map((p) => (
+                                  <option key={p} value={p}>
+                                    {p}
+                                  </option>
+                                ))}
+                              </select>
+                              <select
+                                value={draft.model}
+                                onChange={(e) =>
+                                  setAgentProfileDrafts((prev) => ({
+                                    ...prev,
+                                    [a.id]: { ...(prev[a.id] || { provider: draft.provider, model: "" }), model: e.target.value },
+                                  }))
+                                }
+                                className="bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs md:col-span-2"
+                              >
+                                {models.length === 0 ? (
+                                  <option value={draft.model}>{draft.model || "请先刷新模型列表"}</option>
+                                ) : (
+                                  <>
+                                    {!models.includes(draft.model) && <option value={draft.model}>{draft.model}</option>}
+                                    {models.map((m) => (
+                                      <option key={m} value={m}>
+                                        {m}
+                                      </option>
+                                    ))}
+                                  </>
+                                )}
+                              </select>
+                              <div className="flex gap-2">
+                                <button
+                                  onClick={() => void refreshModelsForProvider(draft.provider)}
+                                  className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                                  disabled={providerLoading}
+                                >
+                                  {providerLoading ? "刷新中..." : "刷新模型"}
+                                </button>
+                                <button
+                                  onClick={() => void saveAgentProfile(a.id)}
+                                  className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-[11px]"
+                                  disabled={agentRuntimeSaving}
+                                >
+                                  保存
+                                </button>
+                              </div>
+                            </div>
+                            <input
+                              value={draft.model}
+                              onChange={(e) =>
+                                setAgentProfileDrafts((prev) => ({
+                                  ...prev,
+                                  [a.id]: { ...(prev[a.id] || { provider: draft.provider, model: "" }), model: e.target.value },
+                                }))
+                              }
+                              placeholder="也可手动输入模型ID"
+                              className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs"
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
+                    {agentRuntimeResult && (
+                      <div
+                        className={`rounded-lg p-3 text-xs whitespace-pre-wrap ${
+                          agentRuntimeResult.includes("向导完成") || agentRuntimeResult.includes("配置完成")
+                            ? "bg-emerald-900/40 border border-emerald-600/50 text-emerald-200"
+                            : "text-emerald-300"
+                        }`}
+                      >
+                        {(agentRuntimeResult.includes("向导完成") || agentRuntimeResult.includes("配置完成")) && (
+                          <p className="font-medium text-emerald-100 mb-1">✓ 配置完成</p>
+                        )}
+                        {agentRuntimeResult}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="bg-indigo-950/30 border border-indigo-700/50 rounded-lg p-4 space-y-3">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <p className="text-sm text-indigo-200 font-medium flex items-center gap-2">
+                        <Sparkles className="w-4 h-4 text-indigo-400" />
+                        新手引导：四步完成渠道配置
+                      </p>
+                      <label className="flex items-center gap-2 text-xs text-slate-400 cursor-pointer hover:text-slate-300">
+                        <input
+                          type="checkbox"
+                          checked={!simpleModeForAgent}
+                          onChange={(e) => setSimpleModeForAgent(!e.target.checked)}
+                        />
+                        显示高级选项
+                      </label>
+                    </div>
+                    {/* 可视化步骤条：实例池 → 网关 → 路由 → 测试 */}
+                    {(() => {
+                      const steps = [
+                        {
+                          step: 1,
+                          label: "实例池",
+                          done:
+                            channelInstancesEditorChannel === "telegram"
+                              ? telegramInstancesDraft.some((x) => x.bot_token?.trim())
+                              : channelInstancesDraft.some((x) => x.channel === channelInstancesEditorChannel && x.credential1?.trim()),
+                        },
+                        { step: 2, label: "应用网关", done: (gatewayBindingsDraft?.length ?? 0) > 0 },
+                        { step: 3, label: "路由", done: channelRoutesDraft.some((r) => r.enabled) },
+                        {
+                          step: 4,
+                          label: "测试命中",
+                          done: !!(routeTestResult && routeTestResult.includes("命中 Agent")),
+                        },
+                      ];
+                      const currentStep = steps.findIndex((s) => !s.done) + 1 || 4;
+                      return (
+                        <div className="flex items-center gap-0">
+                          {steps.map((s, i) => {
+                            const isCurrent = s.step === currentStep;
+                            const isDone = s.done;
+                            return (
+                              <div key={s.step} className="flex items-center">
+                                <div
+                                  className={`flex flex-col items-center cursor-default ${
+                                    isDone ? "text-emerald-400" : isCurrent ? "text-indigo-300" : "text-slate-500"
+                                  }`}
+                                  title={isDone ? `已完成：${s.label}` : isCurrent ? `当前：${s.label}` : `待完成：${s.label}`}
+                                >
+                                  <span
+                                    className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold border-2 ${
+                                      isDone
+                                        ? "bg-emerald-900/50 border-emerald-500 text-emerald-300"
+                                        : isCurrent
+                                          ? "bg-indigo-700/80 border-indigo-400 text-indigo-100 ring-2 ring-indigo-400/50"
+                                          : "bg-slate-800/50 border-slate-600 text-slate-400"
+                                    }`}
+                                  >
+                                    {isDone ? "✓" : s.step}
+                                  </span>
+                                  <span className="text-[10px] mt-1">{s.label}</span>
+                                </div>
+                                {i < 3 && (
+                                  <div
+                                    className={`w-8 h-0.5 mx-0.5 ${isDone ? "bg-emerald-600/50" : "bg-slate-600"}`}
+                                    aria-hidden
+                                  />
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
+                    <div className="rounded-md bg-indigo-900/30 border border-indigo-600/40 p-2.5 space-y-2">
+                      <p className="text-xs text-indigo-200 font-medium">快速开始（推荐）</p>
+                      <p className="text-[11px] text-indigo-100/90 leading-relaxed">
+                        ① 点「按 Agent 自动生成」→ ② 为每个 Agent 填 Token → ③ 点「首次配置向导」一键完成保存、应用、路由与测试。
+                      </p>
+                      <p className="text-[10px] text-indigo-200/70">
+                        概念：<strong>实例池</strong>存 Token；<strong>网关</strong>把实例接到 Agent；<strong>路由</strong>决定消息走哪个 Agent。
+                      </p>
+                      <div className="flex gap-2 flex-wrap">
+                        <button
+                          onClick={() => void (channelInstancesEditorChannel === "telegram" ? runTelegramFirstSetupWizard() : runChannelFirstSetupWizard(channelInstancesEditorChannel as NonTelegramChannel))}
+                          disabled={
+                            (channelInstancesEditorChannel === "telegram" ? telegramWizardRunning : !!channelWizardRunningByChannel[channelInstancesEditorChannel]) ||
+                            !agentsList?.agents?.length
+                          }
+                          className="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 rounded text-[11px] font-medium"
+                        >
+                          首次使用？点这里一键向导
+                        </button>
+                        {setupWizardStepMode ? (
+                          <button
+                            onClick={() => setSetupWizardStepMode(false)}
+                            className="px-2 py-1 bg-slate-600 hover:bg-slate-500 rounded text-[11px]"
+                          >
+                            收起分步向导
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => {
+                              setSetupWizardStepMode(true);
+                              setSetupWizardCurrentStep(1);
+                            }}
+                            className="px-2 py-1 bg-slate-600/80 hover:bg-slate-500 rounded text-[11px]"
+                          >
+                            分步向导（每步有说明）
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* 分步向导：每步有说明和下一步 */}
+                    {setupWizardStepMode && (
+                      <div className="rounded-lg border border-indigo-600/60 bg-indigo-950/40 p-4 space-y-3">
+                        <p className="text-sm font-medium text-indigo-200">分步向导 · 第 {setupWizardCurrentStep} 步</p>
+                        {setupWizardCurrentStep === 1 && (
+                          <>
+                            <p className="text-xs text-indigo-100/90">
+                              <strong>步骤 1：实例池</strong> — 为每个 Agent 配置渠道凭据（如 Telegram Token）。点「按 Agent 自动生成」后填写 Token，再点「保存实例池」。
+                            </p>
+                            <button
+                              onClick={() => setSetupWizardCurrentStep(2)}
+                              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-xs"
+                            >
+                              下一步：应用网关 →
+                            </button>
+                          </>
+                        )}
+                        {setupWizardCurrentStep === 2 && (
+                          <>
+                            <p className="text-xs text-indigo-100/90">
+                              <strong>步骤 2：应用网关</strong> — 将实例池中的激活实例应用到网关。点「应用到网关」后，点「按 Agent 自动生成网关」生成网关绑定。
+                            </p>
+                            <button
+                              onClick={() => setSetupWizardCurrentStep(3)}
+                              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-xs"
+                            >
+                              下一步：保存路由 →
+                            </button>
+                          </>
+                        )}
+                        {setupWizardCurrentStep === 3 && (
+                          <>
+                            <p className="text-xs text-indigo-100/90">
+                              <strong>步骤 3：路由</strong> — 保存渠道路由，让消息能正确命中对应 Agent。首次配置向导会自动完成；或手动点「保存路由」。
+                            </p>
+                            <button
+                              onClick={() => setSetupWizardCurrentStep(4)}
+                              className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-xs"
+                            >
+                              下一步：测试命中 →
+                            </button>
+                          </>
+                        )}
+                        {setupWizardCurrentStep === 4 && (
+                          <>
+                            <p className="text-xs text-indigo-100/90">
+                              <strong>步骤 4：测试命中</strong> — 验证配置是否正确。在下方「渠道调阅路由」区域选择实例后点「测试命中」，或直接点「首次配置向导」一键跑完并测试。
+                            </p>
+                            <div className="flex gap-2">
+                              <button
+                                onClick={() => {
+                                  void (channelInstancesEditorChannel === "telegram"
+                                    ? runTelegramFirstSetupWizard()
+                                    : runChannelFirstSetupWizard(channelInstancesEditorChannel as NonTelegramChannel));
+                                  setSetupWizardStepMode(false);
+                                }}
+                                disabled={
+                                  (channelInstancesEditorChannel === "telegram" ? telegramWizardRunning : !!channelWizardRunningByChannel[channelInstancesEditorChannel]) ||
+                                  !agentsList?.agents?.length
+                                }
+                                className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded text-xs"
+                              >
+                                一键完成全部
+                              </button>
+                              <button
+                                onClick={() => setSetupWizardStepMode(false)}
+                                className="px-3 py-1.5 bg-slate-600 hover:bg-slate-500 rounded text-xs"
+                              >
+                                配置完成，收起向导
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                    </>
+                  )}
+                  <div className="bg-slate-900/40 border border-slate-700 rounded-lg overflow-hidden flex flex-col md:flex-row min-h-[320px]">
+                    <div className="w-full md:w-36 shrink-0 flex md:flex-col gap-1 p-2 border-b md:border-b-0 md:border-r border-slate-700 bg-slate-800/50">
+                      <p className="text-xs text-slate-400 px-2 py-1 md:mb-1 hidden md:block">渠道</p>
+                      {(["telegram", "feishu", "dingtalk", "discord", "qq"] as ChannelEditorChannel[]).map((ch) => {
+                        const label = { telegram: "Telegram", feishu: "飞书", dingtalk: "钉钉", discord: "Discord", qq: "QQ" }[ch];
+                        return (
+                          <button
+                            key={ch}
+                            onClick={() => setChannelInstancesEditorChannel(ch)}
+                            className={`text-left px-2 py-2 rounded text-xs font-medium transition-colors ${
+                              channelInstancesEditorChannel === ch
+                                ? "bg-indigo-700 text-indigo-100"
+                                : "bg-slate-700/60 hover:bg-slate-600 text-slate-300"
+                            }`}
+                          >
+                            {label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    <div className="flex-1 min-w-0 p-3 space-y-3 overflow-auto">
+                    {agentsList?.agents?.length &&
+                      ((channelInstancesEditorChannel === "telegram" && !telegramInstancesDraft.some((x) => x.bot_token?.trim())) ||
+                        (channelInstancesEditorChannel !== "telegram" &&
+                          !channelInstancesDraft.some((x) => x.channel === channelInstancesEditorChannel && x.credential1?.trim()))) && (
+                      <div className="rounded border border-amber-600/60 bg-amber-900/20 px-3 py-2 text-xs text-amber-200">
+                        <span className="font-medium">首次使用？</span> 先点「按 Agent 自动生成」生成配置项，填写 Token 后点「首次配置向导」一键完成。
+                      </div>
+                    )}
+                    {(["telegram", "feishu", "qq"] as ChannelEditorChannel[]).includes(channelInstancesEditorChannel) && (() => {
+                      const pairingChannel = channelInstancesEditorChannel as PairingChannel;
+                      const pairingLabelMap: Record<PairingChannel, string> = {
+                        telegram: "Telegram",
+                        feishu: "飞书",
+                        qq: "QQ",
+                      };
+                      const pairingPlaceholderMap: Record<PairingChannel, string> = {
+                        telegram: "粘贴 Telegram 返回的配对码",
+                        feishu: "粘贴飞书返回的配对码",
+                        qq: "粘贴 QQ 返回的配对码",
+                      };
+                      return (
+                        <div className="rounded-lg border border-slate-700 bg-slate-950/30 p-3 space-y-3">
+                          <div className="flex items-start justify-between gap-2 flex-wrap">
+                            <div>
+                              <p className="text-sm text-slate-200 font-medium">首次配对审批</p>
+                              <p className="text-[11px] text-amber-200/90">
+                                {pairingLabelMap[pairingChannel]} 首次私聊时如果返回配对码，直接在这里审批，后面就能正常对话。
+                              </p>
+                            </div>
+                            <button
+                              onClick={() => void handleListPairings(pairingChannel)}
+                              disabled={pairingLoading === pairingChannel}
+                              className="px-2 py-1 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-[11px]"
+                            >
+                              {pairingLoading === pairingChannel ? "查询中..." : "查询待审批"}
+                            </button>
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <input
+                              type="text"
+                              placeholder={pairingPlaceholderMap[pairingChannel]}
+                              value={pairingCodeByChannel[pairingChannel]}
+                              onChange={(e) =>
+                                setPairingCodeByChannel((prev) => ({
+                                  ...prev,
+                                  [pairingChannel]: e.target.value,
+                                }))
+                              }
+                              className="flex-1 min-w-[220px] bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm"
+                            />
+                            <button
+                              onClick={() => handleApprovePairing(pairingChannel)}
+                              disabled={pairingLoading === pairingChannel || !pairingCodeByChannel[pairingChannel].trim()}
+                              className="px-3 py-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded-lg text-xs"
+                            >
+                              批准配对码
+                            </button>
+                          </div>
+                          {pairingRequestsByChannel[pairingChannel].length > 0 && (
+                            <div className="space-y-2">
+                              {pairingRequestsByChannel[pairingChannel].map((req, index) => {
+                                const code = typeof req.code === "string" ? req.code : "";
+                                const title =
+                                  (typeof req.displayName === "string" && req.displayName) ||
+                                  (typeof req.senderLabel === "string" && req.senderLabel) ||
+                                  (typeof req.senderId === "string" && req.senderId) ||
+                                  (typeof req.from === "string" && req.from) ||
+                                  `请求 ${index + 1}`;
+                                const metaText = Object.entries(req)
+                                  .filter(([key, value]) => key !== "code" && typeof value === "string" && value)
+                                  .slice(0, 3)
+                                  .map(([key, value]) => `${key}: ${value}`)
+                                  .join(" · ");
+                                return (
+                                  <div key={`${pairingChannel}-${code || index}`} className="flex flex-wrap items-center gap-2 rounded border border-slate-700 bg-slate-900/60 px-3 py-2">
+                                    <div className="min-w-[160px] flex-1">
+                                      <div className="text-xs text-slate-200">{title}</div>
+                                      <div className="text-[11px] text-slate-500">{metaText || "等待批准首次访问"}</div>
+                                    </div>
+                                    <code className="rounded bg-slate-950 px-2 py-1 text-xs text-emerald-300">{code || "无 code"}</code>
+                                    {code && (
+                                      <button
+                                        onClick={() => handleApprovePairing(pairingChannel, code)}
+                                        disabled={pairingLoading === pairingChannel}
+                                        className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
+                                      >
+                                        直接批准
+                                      </button>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                          {channelResult && (
+                            <pre className="text-xs text-sky-300 whitespace-pre-wrap bg-slate-900/40 rounded p-2">{channelResult}</pre>
+                          )}
+                        </div>
+                      );
+                    })()}
+                    {channelInstancesEditorChannel !== "telegram" && (
+                    <>
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <p className="text-sm text-slate-200 font-medium">{channelInstancesEditorChannel} 实例池</p>
+                      <div className="flex gap-2 items-center flex-wrap">
+                        <button
+                          onClick={() => buildChannelPerAgentDraft(channelInstancesEditorChannel)}
+                          className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-[11px]"
+                          title="① 先点这里：生成每个 Agent 的配置项"
+                        >
+                          按 Agent 自动生成 <span className="text-emerald-200/80 text-[10px]">① 先点</span>
+                        </button>
+                        {showAgentAdvancedSettings && (
+                          <>
+                            <button
+                              onClick={() => void runChannelFirstSetupWizard(channelInstancesEditorChannel)}
+                              disabled={!!channelWizardRunningByChannel[channelInstancesEditorChannel]}
+                              className="px-2 py-1 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-[11px]"
+                              title="③ 填完 Token 后点这里：一键完成保存、应用、路由与测试"
+                            >
+                              {channelWizardRunningByChannel[channelInstancesEditorChannel] ? "向导执行中..." : "首次配置向导"}
+                              <span className="text-indigo-200/80 text-[10px] ml-0.5">③ 填完点</span>
+                            </button>
+                            <button
+                              onClick={() => void testChannelInstancesBatch(channelInstancesEditorChannel)}
+                              disabled={!!channelBatchTestingByChannel[channelInstancesEditorChannel]}
+                              className="px-2 py-1 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-[11px]"
+                            >
+                              {channelBatchTestingByChannel[channelInstancesEditorChannel] ? "检测中..." : "批量检测"}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      当前渠道：{channelInstancesEditorChannel}。可点“首次配置向导”一键跑完：实例池到应用网关，再到路由与命中测试。
+                    </p>
+                    {channelInstancesEditorChannel === "qq" && (
+                      <div className="rounded-lg border border-cyan-700/50 bg-cyan-950/20 p-3 space-y-2">
+                        <p className="text-sm text-cyan-200 font-medium">QQ 新接入方式</p>
+                        <p className="text-[11px] text-cyan-100/90 leading-relaxed">
+                          这里直接填写 <strong>AppID</strong> 和 <strong>AppSecret</strong>。
+                          后台会自动拼成 OpenClaw 需要的 <code>AppID:AppSecret</code> token，并写入当前 Agent 的 QQ 渠道配置。
+                        </p>
+                        <p className="text-[10px] text-cyan-200/75">
+                          不需要你自己手动拼命令，也不需要手动执行 `channels add`。
+                        </p>
+                      </div>
+                    )}
+                    {!!agentsList.agents.length && (
+                      <div className="border border-slate-700 rounded p-2 space-y-2">
+                        <p className="text-xs text-slate-300">按 Agent 配置 {channelInstancesEditorChannel} 凭据（简化）</p>
+                        {agentsList.agents.map((a) => {
+                          const ch = channelInstancesEditorChannel;
+                          const iid = `${ch}-${a.id}`;
+                          const item =
+                            channelInstancesDraft.find((x) => x.channel === ch && x.id === iid) ||
+                            ({
+                              id: iid,
+                              name: a.name || a.id,
+                              channel: ch,
+                              credential1: "",
+                              credential2: "",
+                              chat_id: "",
+                              enabled: true,
+                            } as ChannelBotInstance);
+                          const singleKey = `${ch}:${iid}`;
+                          const singleTesting = !!channelSingleTestingByInstanceId[singleKey];
+                          return (
+                            <div key={`agent-${ch}-${a.id}`} className="space-y-1">
+                              <div className="grid grid-cols-1 md:grid-cols-6 gap-2">
+                                <div className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300">
+                                  {a.id}
+                                </div>
+                                <input
+                                  type="password"
+                                  value={item.credential1}
+                                  onChange={(e) =>
+                                    setChannelInstancesDraft((prev) => {
+                                      const next = [...prev];
+                                      const idx = next.findIndex((x) => x.channel === ch && x.id === iid);
+                                      const row: ChannelBotInstance = {
+                                        id: iid,
+                                        name: a.name || a.id,
+                                        channel: ch,
+                                        credential1: e.target.value,
+                                        credential2: item.credential2 || "",
+                                        chat_id: item.chat_id || "",
+                                        enabled: item.enabled,
+                                      };
+                                      if (idx >= 0) next[idx] = row;
+                                      else next.push(row);
+                                      return next;
+                                    })
+                                  }
+                                  placeholder={
+                                    ch === "qq"
+                                      ? `${a.id} 的 AppID`
+                                      : `${a.id} 的 ${channelEditorCredential1Label}`
+                                  }
+                                  className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                />
+                                {channelEditorCredential2Label ? (
+                                  <input
+                                    type="password"
+                                    value={item.credential2 || ""}
+                                    onChange={(e) =>
+                                      setChannelInstancesDraft((prev) => {
+                                        const next = [...prev];
+                                        const idx = next.findIndex((x) => x.channel === ch && x.id === iid);
+                                        const row: ChannelBotInstance = {
+                                          id: iid,
+                                          name: a.name || a.id,
+                                          channel: ch,
+                                          credential1: item.credential1 || "",
+                                          credential2: e.target.value,
+                                          chat_id: item.chat_id || "",
+                                          enabled: item.enabled,
+                                        };
+                                        if (idx >= 0) next[idx] = row;
+                                        else next.push(row);
+                                        return next;
+                                      })
+                                    }
+                                    placeholder={
+                                      ch === "qq"
+                                        ? "AppSecret（后台会自动拼成 AppID:AppSecret）"
+                                        : `${channelEditorCredential2Label}(可选)`
+                                    }
+                                    className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                  />
+                                ) : (
+                                  <div className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-[11px] text-slate-500 flex items-center">
+                                    无第二凭据
+                                  </div>
+                                )}
+                                <input
+                                  value={item.chat_id || ""}
+                                  onChange={(e) =>
+                                    setChannelInstancesDraft((prev) => {
+                                      const next = [...prev];
+                                      const idx = next.findIndex((x) => x.channel === ch && x.id === iid);
+                                      const row: ChannelBotInstance = {
+                                        id: iid,
+                                        name: a.name || a.id,
+                                        channel: ch,
+                                        credential1: item.credential1 || "",
+                                        credential2: item.credential2 || "",
+                                        chat_id: e.target.value,
+                                        enabled: item.enabled,
+                                      };
+                                      if (idx >= 0) next[idx] = row;
+                                      else next.push(row);
+                                      return next;
+                                    })
+                                  }
+                                  placeholder="chatId(可选)"
+                                  className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                />
+                                <label className="flex items-center gap-1 text-xs text-slate-300">
+                                  <input
+                                    type="checkbox"
+                                    checked={item.enabled}
+                                    onChange={(e) =>
+                                      setChannelInstancesDraft((prev) => {
+                                        const next = [...prev];
+                                        const idx = next.findIndex((x) => x.channel === ch && x.id === iid);
+                                        const row: ChannelBotInstance = {
+                                          id: iid,
+                                          name: a.name || a.id,
+                                          channel: ch,
+                                          credential1: item.credential1 || "",
+                                          credential2: item.credential2 || "",
+                                          chat_id: item.chat_id || "",
+                                          enabled: e.target.checked,
+                                        };
+                                        if (idx >= 0) next[idx] = row;
+                                        else next.push(row);
+                                        return next;
+                                      })
+                                    }
+                                  />
+                                  启用
+                                </label>
+                                <button
+                                  onClick={() => void testSingleChannelInstance(ch, iid)}
+                                  disabled={singleTesting || !hasRequiredChannelCredentials(ch, item)}
+                                  className="px-2 py-1 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-[11px]"
+                                  title={ch === "qq" ? "检测 AppID / AppSecret 配置是否完整，失败时会给出修复建议" : "检测凭据连通性，失败时会给出修复建议"}
+                                >
+                                  {singleTesting ? "检测中..." : "检测本行"}
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                    <div className="flex flex-wrap gap-2 items-center">
+                      <label className="text-xs text-slate-300">当前激活实例</label>
+                      <select
+                        value={activeChannelInstanceByChannel[channelInstancesEditorChannel] || ""}
+                        onChange={(e) =>
+                          setActiveChannelInstanceByChannel((prev) => ({
+                            ...prev,
+                            [channelInstancesEditorChannel]: e.target.value,
+                          }))
+                        }
+                        className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                      >
+                        <option value="">(未选择)</option>
+                        {channelInstancesDraft
+                          .filter((it) => it.channel === channelInstancesEditorChannel)
+                          .map((it) => (
+                            <option key={it.id} value={it.id}>
+                              {it.id} {it.name ? `· ${it.name}` : ""}
+                            </option>
+                          ))}
+                      </select>
+                      <button
+                        onClick={() => void saveAndApplyChannelSetup(channelInstancesEditorChannel)}
+                        disabled={agentRuntimeSaving}
+                        className="px-3 py-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
+                      >
+                        保存并应用
+                      </button>
+                      {showAgentAdvancedSettings && (
+                        <>
+                          <button
+                            onClick={() => void saveChannelInstances(channelInstancesEditorChannel)}
+                            disabled={agentRuntimeSaving}
+                            className="px-3 py-1 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                          >
+                            仅保存
+                          </button>
+                          <button
+                            onClick={() =>
+                              void applyChannelInstance(
+                                channelInstancesEditorChannel,
+                                activeChannelInstanceByChannel[channelInstancesEditorChannel] || ""
+                              )
+                            }
+                            disabled={agentRuntimeSaving || !(activeChannelInstanceByChannel[channelInstancesEditorChannel] || "")}
+                            className="px-3 py-1 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-xs"
+                          >
+                            重新应用
+                          </button>
+                        </>
+                      )}
+                    </div>
+                    </>
+                  )}
+
+                  {channelInstancesEditorChannel === "telegram" && (
+                    <>
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <p className="text-sm text-slate-200 font-medium">telegram 实例池</p>
+                      <div className="flex gap-2 flex-wrap">
+                        <button
+                          onClick={buildTelegramPerAgentDraft}
+                          className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-[11px]"
+                          title="① 先点这里：生成每个 Agent 的配置项"
+                        >
+                          按 Agent 自动生成 <span className="text-emerald-200/80 text-[10px]">① 先点</span>
+                        </button>
+                        {showAgentAdvancedSettings && (
+                          <>
+                            <button
+                              onClick={() => void runTelegramFirstSetupWizard()}
+                              disabled={telegramWizardRunning}
+                              className="px-2 py-1 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-[11px]"
+                              title="③ 填完 Token 后点这里：一键完成保存、应用、路由与测试"
+                            >
+                              {telegramWizardRunning ? "向导执行中..." : "首次配置向导"}
+                              <span className="text-indigo-200/80 text-[10px] ml-0.5">③ 填完点</span>
+                            </button>
+                            <button
+                              onClick={() => void testTelegramInstancesBatch()}
+                              disabled={telegramBatchTesting}
+                              className="px-2 py-1 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-[11px]"
+                            >
+                              {telegramBatchTesting ? "批量检测中..." : "批量 getMe 检查"}
+                            </button>
+                            <button
+                              onClick={() => void cleanupBrowserSessionsForTelegramBindings()}
+                              disabled={telegramSessionCleanupRunning}
+                              className="px-2 py-1 bg-fuchsia-700 hover:bg-fuchsia-600 disabled:opacity-50 rounded text-[11px]"
+                              title="仅保留当前 Telegram 路由绑定到 Agent 的会话（会重写 sessions.json）"
+                            >
+                              {telegramSessionCleanupRunning ? "清理中..." : "清理浏览器会话"}
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      可先点“按 Agent 自动生成”，界面会出现所有 Agent，你只需为每个 Agent 填 Token；点“首次配置向导”可一键完成保存、应用、路由和测试。
+                    </p>
+                    {!!agentsList.agents.length && (
+                      <div className="border border-slate-700 rounded p-2 space-y-2">
+                        <p className="text-xs text-slate-300">按 Agent 配置 Token（简化）</p>
+                        {agentsList.agents.map((a) => {
+                          const iid = `tg-${a.id}`;
+                          const item =
+                            telegramInstancesDraft.find((x) => x.id === iid) ||
+                            ({ id: iid, name: a.name || a.id, bot_token: "", chat_id: "", enabled: true } as TelegramBotInstance);
+                          const actualUsername = telegramUsernameByInstanceId[iid];
+                          const singleTesting = !!telegramSingleTestingByInstanceId[iid];
+                          return (
+                            <div key={`agent-tg-${a.id}`} className="space-y-1">
+                              <div className="grid grid-cols-1 md:grid-cols-6 gap-2">
+                                <div className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300">
+                                  {a.id}
+                                </div>
+                                <input
+                                  type="password"
+                                  value={item.bot_token}
+                                  onChange={(e) =>
+                                    setTelegramInstancesDraft((prev) => {
+                                      const next = [...prev];
+                                      const idx = next.findIndex((x) => x.id === iid);
+                                      const row = {
+                                        id: iid,
+                                        name: a.name || a.id,
+                                        bot_token: e.target.value,
+                                        chat_id: item.chat_id || "",
+                                        enabled: item.enabled,
+                                      };
+                                      if (idx >= 0) next[idx] = row;
+                                      else next.push(row);
+                                      return next;
+                                    })
+                                  }
+                                  placeholder={`${a.id} 的 Bot Token`}
+                                  className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs md:col-span-3"
+                                />
+                                <input
+                                  value={item.chat_id || ""}
+                                  onChange={(e) =>
+                                    setTelegramInstancesDraft((prev) => {
+                                      const next = [...prev];
+                                      const idx = next.findIndex((x) => x.id === iid);
+                                      const row = {
+                                        id: iid,
+                                        name: a.name || a.id,
+                                        bot_token: item.bot_token,
+                                        chat_id: e.target.value,
+                                        enabled: item.enabled,
+                                      };
+                                      if (idx >= 0) next[idx] = row;
+                                      else next.push(row);
+                                      return next;
+                                    })
+                                  }
+                                  placeholder="chatId(可选)"
+                                  className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                />
+                                <label className="flex items-center gap-1 text-xs text-slate-300">
+                                  <input
+                                    type="checkbox"
+                                    checked={item.enabled}
+                                    onChange={(e) =>
+                                      setTelegramInstancesDraft((prev) => {
+                                        const next = [...prev];
+                                        const idx = next.findIndex((x) => x.id === iid);
+                                        const row = {
+                                          id: iid,
+                                          name: a.name || a.id,
+                                          bot_token: item.bot_token,
+                                          chat_id: item.chat_id || "",
+                                          enabled: e.target.checked,
+                                        };
+                                        if (idx >= 0) next[idx] = row;
+                                        else next.push(row);
+                                        return next;
+                                      })
+                                    }
+                                  />
+                                  启用
+                                </label>
+                              </div>
+                              <div className="flex items-center justify-between gap-2">
+                                <p className="text-[11px] text-slate-400">
+                                  token 实际对应的 bot username：{actualUsername ? `@${actualUsername}` : "未识别（可点本行检测）"}
+                                </p>
+                                <button
+                                  onClick={() => void testSingleTelegramInstance(iid)}
+                                  disabled={singleTesting || !item.bot_token?.trim()}
+                                  className="px-2 py-1 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-[11px]"
+                                  title="检测 Token 连通性，失败时会给出修复建议"
+                                >
+                                  {singleTesting ? "检测中..." : "检测用户名"}
+                                </button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                    <div className="flex flex-wrap gap-2 items-center">
+                      <label className="text-xs text-slate-300">当前激活实例</label>
+                      <select
+                        value={activeTelegramInstanceId}
+                        onChange={(e) => setActiveTelegramInstanceId(e.target.value)}
+                        className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                      >
+                        <option value="">(未选择)</option>
+                        {telegramInstancesDraft.map((it) => (
+                          <option key={it.id} value={it.id}>
+                            {it.id} {it.name ? `· ${it.name}` : ""}
+                            {telegramUsernameByInstanceId[it.id] ? ` · @${telegramUsernameByInstanceId[it.id]}` : ""}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={() => void saveAndApplyTelegramSetup()}
+                        disabled={agentRuntimeSaving}
+                        className="px-3 py-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
+                      >
+                        保存并应用
+                      </button>
+                      {showAgentAdvancedSettings && (
+                        <>
+                          <button
+                            onClick={() => void saveTelegramInstances()}
+                            disabled={agentRuntimeSaving}
+                            className="px-3 py-1 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                          >
+                            仅保存
+                          </button>
+                          <button
+                            onClick={() => void applyTelegramInstance(activeTelegramInstanceId)}
+                            disabled={agentRuntimeSaving || !activeTelegramInstanceId}
+                            className="px-3 py-1 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-xs"
+                          >
+                            重新应用
+                          </button>
+                        </>
+                      )}
+                    </div>
+                    </>
+                  )}
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-3 space-y-3">
+                    <div className="flex items-start justify-between gap-2 flex-wrap">
+                      <div>
+                        <p className="text-sm text-slate-200 font-medium">Agent 网关控制台（每个 Agent 一个）</p>
+                        <p className="text-[11px] text-slate-400 mt-0.5">
+                          {simpleModeForAgent
+                            ? "系统会自动把同一 Agent 的 Telegram / QQ / 飞书等渠道合并到同一个网关里。这里展示的已接入渠道，就是最终绑定结果。"
+                            : "高级模式下仍可检查网关字段，但运行时会自动收敛为每个 Agent 一个网关。这里展示的已接入渠道，就是最终绑定结果。"}
+                        </p>
+                      </div>
+                      {(gatewayBindingsDraft?.length ?? 0) === 0 && (
+                        <div className="rounded border border-amber-600/60 bg-amber-900/20 px-2 py-1.5 text-[11px] text-amber-200">
+                          提示：先点「按 Agent 自动生成网关」或完成上方实例池配置
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        onClick={() => void refreshGatewayInstances()}
+                        className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs"
+                      >
+                        刷新网关状态
+                      </button>
+                      <button
+                        onClick={() => setShowGatewayAdvancedActions((prev) => !prev)}
+                        className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                      >
+                        {showGatewayAdvancedActions ? "收起网关高级操作" : "展开网关高级操作"}
+                      </button>
+                      {showGatewayAdvancedActions && (
+                        <>
+                          {!simpleModeForAgent && (
+                            <button
+                              onClick={() =>
+                                setGatewayBindingsDraft((prev) => [
+                                  ...prev,
+                                  (() => {
+                                    const aid = agentsList.agents[0]?.id || "main";
+                                    const channelMap = buildChannelInstanceMapForAgent(aid);
+                                    const fallbackChannel = channelInstancesEditorChannel;
+                                    const fallbackInstance =
+                                      channelMap[fallbackChannel] ||
+                                      channelMap.telegram ||
+                                      Object.values(channelMap)[0] ||
+                                      "";
+                                    return {
+                                      gateway_id: `gw-${fallbackChannel}-${Date.now().toString(36)}`,
+                                      agent_id: aid,
+                                      channel: fallbackChannel,
+                                      instance_id: fallbackInstance,
+                                      channel_instances: channelMap,
+                                      enabled: true,
+                                      auto_restart: true,
+                                    } as GatewayBinding;
+                                  })(),
+                                ])
+                              }
+                              className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                            >
+                              新增网关绑定
+                            </button>
+                          )}
+                          <button
+                            onClick={() => void saveGatewayBindings()}
+                            disabled={agentRuntimeSaving}
+                            className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
+                          >
+                            保存 Agent 网关
+                          </button>
+                          <button
+                            onClick={generateGatewayBindingsByAgent}
+                            className="px-3 py-1.5 bg-violet-700 hover:bg-violet-600 rounded text-xs"
+                            title="为每个 Agent 自动生成一个网关，并绑定当前激活的多渠道实例"
+                          >
+                            按 Agent 自动生成网关
+                          </button>
+                          <button
+                            onClick={() => void runStartAllEnabledGateways()}
+                            disabled={gatewayBatchLoading === "start"}
+                            className="px-3 py-1.5 bg-emerald-800 hover:bg-emerald-700 disabled:opacity-50 rounded text-xs"
+                          >
+                            {gatewayBatchLoading === "start" ? "批量启动中..." : "批量启动全部启用网关"}
+                          </button>
+                          <button
+                            onClick={() => void runHealthAllEnabledGateways()}
+                            disabled={gatewayBatchLoading === "health"}
+                            className="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs"
+                          >
+                            {gatewayBatchLoading === "health" ? "批量检查中..." : "批量健康检查"}
+                          </button>
+                          <button
+                            onClick={() => void exportGatewayDiagnosticReport()}
+                            disabled={gatewayBatchLoading === "report"}
+                            className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-xs"
+                          >
+                            {gatewayBatchLoading === "report" ? "导出中..." : "导出多网关诊断报告"}
+                          </button>
+                        </>
+                      )}
+                    </div>
+                    <div className="space-y-2" style={heavyPanelStyle}>
+                      {(gatewayBindingsDraft || []).length === 0 ? (
+                        <p className="text-xs text-slate-500">暂无网关绑定。保存并应用任一渠道实例后会自动生成。</p>
+                      ) : (
+                        gatewayBindingsDraft.map((g, idx) => {
+                          const loading = !!gatewayActionLoadingById[g.gateway_id];
+                          return (
+                            <div
+                              key={`gw-row-${g.gateway_id}-${idx}`}
+                              className="border border-slate-700 rounded p-2 grid grid-cols-1 md:grid-cols-12 gap-2"
+                              style={heavyPanelStyle}
+                            >
+                              {simpleModeForAgent ? (
+                                <>
+                                  <div className="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs md:col-span-4">
+                                    <p className="text-slate-200 font-medium">{g.agent_id}</p>
+                                    <p className="text-slate-400 mt-1">
+                                      网关 ID：{g.gateway_id}
+                                      {g.listen_port ? ` · 端口 ${g.listen_port}` : ""}
+                                    </p>
+                                  </div>
+                                  <div className="bg-slate-900 border border-slate-700 rounded px-3 py-2 text-xs md:col-span-5">
+                                    <p className="text-slate-300">已接入渠道</p>
+                                    <p className="text-slate-400 mt-1 break-all">
+                                      {formatOrderedChannelBindings(g.channel_instances, { channel: g.channel, instance_id: g.instance_id })}
+                                    </p>
+                                  </div>
+                                </>
+                              ) : (
+                                <>
+                                  <input
+                                    value={g.gateway_id}
+                                    onChange={(e) =>
+                                      setGatewayBindingsDraft((prev) =>
+                                        prev.map((x, i) => (i === idx ? { ...x, gateway_id: e.target.value } : x))
+                                      )
+                                    }
+                                    placeholder="gateway_id"
+                                    className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs md:col-span-2"
+                                  />
+                                  <select
+                                    value={g.agent_id}
+                                    onChange={(e) =>
+                                      setGatewayBindingsDraft((prev) =>
+                                        prev.map((x, i) => (i === idx ? { ...x, agent_id: e.target.value } : x))
+                                      )
+                                    }
+                                    className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs md:col-span-2"
+                                  >
+                                    {agentsList.agents.map((a) => (
+                                      <option key={`gw-a-${g.gateway_id}-${a.id}`} value={a.id}>
+                                        {a.id}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <select
+                                    value={g.channel}
+                                    onChange={(e) =>
+                                      setGatewayBindingsDraft((prev) =>
+                                        prev.map((x, i) => (i === idx ? { ...x, channel: e.target.value } : x))
+                                      )
+                                    }
+                                    className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                  >
+                                    {["telegram", "feishu", "dingtalk", "discord", "qq"].map((ch) => (
+                                      <option key={`gw-ch-${g.gateway_id}-${ch}`} value={ch}>
+                                        {ch}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <input
+                                    value={g.instance_id}
+                                    onChange={(e) =>
+                                      setGatewayBindingsDraft((prev) =>
+                                        prev.map((x, i) => (i === idx ? { ...x, instance_id: e.target.value } : x))
+                                      )
+                                    }
+                                    placeholder="instance_id"
+                                    className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                  />
+                                </>
+                              )}
+                              {!simpleModeForAgent && (
+                                <>
+                                  <input
+                                    value={stringifyGatewayChannelInstances(g.channel_instances, g.channel, g.instance_id)}
+                                    onChange={(e) =>
+                                      setGatewayBindingsDraft((prev) =>
+                                        prev.map((x, i) =>
+                                          i === idx
+                                            ? {
+                                                ...x,
+                                                channel_instances: parseGatewayChannelInstancesText(
+                                                  e.target.value,
+                                                  x.channel,
+                                                  x.instance_id
+                                                ),
+                                              }
+                                            : x
+                                        )
+                                      )
+                                    }
+                                    placeholder="多渠道映射: telegram:tg-main,feishu:feishu-main"
+                                    className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs md:col-span-3"
+                                  />
+                                  <button
+                                    onClick={() =>
+                                      setGatewayBindingsDraft((prev) =>
+                                        prev.map((x, i) =>
+                                          i === idx ? { ...x, channel_instances: buildChannelInstanceMapForAgent(x.agent_id) } : x
+                                        )
+                                      )
+                                    }
+                                    className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                                    title="优先按该 Agent 的路由实例填充映射，其次回退到当前激活实例"
+                                  >
+                                    按 Agent 路由填充
+                                  </button>
+                                </>
+                              )}
+                              {!simpleModeForAgent && (
+                                <input
+                                  value={g.listen_port ?? ""}
+                                  onChange={(e) =>
+                                    setGatewayBindingsDraft((prev) =>
+                                      prev.map((x, i) => ({
+                                        ...x,
+                                        listen_port: i === idx ? (e.target.value ? Number(e.target.value) : undefined) : x.listen_port,
+                                      }))
+                                    )
+                                  }
+                                  placeholder="port"
+                                  className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                />
+                              )}
+                              <label className="flex items-center gap-1 text-xs text-slate-300">
+                                <input
+                                  type="checkbox"
+                                  checked={!!g.enabled}
+                                  onChange={(e) =>
+                                    setGatewayBindingsDraft((prev) =>
+                                      prev.map((x, i) => (i === idx ? { ...x, enabled: e.target.checked } : x))
+                                    )
+                                  }
+                                />
+                                启用
+                              </label>
+                              {showGatewayAdvancedActions && (
+                                <div className="flex flex-wrap gap-1 md:col-span-3">
+                                  <button
+                                    onClick={() => void runGatewayAction("start", g.gateway_id)}
+                                    disabled={loading}
+                                    className="px-2 py-1 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-[11px]"
+                                  >
+                                    启动
+                                  </button>
+                                  <button
+                                    onClick={() => void runGatewayAction("stop", g.gateway_id)}
+                                    disabled={loading}
+                                    className="px-2 py-1 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-[11px]"
+                                  >
+                                    停止
+                                  </button>
+                                  <button
+                                    onClick={() => void runGatewayAction("restart", g.gateway_id)}
+                                    disabled={loading}
+                                    className="px-2 py-1 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-[11px]"
+                                  >
+                                    重启
+                                  </button>
+                                  <button
+                                    onClick={() => void runGatewayAction("health", g.gateway_id)}
+                                    disabled={loading}
+                                    className="px-2 py-1 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-[11px]"
+                                  >
+                                    探活
+                                  </button>
+                                  <button
+                                    onClick={() => void runGatewayAction("logs", g.gateway_id)}
+                                    disabled={loading}
+                                    className="px-2 py-1 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-[11px]"
+                                  >
+                                    日志
+                                  </button>
+                                </div>
+                              )}
+                              <div
+                                className="text-[11px] text-slate-400 md:col-span-12"
+                                title={g.health?.detail || ""}
+                              >
+                                状态: {g.health?.status || "unknown"} · {summarizeGatewayHealthDetail(g.health?.detail)}
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-3 space-y-3" style={heavyPanelStyle}>
+                    <div className="flex items-start justify-between gap-2 flex-wrap">
+                      <div>
+                        <p className="text-sm text-slate-200 font-medium">手动路由覆盖</p>
+                        <p className="text-xs text-slate-400 mt-1">
+                          默认不用改。只有需要强制指定网关、实例，或按 account / peer / chatId 做特殊分流时，才需要改这里。
+                        </p>
+                      </div>
+                      {showAgentAdvancedSettings && (
+                        <button
+                          onClick={() => setShowAdvancedRouteRules((prev) => !prev)}
+                          className="px-3 py-1.5 rounded border border-slate-600 text-xs text-slate-200 hover:border-slate-500 hover:bg-slate-800/70"
+                        >
+                          {showAdvancedRouteRules ? "收起手动路由覆盖" : "展开手动路由覆盖"}
+                        </button>
+                      )}
+                    </div>
+                    {!showAgentAdvancedSettings && (
+                      <p className="text-[11px] text-slate-500">
+                        如需做特殊分流，请先展开高级设置，再打开这里。
+                      </p>
+                    )}
+                    {showAgentAdvancedSettings && showAdvancedRouteRules && (
+                      <div className="space-y-3 rounded border border-slate-700 bg-slate-950/30 p-3">
+                        {telegramInstancesDraft.length === 0 && (
+                          <div className="rounded border border-amber-700 bg-amber-900/20 p-2 text-xs text-amber-200">
+                            你还没有配置 Telegram 实例。请先在上方点“按 Agent 自动生成”，填写 Token 后保存并应用到网关。
+                          </div>
+                        )}
+                        <div className="space-y-2">
+                          {channelRoutesDraft.map((r, idx) => (
+                            <div key={r.id || `route-${idx}`} className="border border-slate-700 rounded p-2 grid grid-cols-1 md:grid-cols-9 gap-2">
+                              <label className="flex items-center gap-1 text-xs text-slate-300">
+                                <input
+                                  type="checkbox"
+                                  checked={r.enabled}
+                                  onChange={(e) =>
+                                    setChannelRoutesDraft((prev) =>
+                                      prev.map((x, i) => (i === idx ? { ...x, enabled: e.target.checked } : x))
+                                    )
+                                  }
+                                />
+                                启用
+                              </label>
+                              <select
+                                value={r.channel}
+                                onChange={(e) =>
+                                  setChannelRoutesDraft((prev) =>
+                                    prev.map((x, i) => (i === idx ? { ...x, channel: e.target.value } : x))
+                                  )
+                                }
+                                className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                              >
+                                {["telegram", "feishu", "dingtalk", "discord", "qq"].map((ch) => (
+                                  <option key={ch} value={ch}>
+                                    {ch}
+                                  </option>
+                                ))}
+                              </select>
+                              <select
+                                value={r.agent_id}
+                                onChange={(e) =>
+                                  setChannelRoutesDraft((prev) =>
+                                    prev.map((x, i) => (i === idx ? { ...x, agent_id: e.target.value } : x))
+                                  )
+                                }
+                                className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                              >
+                                {agentsList.agents.map((a) => (
+                                  <option key={a.id} value={a.id}>
+                                    {a.id}
+                                  </option>
+                                ))}
+                              </select>
+                              <select
+                                value={r.gateway_id || ""}
+                                onChange={(e) =>
+                                  setChannelRoutesDraft((prev) =>
+                                    prev.map((x, i) =>
+                                      i === idx ? { ...x, gateway_id: e.target.value || undefined } : x
+                                    )
+                                  )
+                                }
+                                className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                title="可指定网关实例（优先于bot_instance）"
+                              >
+                                <option value="">网关(任意)</option>
+                                {gatewayBindingsDraft.map((g) => (
+                                  <option key={`gw-opt-${g.gateway_id}`} value={g.gateway_id}>
+                                    {g.gateway_id}
+                                  </option>
+                                ))}
+                              </select>
+                              <select
+                                value={r.bot_instance || ""}
+                                onChange={(e) =>
+                                  setChannelRoutesDraft((prev) =>
+                                    prev.map((x, i) => (i === idx ? { ...x, bot_instance: e.target.value || undefined } : x))
+                                  )
+                                }
+                                className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                title="可指定渠道实例"
+                              >
+                                <option value="">实例(任意)</option>
+                                {getChannelInstanceIdsByChannel(r.channel).map((iid) => (
+                                  <option key={iid} value={iid}>
+                                    {iid}
+                                  </option>
+                                ))}
+                              </select>
+                              <input
+                                value={r.account || ""}
+                                onChange={(e) =>
+                                  setChannelRoutesDraft((prev) =>
+                                    prev.map((x, i) => (i === idx ? { ...x, account: e.target.value } : x))
+                                  )
+                                }
+                                placeholder="account(可选)"
+                                className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                              />
+                              <input
+                                value={r.peer || ""}
+                                onChange={(e) =>
+                                  setChannelRoutesDraft((prev) =>
+                                    prev.map((x, i) => (i === idx ? { ...x, peer: e.target.value } : x))
+                                  )
+                                }
+                                placeholder="peer/chatId(可选)"
+                                className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                              />
+                              <button
+                                onClick={() => setChannelRoutesDraft((prev) => prev.filter((_, i) => i !== idx))}
+                                className="px-2 py-1 bg-rose-700 hover:bg-rose-600 rounded text-[11px]"
+                              >
+                                删除
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            onClick={() =>
+                              setChannelRoutesDraft((prev) => [
+                                ...prev,
+                                {
+                                  id: "",
+                                  channel: "telegram",
+                                  agent_id: agentsList.agents[0]?.id || "main",
+                                  bot_instance: "",
+                                  account: "",
+                                  peer: "",
+                                  enabled: true,
+                                },
+                              ])
+                            }
+                            className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                          >
+                            新增覆盖规则
+                          </button>
+                          <button
+                            onClick={() => void saveChannelRoutes()}
+                            disabled={agentRuntimeSaving}
+                            className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
+                          >
+                            {agentRuntimeSaving ? "保存中..." : "保存手动覆盖"}
+                          </button>
+                        </div>
+                        <div className="border border-slate-700 rounded p-2 space-y-2">
+                          <div className="flex items-center justify-between gap-2 flex-wrap">
+                            <p className="text-xs text-slate-300">路由命中测试</p>
+                            <button
+                              onClick={() => setShowRouteTestPanel((prev) => !prev)}
+                              className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                            >
+                              {showRouteTestPanel ? "收起测试面板" : "展开测试面板"}
+                            </button>
+                          </div>
+                          {showRouteTestPanel && (
+                            <>
+                              <div className="grid grid-cols-1 md:grid-cols-6 gap-2">
+                                <select
+                                  value={gatewaySelectedIdForRouteTest}
+                                  onChange={(e) => setGatewaySelectedIdForRouteTest(e.target.value)}
+                                  className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                >
+                                  <option value="">网关(任意)</option>
+                                  {gatewayBindingsDraft.map((g) => (
+                                    <option key={`route-gw-${g.gateway_id}`} value={g.gateway_id}>
+                                      {g.gateway_id}
+                                    </option>
+                                  ))}
+                                </select>
+                                <select
+                                  value={routeTestChannel}
+                                  onChange={(e) => setRouteTestChannel(e.target.value)}
+                                  className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                >
+                                  {["telegram", "feishu", "dingtalk", "discord", "qq"].map((ch) => (
+                                    <option key={ch} value={ch}>
+                                      {ch}
+                                    </option>
+                                  ))}
+                                </select>
+                                <select
+                                  value={routeTestBotInstance}
+                                  onChange={(e) => setRouteTestBotInstance(e.target.value)}
+                                  className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                >
+                                  <option value="">实例(任意)</option>
+                                  {getChannelInstanceIdsByChannel(routeTestChannel).map((iid) => (
+                                    <option key={iid} value={iid}>
+                                      {iid}
+                                    </option>
+                                  ))}
+                                </select>
+                                <input
+                                  value={routeTestAccount}
+                                  onChange={(e) => setRouteTestAccount(e.target.value)}
+                                  placeholder="account(可选)"
+                                  className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                />
+                                <input
+                                  value={routeTestPeer}
+                                  onChange={(e) => setRouteTestPeer(e.target.value)}
+                                  placeholder="peer/chatId(可选)"
+                                  className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs"
+                                />
+                                <button
+                                  onClick={() => void testChannelRoute()}
+                                  disabled={routeTesting}
+                                  className="px-3 py-1 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-xs"
+                                >
+                                  {routeTesting ? "测试中..." : "测试命中"}
+                                </button>
+                              </div>
+                              {routeTestResult && <p className="text-xs text-sky-300 whitespace-pre-wrap">{routeTestResult}</p>}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  {gatewayLogViewerId && (
+                    <div
+                      className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center"
+                      onClick={() => setGatewayLogViewerId(null)}
+                    >
+                      <div
+                        className="w-[92vw] max-w-4xl bg-slate-900 border border-slate-700 rounded-lg p-3 space-y-2"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div className="flex items-center justify-between">
+                          <p className="text-sm text-slate-200">网关日志：{gatewayLogViewerId}</p>
+                          <button
+                            onClick={() => setGatewayLogViewerId(null)}
+                            className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                          >
+                            关闭
+                          </button>
+                        </div>
+                        <pre className="max-h-[60vh] overflow-auto bg-slate-950/70 border border-slate-800 rounded p-2 text-[11px] text-slate-300 whitespace-pre-wrap">
+                          {gatewayLogsById[gatewayLogViewerId] || "(暂无日志)"}
+                        </pre>
+                      </div>
+                    </div>
+                  )}
+                  {showCreateAgent && (
+                    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50" onClick={() => setShowCreateAgent(false)}>
+                      <div className="bg-slate-800 rounded-lg p-4 max-w-md w-full mx-2 space-y-2" onClick={(e) => e.stopPropagation()}>
+                        <h3 className="font-medium text-slate-200">新建 Agent</h3>
+                        <label className="block text-xs text-slate-400">ID (必填)</label>
+                        <input
+                          value={createAgentId}
+                          onChange={(e) => setCreateAgentId(e.target.value)}
+                          placeholder="work-agent"
+                          className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-sm"
+                        />
+                        <label className="block text-xs text-slate-400">名称 (选填)</label>
+                        <input
+                          value={createAgentName}
+                          onChange={(e) => setCreateAgentName(e.target.value)}
+                          placeholder="显示名称"
+                          className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-sm"
+                        />
+                        <label className="block text-xs text-slate-400">Workspace (选填)</label>
+                        <input
+                          value={createAgentWorkspace}
+                          onChange={(e) => setCreateAgentWorkspace(e.target.value)}
+                          placeholder="留空使用默认"
+                          className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-sm"
+                        />
+                        <div className="flex gap-2 pt-2">
+                          <button
+                            onClick={() => setShowCreateAgent(false)}
+                            className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                          >
+                            取消
+                          </button>
+                          <button
+                            onClick={async () => {
+                              if (!createAgentId.trim()) {
+                                alert("请输入 Agent ID");
+                                return;
+                              }
+                              const newAgentId = createAgentId.trim();
+                              setCreatingAgent(true);
+                              try {
+                                await invoke("create_agent", {
+                                  id: newAgentId,
+                                  name: createAgentName.trim() || undefined,
+                                  workspace: createAgentWorkspace.trim() || undefined,
+                                  customPath: normalizeConfigPath(customConfigPath) || undefined,
+                                });
+                                setShowCreateAgent(false);
+                                setCreateAgentId("");
+                                setCreateAgentName("");
+                                setCreateAgentWorkspace("");
+                                await refreshAgentsList();
+                                await setAgentSpecialtyIdentity(newAgentId);
+                              } catch (e) {
+                                alert(String(e));
+                              } finally {
+                                setCreatingAgent(false);
+                              }
+                            }}
+                            disabled={creatingAgent}
+                            className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-xs"
+                          >
+                            {creatingAgent ? "创建中..." : "创建"}
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <p className="text-xs text-slate-400">暂无 Agent 数据</p>
+              )}
+            </div>
+            )}
+
+            {false && tuningSection === "chat" && (
+            <div className="flex flex-col gap-2" style={{ minHeight: 520 }}>
+              <div className="flex items-center justify-between">
+                <p className="text-xs text-slate-400">
+                  聊天对话：左侧选择 Agent，右侧是会话内容。支持手动 @agent 与自动路由。
+                </p>
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-slate-400">路由模式</label>
+                  <select
+                    value={routeMode}
+                    onChange={(e) => setRouteMode(e.target.value as "manual" | "auto")}
+                    className="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs"
+                  >
+                    <option value="manual">手动</option>
+                    <option value="auto">自动</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="flex gap-2 flex-1 min-h-0">
+                <div className="w-52 shrink-0 flex flex-col gap-1 bg-slate-800/50 rounded-lg p-2 overflow-y-auto">
+                  {(agentsList?.agents || []).length > 0 ? (
+                    (agentsList?.agents || []).map((a) => {
+                      const selected = selectedAgentId === a.id;
+                      const specialty = getAgentSpecialty(a.id);
+                      const unread = unreadByAgent[a.id] || 0;
+                      return (
+                        <button
+                          key={a.id}
+                          onClick={() => {
+                            void handleSelectAgentForChat(a.id);
+                            invoke("set_default_agent", {
+                              id: a.id,
+                              customPath: normalizeConfigPath(customConfigPath) || undefined,
+                            })
+                              .then(() => refreshAgentsList())
+                              .catch((e) => {
+                                setChatError(String(e));
+                              });
+                          }}
+                          className={`text-left px-2 py-2 rounded text-xs ${
+                            selected ? "bg-sky-700 text-sky-100" : "bg-slate-700/60 hover:bg-slate-600 text-slate-200"
+                          }`}
+                          title={a.workspace || a.id}
+                        >
+                          <div className="flex items-center justify-between">
+                            <span className="truncate">{a.name || a.id}</span>
+                            {unread > 0 && (
+                              <span className="bg-rose-600 text-white rounded-full px-1.5 text-[10px]">{unread}</span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-slate-300/80 mt-0.5">
+                            {a.id} · {specialty}
+                          </div>
+                        </button>
+                      );
+                    })
+                  ) : (
+                    <p className="text-xs text-slate-500 px-2">暂无 Agent</p>
+                  )}
+                </div>
+
+                <div className="flex-1 min-w-0 bg-slate-900/50 rounded-lg overflow-hidden border border-slate-700/60 flex flex-col">
+                  <div className="px-3 py-2 border-b border-slate-700/60 flex items-center justify-between">
+                    <div className="text-sm text-slate-200">
+                      当前会话：<span className="font-medium">{selectedAgentId || "(未选择)"}</span>
+                      {selectedAgentId && (
+                        <span className="text-xs text-slate-400 ml-2">
+                          专长：{getAgentSpecialty(selectedAgentId)}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={handleNewSessionLocal}
+                        className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                      >
+                        新会话
+                      </button>
+                      <button
+                        onClick={() =>
+                          setMessagesByAgent((prev) => ({ ...prev, [selectedAgentId]: [] }))
+                        }
+                        className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                      >
+                        清空
+                      </button>
+                      <button
+                        onClick={handleAbortChat}
+                        className="px-2 py-1 bg-rose-700 hover:bg-rose-600 rounded text-xs"
+                      >
+                        停止
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex-1 overflow-y-auto p-3 space-y-2 min-h-[320px]">
+                    {chatLoading && (
+                      <p className="text-xs text-slate-500">正在加载历史...</p>
+                    )}
+                    {!chatLoading && (messagesByAgent[selectedAgentId] || []).length === 0 && (
+                      <p className="text-xs text-slate-500">暂无消息，开始对话吧。</p>
+                    )}
+                    {(messagesByAgent[selectedAgentId] || []).map((m) => {
+                      const isUser = m.role === "user";
+                      return (
+                        <div key={m.id} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+                          <div
+                            className={`max-w-[78%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap ${
+                              isUser ? "bg-sky-700 text-white" : "bg-slate-800 text-slate-100"
+                            }`}
+                          >
+                            <div>{m.text}</div>
+                            <div className={`text-[10px] mt-1 ${isUser ? "text-sky-100/70" : "text-slate-400"}`}>
+                              {m.status === "sending" && "发送中..."}
+                              {m.status === "failed" && "发送失败，可重试"}
+                              {(m.status === "sent" || !m.status) && (m.timestamp || m.role)}
+                            </div>
+                            {m.status === "failed" && (
+                              <button
+                                onClick={() => setChatDraft(m.text)}
+                                className="mt-1 text-[10px] text-amber-300 hover:text-amber-200 underline"
+                              >
+                                回填重试
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  <div className="border-t border-slate-700/60 p-3 space-y-2">
+                    {routeHint && (
+                      <p className="text-xs text-emerald-300">{routeHint}</p>
+                    )}
+                    {chatError && (
+                      <p className="text-xs text-rose-400">{chatError}</p>
+                    )}
+                    <div className="flex gap-2">
+                      <textarea
+                        value={chatDraft}
+                        onChange={(e) => setChatDraft(e.target.value)}
+                        placeholder="输入消息，手动路由可用 @code 你的问题"
+                        rows={2}
+                        className="flex-1 bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm resize-none"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" && !e.shiftKey) {
+                            e.preventDefault();
+                            void handleSendChat();
+                          }
+                        }}
+                      />
+                      <button
+                        onClick={() => void handleSendChat()}
+                        disabled={chatSending || !selectedAgentId}
+                        className="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-sm"
+                      >
+                        {chatSending ? "发送中..." : "发送"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            )}
+
+            {tuningSection === "control" && (
+            <div className="space-y-4">
+              <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+                <p className="font-medium text-slate-200">控制平面（Orchestrator / DAG / Ticket / Memory / Sandbox / Verifier）</p>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={handleSeedControlPlane}
+                    disabled={cpLoading}
+                    className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
+                  >
+                    初始化示例数据
+                  </button>
+                  <button
+                    onClick={loadControlPlaneOverview}
+                    disabled={cpLoading}
+                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                  >
+                    刷新总览
+                  </button>
+                </div>
+                {cpResult && <p className="text-xs text-emerald-300 whitespace-pre-wrap">{cpResult}</p>}
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                <div className="bg-slate-800/40 rounded-lg p-4 space-y-2">
+                  <p className="text-sm font-medium text-slate-200">总控编排 + 验收器</p>
+                  <input
+                    value={cpTaskTitle}
+                    onChange={(e) => setCpTaskTitle(e.target.value)}
+                    placeholder="任务标题"
+                    className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs"
+                  />
+                  <textarea
+                    value={cpTaskInput}
+                    onChange={(e) => setCpTaskInput(e.target.value)}
+                    rows={3}
+                    placeholder="输入任务，例如：抓取天气并生成日报后发送到钉钉"
+                    className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs resize-none"
+                  />
+                  <div className="flex gap-2">
+                    <button onClick={handleOrchestratorSubmit} disabled={cpLoading} className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 rounded text-xs disabled:opacity-50">提交任务</button>
+                  </div>
+                  <textarea
+                    value={cpVerifierOutput}
+                    onChange={(e) => setCpVerifierOutput(e.target.value)}
+                    rows={3}
+                    placeholder="Verifier 待检输出"
+                    className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs resize-none"
+                  />
+                  <textarea
+                    value={cpVerifierConstraints}
+                    onChange={(e) => setCpVerifierConstraints(e.target.value)}
+                    rows={2}
+                    placeholder="每行一个约束"
+                    className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs resize-none"
+                  />
+                  <button onClick={handleVerifierCheck} disabled={cpLoading} className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs disabled:opacity-50">执行验收</button>
+                  {cpVerifierReport && (
+                    <p className={`text-xs ${cpVerifierReport.passed ? "text-emerald-300" : "text-amber-300"}`}>
+                      结果：{cpVerifierReport.passed ? "通过" : "不通过"} / score={cpVerifierReport.score.toFixed(2)} / {cpVerifierReport.reasons.join("；")}
+                    </p>
+                  )}
+                </div>
+
+                <div className="bg-slate-800/40 rounded-lg p-4 space-y-2">
+                  <p className="text-sm font-medium text-slate-200">技能流水线（Skill Graph DAG）</p>
+                  <input value={cpGraphName} onChange={(e) => setCpGraphName(e.target.value)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs" />
+                  <textarea value={cpGraphNodesJson} onChange={(e) => setCpGraphNodesJson(e.target.value)} rows={4} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs font-mono resize-none" />
+                  <textarea value={cpGraphEdgesJson} onChange={(e) => setCpGraphEdgesJson(e.target.value)} rows={3} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs font-mono resize-none" />
+                  <div className="flex gap-2">
+                    <button onClick={handleSaveSkillGraph} disabled={cpLoading} className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 rounded text-xs disabled:opacity-50">保存DAG</button>
+                    <select value={cpSelectedGraphId} onChange={(e) => setCpSelectedGraphId(e.target.value)} className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs">
+                      <option value="">选择技能图</option>
+                      {cpGraphs.map((g) => <option key={g.id} value={g.id}>{g.name}</option>)}
+                    </select>
+                    <button onClick={handleExecuteSkillGraph} disabled={cpLoading || !cpSelectedGraphId} className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 rounded text-xs disabled:opacity-50">执行DAG</button>
+                  </div>
+                </div>
+
+                <div className="bg-slate-800/40 rounded-lg p-4 space-y-2">
+                  <p className="text-sm font-medium text-slate-200">跨渠道工单 + 分层记忆</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <input value={cpTicketChannel} onChange={(e) => setCpTicketChannel(e.target.value)} placeholder="channel" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <input value={cpTicketExternalRef} onChange={(e) => setCpTicketExternalRef(e.target.value)} placeholder="external_ref" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                  </div>
+                  <input value={cpTicketTitle} onChange={(e) => setCpTicketTitle(e.target.value)} placeholder="ticket title" className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                  <textarea value={cpTicketPayload} onChange={(e) => setCpTicketPayload(e.target.value)} rows={2} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs font-mono resize-none" />
+                  <button onClick={handleCreateTicket} disabled={cpLoading} className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 rounded text-xs disabled:opacity-50">创建工单</button>
+                  <div className="grid grid-cols-3 gap-2">
+                    <input value={cpMemoryLayer} onChange={(e) => setCpMemoryLayer(e.target.value)} placeholder="layer" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <input value={cpMemoryScope} onChange={(e) => setCpMemoryScope(e.target.value)} placeholder="scope" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <input value={cpMemoryTags} onChange={(e) => setCpMemoryTags(e.target.value)} placeholder="tags" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                  </div>
+                  <textarea value={cpMemoryContent} onChange={(e) => setCpMemoryContent(e.target.value)} rows={2} placeholder="记忆内容" className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs resize-none" />
+                  <input value={cpMemoryRationale} onChange={(e) => setCpMemoryRationale(e.target.value)} placeholder="引用原因/解释" className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                  <button onClick={handleMemoryWriteLayered} disabled={cpLoading} className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 rounded text-xs disabled:opacity-50">写入记忆</button>
+                </div>
+
+                <div className="bg-slate-800/40 rounded-lg p-4 space-y-2">
+                  <p className="text-sm font-medium text-slate-200">沙箱执行 + 辩论 + 快照 + PromptOps + 企业化</p>
+                  <div className="grid grid-cols-2 gap-2">
+                    <input value={cpSandboxActionType} onChange={(e) => setCpSandboxActionType(e.target.value)} placeholder="action_type" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <input value={cpSandboxResource} onChange={(e) => setCpSandboxResource(e.target.value)} placeholder="resource" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                  </div>
+                  <div className="flex gap-2 items-center">
+                    <button onClick={handleSandboxPreview} disabled={cpLoading} className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 rounded text-xs disabled:opacity-50">沙箱预览</button>
+                    <label className="text-xs text-slate-300 flex items-center gap-1">
+                      <input type="checkbox" checked={cpSandboxApproved} onChange={(e) => setCpSandboxApproved(e.target.checked)} />
+                      已审批
+                    </label>
+                    <button onClick={handleSandboxExecute} disabled={cpLoading} className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 rounded text-xs disabled:opacity-50">执行沙箱</button>
+                  </div>
+                  {cpSandboxPreview && (
+                    <p className="text-xs text-slate-300">风险: {cpSandboxPreview.risk_level} / 审批: {cpSandboxPreview.requires_approval ? "需要" : "无需"} / 计划: {cpSandboxPreview.plan.join(" -> ")}</p>
+                  )}
+                  <div className="flex gap-2">
+                    <input value={cpDebateTask} onChange={(e) => setCpDebateTask(e.target.value)} className="flex-1 bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <button onClick={handleDebateRun} disabled={cpLoading} className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs disabled:opacity-50">辩论</button>
+                  </div>
+                  {cpDebateResult && (
+                    <p className="text-xs text-slate-300">裁判: {cpDebateResult.judge_summary}</p>
+                  )}
+                  <div className="grid grid-cols-2 gap-2">
+                    <input value={cpSnapshotTaskId} onChange={(e) => setCpSnapshotTaskId(e.target.value)} placeholder="snapshot task_id" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <input value={cpSnapshotInput} onChange={(e) => setCpSnapshotInput(e.target.value)} placeholder="snapshot input" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                  </div>
+                  <input value={cpSnapshotTools} onChange={(e) => setCpSnapshotTools(e.target.value)} placeholder="tools csv" className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                  <input value={cpSnapshotConfig} onChange={(e) => setCpSnapshotConfig(e.target.value)} placeholder="snapshot config json" className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs font-mono" />
+                  <button onClick={handleCreateSnapshot} disabled={cpLoading} className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 rounded text-xs disabled:opacity-50">创建快照</button>
+                  <div className="grid grid-cols-3 gap-2">
+                    <input value={cpPromptName} onChange={(e) => setCpPromptName(e.target.value)} placeholder="policy name" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <input type="number" min={0} max={100} value={cpPromptTraffic} onChange={(e) => setCpPromptTraffic(Number(e.target.value))} className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <button onClick={handleCreatePromptVersion} disabled={cpLoading} className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs disabled:opacity-50">建版本</button>
+                  </div>
+                  <input value={cpPromptRules} onChange={(e) => setCpPromptRules(e.target.value)} placeholder="rules json" className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs font-mono" />
+                  <div className="grid grid-cols-3 gap-2">
+                    <input value={cpRoleUserId} onChange={(e) => setCpRoleUserId(e.target.value)} placeholder="user_id" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <input value={cpRoleName} onChange={(e) => setCpRoleName(e.target.value)} placeholder="role" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <button onClick={handleSetRoleBinding} disabled={cpLoading} className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 rounded text-xs disabled:opacity-50">设角色</button>
+                  </div>
+                  <p className="text-xs text-slate-300 mt-2">能力注册表（模型 + 工具 + 专长）</p>
+                  <div className="grid grid-cols-3 gap-2">
+                    <input value={cpCapAgentId} onChange={(e) => setCpCapAgentId(e.target.value)} placeholder="agent_id" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <input value={cpCapSpecialty} onChange={(e) => setCpCapSpecialty(e.target.value)} placeholder="specialty(code/sheet/...)" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <input value={cpCapCostTier} onChange={(e) => setCpCapCostTier(e.target.value)} placeholder="cost_tier" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <input value={cpCapPrimaryModel} onChange={(e) => setCpCapPrimaryModel(e.target.value)} placeholder="primary_model" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                    <input value={cpCapFallbackModel} onChange={(e) => setCpCapFallbackModel(e.target.value)} placeholder="fallback_model" className="bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                  </div>
+                  <input value={cpCapTools} onChange={(e) => setCpCapTools(e.target.value)} placeholder="tools csv" className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                  <input value={cpCapStrengths} onChange={(e) => setCpCapStrengths(e.target.value)} placeholder="strengths csv" className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1 text-xs" />
+                  <button onClick={handleUpsertCapability} disabled={cpLoading} className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs disabled:opacity-50">更新能力画像</button>
+                </div>
+              </div>
+
+              <div className="bg-slate-800/30 rounded-lg p-4 text-xs space-y-2">
+                <p className="text-slate-200 font-medium">执行轨迹 / 数据总览</p>
+                <p>任务: {cpTasks.length} · DAG: {cpGraphs.length} · 工单: {cpTickets.length} · 记忆: {cpMemory.length} · 快照: {cpSnapshots.length}</p>
+                <p>Prompt版本: {cpPrompts.length} · 能力画像: {cpCapabilities.length} · 角色绑定: {cpRoles.length} · 审计: {cpAudit.length} · 成本统计: {cpCost ? `${cpCost.total_tokens} tokens` : "-"}</p>
+                <div className="max-h-64 overflow-auto space-y-2">
+                  {cpTasks.slice(0, 6).map((t) => (
+                    <div key={t.id} className="border border-slate-700 rounded p-2">
+                      <p className="text-slate-200">{t.title} · {t.status}</p>
+                      <p className="text-slate-400 break-all">{t.id}</p>
+                      {t.route_decision && (
+                        <p className="text-sky-300">
+                          路由：intent={t.route_decision.intent} {"->"} selected={t.route_decision.selected_agent} · {t.route_decision.explanation}
+                        </p>
+                      )}
+                      <p className="text-slate-400">输出: {t.final_output || "-"}</p>
+                      <div className="flex flex-wrap gap-1 mt-1">
+                        {(t.steps || []).map((s) => (
+                          <button
+                            key={s.id}
+                            onClick={() => void handleRetryTaskStep(t.id, s.id)}
+                            className="px-2 py-0.5 bg-slate-700 hover:bg-slate-600 rounded text-[11px]"
+                          >
+                            {s.name}:{s.status} (重试 {s.retry_count})
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="max-h-40 overflow-auto">
+                  {cpTickets.slice(0, 8).map((tk) => (
+                    <div key={tk.id} className="flex items-center justify-between border-b border-slate-700 py-1">
+                      <span>{tk.channel} · {tk.title} · {tk.status}</span>
+                      <div className="flex gap-1">
+                        <button onClick={() => void handleUpdateTicket(tk.id, "in_progress")} className="px-2 py-0.5 bg-slate-700 rounded">受理</button>
+                        <button onClick={() => void handleUpdateTicket(tk.id, "done")} className="px-2 py-0.5 bg-emerald-700 rounded">完成</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="max-h-36 overflow-auto">
+                  {cpSnapshots.slice(0, 6).map((sp) => (
+                    <div key={sp.id} className="flex items-center justify-between border-b border-slate-700 py-1">
+                      <span className="truncate pr-2">{sp.id} · {sp.task_id}</span>
+                      <button onClick={() => void handleReplaySnapshot(sp.id)} className="px-2 py-0.5 bg-indigo-700 rounded">回放</button>
+                    </div>
+                  ))}
+                </div>
+                <div className="max-h-36 overflow-auto">
+                  {cpCapabilities.map((cap) => (
+                    <div key={cap.agent_id} className="border-b border-slate-700 py-1">
+                      <span>{cap.agent_id} · {cap.specialty} · {cap.primary_model} · tools:{cap.tools.join(",")}</span>
+                    </div>
+                  ))}
+                </div>
+                <div className="max-h-36 overflow-auto">
+                  {cpPrompts.map((p) => (
+                    <div key={p.id} className="flex items-center justify-between border-b border-slate-700 py-1">
+                      <span>{p.name} · {p.traffic_percent}% · {p.active ? "active" : "inactive"}</span>
+                      {!p.active && (
+                        <button onClick={() => void handleActivatePromptVersion(p.id)} className="px-2 py-0.5 bg-sky-700 rounded">激活</button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+            )}
+
+            {tuningSection === "quick" && (
+            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+              <p className="font-medium text-slate-200 flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-emerald-400" />
+                快速模式
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={() => applyQuickModePreset("stable")}
+                  className={`px-3 py-1.5 rounded text-xs ${quickMode === "stable" ? "bg-emerald-700" : "bg-slate-700 hover:bg-slate-600"}`}
+                >
+                  稳定模式（推荐）
+                </button>
+                <button
+                  onClick={() => applyQuickModePreset("balanced")}
+                  className={`px-3 py-1.5 rounded text-xs ${quickMode === "balanced" ? "bg-emerald-700" : "bg-slate-700 hover:bg-slate-600"}`}
+                >
+                  均衡模式
+                </button>
+                <button
+                  onClick={() => applyQuickModePreset("performance")}
+                  className={`px-3 py-1.5 rounded text-xs ${quickMode === "performance" ? "bg-emerald-700" : "bg-slate-700 hover:bg-slate-600"}`}
+                >
+                  高性能模式
+                </button>
+              </div>
+              <p className="text-xs text-slate-400">
+                当前快速模式会同步调整模型、记忆策略、执行权限。应用后请在第 2 步点击“保存配置”。
+              </p>
+            </div>
+            )}
+
+            {tuningSection === "scene" && (
+            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+              <p className="font-medium text-slate-200 flex items-center gap-2">
+                <Brain className="w-4 h-4 text-sky-400" />
+                场景模板
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-2">
+                {[
+                  { id: "customer_support" as ScenarioPreset, label: "客服回复" },
+                  { id: "short_video" as ScenarioPreset, label: "短视频脚本" },
+                  { id: "office" as ScenarioPreset, label: "办公文档" },
+                  { id: "developer" as ScenarioPreset, label: "编程助手" },
+                  { id: "none" as ScenarioPreset, label: "清空模板" },
+                ].map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => applyScenarioPreset(t.id)}
+                    className={`px-3 py-2 rounded text-xs border ${
+                      scenarioPreset === t.id
+                        ? "bg-sky-800/60 border-sky-600 text-sky-100"
+                        : "bg-slate-700/60 border-slate-600 hover:bg-slate-700"
+                    }`}
+                  >
+                    {t.label}
+                  </button>
                 ))}
               </div>
+            </div>
+            )}
+
+            {tuningSection === "personal" && (
+            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+              <p className="font-medium text-slate-200">个性调教</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                <label className="text-xs space-y-1">
+                  <span className="text-slate-400">回答长度</span>
+                  <select value={tuneLength} onChange={(e) => setTuneLength(e.target.value as TuneLength)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
+                    <option value="short">短</option>
+                    <option value="medium">中</option>
+                    <option value="long">长</option>
+                  </select>
+                </label>
+                <label className="text-xs space-y-1">
+                  <span className="text-slate-400">语气风格</span>
+                  <select value={tuneTone} onChange={(e) => setTuneTone(e.target.value as TuneTone)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
+                    <option value="professional">专业</option>
+                    <option value="friendly">亲切</option>
+                    <option value="concise">简洁</option>
+                  </select>
+                </label>
+                <label className="text-xs space-y-1">
+                  <span className="text-slate-400">主动性</span>
+                  <select value={tuneProactivity} onChange={(e) => setTuneProactivity(e.target.value as TuneProactivity)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
+                    <option value="low">少追问</option>
+                    <option value="balanced">平衡</option>
+                    <option value="high">多建议</option>
+                  </select>
+                </label>
+                <label className="text-xs space-y-1">
+                  <span className="text-slate-400">执行权限</span>
+                  <select value={tunePermission} onChange={(e) => setTunePermission(e.target.value as TunePermission)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
+                    <option value="suggest">仅建议</option>
+                    <option value="confirm">需确认后执行</option>
+                    <option value="auto_low_risk">低风险自动执行</option>
+                  </select>
+                </label>
+                <label className="text-xs space-y-1">
+                  <span className="text-slate-400">记忆策略</span>
+                  <select value={memoryMode} onChange={(e) => setMemoryMode(e.target.value as MemoryMode)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
+                    <option value="off">关闭记忆</option>
+                    <option value="session">仅会话记忆</option>
+                    <option value="long">长期记忆</option>
+                  </select>
+                </label>
+              </div>
+              <pre className="text-xs text-slate-300 bg-slate-900/40 rounded p-3 whitespace-pre-wrap">{tuningPromptPreview}</pre>
               <button
-                onClick={handleAutoInstallPlugins}
-                disabled={pluginInstallLoading}
-                className="px-3 py-2 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-xs"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(tuningPromptPreview);
+                    setSelfCheckResult("已复制调教模板摘要");
+                  } catch {
+                    setSelfCheckResult("复制失败，请手动复制调教模板摘要");
+                  }
+                }}
+                className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
               >
-                {pluginInstallLoading ? "安装中..." : "按勾选渠道自动安装/校验插件"}
+                复制调教模板摘要
               </button>
-              {pluginInstallLoading && pluginInstallProgress && (
-                <div className="space-y-2">
-                  <p className="text-xs text-sky-300">
-                    当前进度：{pluginInstallProgress.current}/{pluginInstallProgress.total}，
-                    正在处理 `{pluginInstallProgress.channel}`（{pluginInstallProgress.status}）
-                  </p>
-                  <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-sky-500 rounded-full transition-all duration-300"
-                      style={{
-                        width: `${Math.max(
-                          5,
-                          Math.min(
-                            100,
-                            Math.round(
-                              (pluginInstallProgress.current / Math.max(pluginInstallProgress.total, 1)) * 100
-                            )
-                          )
-                        )}%`,
-                      }}
-                    />
-                  </div>
-                  <pre className="bg-slate-900/40 rounded p-3 text-xs whitespace-pre-wrap max-h-28 overflow-auto">
-                    {pluginInstallProgressLog.join("\n")}
-                  </pre>
+            </div>
+            )}
+
+            {tuningSection === "memory" && (
+            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
+              <p className="font-medium text-slate-200">记忆中心</p>
+              <div className="flex flex-wrap gap-2">
+                <button onClick={refreshMemoryCenterStatus} disabled={memoryLoading} className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs">
+                  {memoryLoading ? "刷新中..." : "刷新记忆状态"}
+                </button>
+                <button onClick={handleInitMemory} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs">
+                  {memoryActionLoading === "init" ? "初始化中..." : "一键初始化记忆"}
+                </button>
+                <button onClick={handleReadMemorySummary} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-xs">
+                  {memoryActionLoading === "read" ? "读取中..." : "查看记忆摘要"}
+                </button>
+                <button onClick={handleClearMemory} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-rose-700 hover:bg-rose-600 disabled:opacity-50 rounded text-xs">
+                  {memoryActionLoading === "clear" ? "清空中..." : "清空记忆"}
+                </button>
+                <button onClick={handleExportMemory} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs">
+                  {memoryActionLoading === "export" ? "导出中..." : "导出记忆"}
+                </button>
+              </div>
+              {memoryStatus && (
+                <div className="text-xs text-slate-300 bg-slate-900/40 rounded p-3 space-y-1">
+                  <p>记忆启用：{memoryStatus.enabled ? "是" : "否"}</p>
+                  <p>记忆文件：{memoryStatus.memory_file_count} 个</p>
+                  <p>MEMORY.md：{memoryStatus.memory_file_exists ? "存在" : "不存在"}</p>
+                  <p>memory 目录：{memoryStatus.memory_dir_exists ? "存在" : "不存在"}</p>
+                  <p className="text-slate-400">{memoryStatus.note}</p>
                 </div>
               )}
-              {pluginInstallResult && (
-                <pre className="bg-slate-900/40 rounded p-3 text-xs whitespace-pre-wrap max-h-40 overflow-auto">
-                  {pluginInstallResult}
-                </pre>
-              )}
+              {memorySummary && <pre className="text-xs text-slate-300 whitespace-pre-wrap bg-slate-900/40 rounded p-3 max-h-52 overflow-auto">{memorySummary}</pre>}
             </div>
+            )}
+
+            {tuningSection === "skills" && (
             <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
               <p className="font-medium text-slate-200">Skills 管理面板</p>
+              <div className="rounded-lg border border-slate-700 bg-slate-900/30 p-3 space-y-2 text-xs">
+                <p className="text-slate-200">当前模式：{currentSkillsScope === "shared" ? "默认共享" : "Agent 覆盖"}</p>
+                <p className="text-slate-400">
+                  默认共享表示所有 Agent 继承同一套共享 Skills；切到 Agent 覆盖后，可以让个别 Agent 改成独立启用清单。
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => handleSaveSkillsScope("shared")}
+                    disabled={skillsScopeSaving || currentSkillsScope === "shared"}
+                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                  >
+                    切到共享
+                  </button>
+                  <button
+                    onClick={() => handleSaveSkillsScope("agent_override")}
+                    disabled={skillsScopeSaving || currentSkillsScope === "agent_override"}
+                    className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-xs"
+                  >
+                    切到 Agent 覆盖
+                  </button>
+                  <label className="text-slate-400">当前 Agent</label>
+                  <select
+                    value={effectiveSkillsAgentId}
+                    onChange={(e) => setSkillsSelectedAgentId(e.target.value)}
+                    className="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs min-w-[140px]"
+                  >
+                    {skillsAgents.map((agent) => (
+                      <option key={agent.id} value={agent.id}>
+                        {agent.id}
+                      </option>
+                    ))}
+                  </select>
+                  {currentSkillsScope === "agent_override" && (
+                    <>
+                      <button
+                        onClick={handleMakeAgentSkillCustom}
+                        disabled={skillsScopeSaving || !effectiveSkillsAgentId}
+                        className="px-3 py-1.5 bg-violet-700 hover:bg-violet-600 disabled:opacity-50 rounded text-xs"
+                      >
+                        {currentAgentSkillBinding?.mode === "custom" ? "重建独立清单" : "为当前 Agent 建独立清单"}
+                      </button>
+                      <button
+                        onClick={handleRestoreAgentSkillInheritance}
+                        disabled={skillsScopeSaving || !effectiveSkillsAgentId}
+                        className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                      >
+                        恢复继承
+                      </button>
+                    </>
+                  )}
+                </div>
+                {effectiveSkillsAgentId && (
+                  <p className="text-slate-400">
+                    {effectiveSkillsAgentId}：
+                    {currentSkillsScope === "shared"
+                      ? `当前跟随共享层，可见 ${skillsCatalog.length} 项 Skills。`
+                      : currentAgentSkillBinding?.mode === "custom"
+                        ? `当前使用独立清单，已启用 ${effectiveAgentEnabledSkillCount}/${skillsCatalog.length} 项。`
+                        : `当前仍继承共享层，可见 ${skillsCatalog.length} 项 Skills。`}
+                  </p>
+                )}
+              </div>
+              <div className="rounded-lg border border-slate-700 bg-slate-900/30 p-3 space-y-2 text-xs">
+                <p className="text-slate-200">会话/记忆边界说明</p>
+                <p className="text-slate-400">
+                  当前不同渠道并不天然隔离记忆。是否共享，主要由 Agent、sessionName 和对应 gateway 的 state_dir 决定；同一 Agent 下的多渠道可能落到同一会话历史。
+                </p>
+              </div>
               <div className="flex flex-wrap gap-2">
                 <button onClick={loadSkillsCatalog} disabled={skillsCatalogLoading} className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs">刷新列表</button>
                 <button
@@ -3073,95 +8477,166 @@ function App() {
                   )}
                 </div>
                 <pre className="rounded bg-slate-900/60 p-3 text-xs whitespace-pre-wrap max-h-44 overflow-auto">
-                  {(() => {
-                    const progressText = skillsRepairProgressLog.join("\n").trim();
-                    const resultText = (skillsResult || "").trim();
-                    if (progressText && resultText) return `${progressText}\n\n----- 结果日志 -----\n${resultText}`;
-                    if (progressText) return progressText;
-                    if (resultText) return resultText;
-                    return "暂无日志。点击“安装选中”或“修复缺失依赖（选中）”后，这里会实时显示执行输出。";
-                  })()}
+                  {skillsLogText}
                 </pre>
               </div>
               <div className="overflow-auto border border-slate-700 rounded-lg">
-                <table className="w-full min-w-[900px] text-xs">
+                {skillsCatalog.length > serviceSkillsRenderLimit && (
+                  <div className="flex items-center justify-between px-3 py-2 border-b border-slate-700 text-xs text-slate-400">
+                    <span>
+                      为保证服务页流畅度，当前渲染 {serviceSkillsRenderLimit}/{skillsCatalog.length} 条 Skills。
+                    </span>
+                    <button
+                      onClick={() =>
+                        setServiceSkillsRenderLimit((prev) => Math.min(skillsCatalog.length, prev + 80))
+                      }
+                      className="px-2 py-1 bg-slate-700 hover:bg-slate-600 rounded"
+                    >
+                      加载更多
+                    </button>
+                  </div>
+                )}
+                <table className="w-full min-w-[980px] text-xs">
                   <thead className="bg-slate-900/60 text-slate-300">
                     <tr>
                       <th className="text-left px-2 py-2">选择</th>
                       <th className="text-left px-2 py-2">Skill</th>
                       <th className="text-left px-2 py-2">来源</th>
                       <th className="text-left px-2 py-2">状态</th>
+                      <th className="text-left px-2 py-2">当前Agent</th>
                       <th className="text-left px-2 py-2">缺失项摘要</th>
                       <th className="text-left px-2 py-2">操作建议</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {skillsCatalog.map((s) => {
-                      const missingParts = [
-                        s.missing.bins.length ? `bins:${s.missing.bins.join(",")}` : "",
-                        s.missing.any_bins.length ? `any:${s.missing.any_bins.join(",")}` : "",
-                        s.missing.env.length ? `env:${s.missing.env.join(",")}` : "",
-                        s.missing.config.length ? `cfg:${s.missing.config.slice(0, 2).join(",")}` : "",
-                        s.missing.os.length ? `os:${s.missing.os.join(",")}` : "",
-                      ].filter(Boolean);
-                      return (
-                        <tr key={s.name} className="border-t border-slate-800">
-                          <td className="px-2 py-2">
-                            <input
-                              type="checkbox"
-                              checked={!!selectedSkills[s.name]}
-                              onChange={(e) =>
-                                setSelectedSkills((prev) => ({ ...prev, [s.name]: e.target.checked }))
-                              }
-                            />
-                          </td>
-                          <td className="px-2 py-2 text-slate-200">{s.name}</td>
-                          <td className="px-2 py-2">{s.source || (s.bundled ? "bundled" : "unknown")}</td>
-                          <td
-                            className={`px-2 py-2 ${
-                              s.eligible
-                                ? "text-emerald-400"
-                                : hasManualSkillGaps(s)
-                                ? "text-rose-300"
-                                : "text-amber-300"
-                            }`}
-                          >
-                            {s.eligible ? "可用" : hasManualSkillGaps(s) ? "需手动处理" : "可自动修复"}
-                          </td>
-                          <td className="px-2 py-2 text-slate-400">{missingParts.join(" | ") || "-"}</td>
-                          <td className="px-2 py-2">
-                            {hasManualSkillGaps(s) ? (
-                              <button
-                                onClick={async () => {
-                                  const hint = buildManualFixHint(s);
-                                  try {
-                                    await navigator.clipboard.writeText(hint);
-                                    setSkillsResult(`已复制 ${s.name} 的手动修复指引`);
-                                  } catch {
-                                    setSkillsResult(`复制失败，请手动复制：\n\n${hint}`);
-                                  }
-                                }}
-                                className="px-2 py-1 bg-amber-700 hover:bg-amber-600 rounded text-xs"
-                              >
-                                复制手动指引
-                              </button>
-                            ) : isAutoFixableSkill(s) ? (
-                              <span className="text-emerald-300 text-xs">可点“修复缺失依赖（选中）”</span>
-                            ) : (
-                              <span className="text-slate-500 text-xs">-</span>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })}
+                    {skillsCatalog.slice(0, serviceSkillsRenderLimit).map((s) => (
+                      <SkillTableRow
+                        key={s.name}
+                        skill={s}
+                        checked={!!selectedSkills[s.name]}
+                        onToggle={toggleSkillSelection}
+                        onCopyManualHint={handleCopyManualHint}
+                        agentEnabled={effectiveAgentEnabledSkillSet.has(s.name)}
+                        showAgentToggle={currentSkillsScope === "agent_override" && !!effectiveSkillsAgentId}
+                        onToggleAgentSkill={handleToggleSkillForAgent}
+                        repairState={skillRepairStateByName[s.name]}
+                      />
+                    ))}
                   </tbody>
                 </table>
+              </div>
+              <div className="rounded-lg border border-slate-700 bg-slate-900/30 p-3 space-y-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-slate-200">第三方 Skills 市场</p>
+                  <input
+                    value={marketQuery}
+                    onChange={(e) => setMarketQuery(e.target.value)}
+                    placeholder="搜索 ClawHub / GitHub Skills，例如 github、excel、crawler"
+                    className="flex-1 min-w-[260px] bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-xs"
+                  />
+                  <button
+                    onClick={handleSearchMarketSkills}
+                    disabled={marketLoading}
+                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
+                  >
+                    {marketLoading ? "搜索中..." : "搜索"}
+                  </button>
+                </div>
+                <p className="text-slate-400 text-xs">
+                  搜索结果会聚合 ClawHub 和 GitHub。若 ClawHub 被限流，会自动退化到 GitHub 结果。安装始终先落到共享 Skills 层；若你已切到 Agent 覆盖，还可以顺手加入当前 Agent 的独立清单。
+                </p>
+                {marketResult && (
+                  <div className="rounded border border-slate-700 bg-slate-950/40 p-3 text-xs text-slate-300 whitespace-pre-wrap">
+                    {marketResult}
+                  </div>
+                )}
+                {marketResults.length > 0 && (
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-2">
+                    {marketResults.map((skill) => {
+                      const itemKey = `${skill.source_type || "remote"}:${skill.package_name || skill.name}`;
+                      return (
+                        <div key={itemKey} className="rounded-lg border border-slate-700 bg-slate-950/40 p-3 space-y-2">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="space-y-1">
+                              <p className="text-slate-200 text-sm">{skill.name}</p>
+                              <p className="text-slate-400 text-xs">{skill.description || "暂无描述"}</p>
+                            </div>
+                            <span className="px-2 py-0.5 rounded bg-slate-700 text-[11px] text-slate-200">
+                              {skill.source_type === "clawhub" ? "ClawHub" : "GitHub"}
+                            </span>
+                          </div>
+                          <div className="flex flex-wrap gap-3 text-[11px] text-slate-500">
+                            {skill.author && <span>作者：{skill.author}</span>}
+                            {skill.version && <span>版本：{skill.version}</span>}
+                            {skill.package_name && <span>包名：{skill.package_name}</span>}
+                          </div>
+                          {skill.repo_url && (
+                            <a href={skill.repo_url} target="_blank" rel="noreferrer" className="text-xs text-sky-300 hover:text-sky-200 underline">
+                              {skill.repo_url}
+                            </a>
+                          )}
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              onClick={() => handleInstallMarketSkill(skill, false)}
+                              disabled={marketInstallKey === itemKey}
+                              className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-xs"
+                            >
+                              {marketInstallKey === itemKey ? "安装中..." : "安装到共享层"}
+                            </button>
+                            {currentSkillsScope === "agent_override" && !!effectiveSkillsAgentId && (
+                              <button
+                                onClick={() => handleInstallMarketSkill(skill, true)}
+                                disabled={marketInstallKey === itemKey}
+                                className="px-3 py-1.5 bg-violet-700 hover:bg-violet-600 disabled:opacity-50 rounded text-xs"
+                              >
+                                安装并加入当前 Agent
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                <div className="rounded-lg border border-slate-700 bg-slate-950/40 p-3 space-y-3">
+                  <p className="text-slate-200 text-xs">本地 Skills 安装</p>
+                  <p className="text-slate-400 text-xs">
+                    如果你已经从网站下载了 Skill ZIP，或者手里有一个本地 Skill 文件夹，可以直接在这里导入。要求内容里至少包含 `SKILL.md`。
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <input
+                      value={localSkillPath}
+                      onChange={(e) => setLocalSkillPath(e.target.value)}
+                      placeholder="粘贴本地 Skill 目录或 ZIP 路径"
+                      className="flex-1 min-w-[320px] bg-slate-800 border border-slate-600 rounded px-3 py-1.5 text-xs"
+                    />
+                    <button
+                      onClick={handlePickLocalSkillFolder}
+                      className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                    >
+                      选目录
+                    </button>
+                    <button
+                      onClick={handlePickLocalSkillZip}
+                      className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
+                    >
+                      选ZIP
+                    </button>
+                    <button
+                      onClick={handleInstallLocalSkill}
+                      disabled={localSkillInstalling}
+                      className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs"
+                    >
+                      {localSkillInstalling ? "导入中..." : "安装到共享层"}
+                    </button>
+                  </div>
+                </div>
               </div>
               {skillsRepairLoading && skillsRepairProgress && (
                 <div className="space-y-2">
                   <p className="text-xs text-sky-300">
-                    修复进度：{skillsRepairProgress.current}/{skillsRepairProgress.total}，
-                    当前 `{skillsRepairProgress.skill}` - {skillsRepairProgress.message}
+                    修复进度：{skillsRepairProgress?.current ?? 0}/{skillsRepairProgress?.total ?? 0}，
+                    当前 `{skillsRepairProgress?.skill ?? "-"}` - {skillsRepairProgress?.message ?? "-"}
                   </p>
                   <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
                     <div
@@ -3172,7 +8647,7 @@ function App() {
                           Math.min(
                             100,
                             Math.round(
-                              (skillsRepairProgress.current / Math.max(skillsRepairProgress.total, 1)) * 100
+                              ((skillsRepairProgress?.current ?? 0) / Math.max(skillsRepairProgress?.total ?? 0, 1)) * 100
                             )
                           )
                         )}%`,
@@ -3182,664 +8657,9 @@ function App() {
                 </div>
               )}
             </div>
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
-              <p className="font-medium text-slate-200">诊断与回滚</p>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  onClick={handleExportDiagnosticBundle}
-                  disabled={diagnosticLoading}
-                  className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
-                >
-                  {diagnosticLoading ? "导出中..." : "一键导出诊断包"}
-                </button>
-                <button
-                  onClick={loadSnapshots}
-                  disabled={snapshotsLoading}
-                  className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs"
-                >
-                  {snapshotsLoading ? "加载中..." : "刷新配置快照"}
-                </button>
-              </div>
-              {snapshots.length > 0 && (
-                <div className="space-y-2 max-h-40 overflow-auto">
-                  {snapshots.slice(0, 10).map((s) => (
-                    <div key={s} className="flex items-center justify-between gap-2 bg-slate-900/40 rounded p-2">
-                      <span className="text-xs text-slate-400 truncate">{s}</span>
-                      <button
-                        onClick={() => handleRollbackSnapshot(s)}
-                        disabled={rollingBackSnapshot === s}
-                        className="px-2 py-1 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs"
-                      >
-                        {rollingBackSnapshot === s ? "回滚中..." : "回滚"}
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {diagnosticResult && <pre className="text-xs text-sky-300 whitespace-pre-wrap">{diagnosticResult}</pre>}
-              {ticketSummary && (
-                <div className="space-y-2">
-                  <p className="text-xs text-amber-300">可复制工单摘要（发给维护者）</p>
-                  <pre className="text-xs text-slate-300 whitespace-pre-wrap bg-slate-900/40 rounded p-2 max-h-28 overflow-auto">
-                    {ticketSummary}
-                  </pre>
-                  <button
-                    onClick={async () => {
-                      try {
-                        await navigator.clipboard.writeText(ticketSummary);
-                        setDiagnosticResult("已复制工单摘要到剪贴板");
-                      } catch {
-                        setDiagnosticResult("复制失败，请手动复制");
-                      }
-                    }}
-                    className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs"
-                  >
-                    复制工单摘要
-                  </button>
-                </div>
-              )}
-            </div>
-            <div className="bg-gradient-to-r from-emerald-900/40 to-indigo-900/40 border border-emerald-700/40 rounded-lg p-4 text-sm text-slate-200 space-y-2">
-              <p className="font-medium">权益中心（免费额度 / 群支持 / 包月代理）</p>
-              <p className="text-xs text-slate-300">
-                每日免费额度、问题优先答疑、代理服务申请入口。推荐先加群获取试用额度。
-              </p>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  onClick={() => openUrl("https://qm.qq.com/q/yEwM0TR6F4")}
-                  className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 rounded text-xs"
-                >
-                  一键加群（1085253453）
-                </button>
-                <button
-                  onClick={() => openUrl("https://github.com/3445286649/openclaw-deploy/issues/new")}
-                  className="px-3 py-1.5 bg-indigo-700 hover:bg-indigo-600 rounded text-xs"
-                >
-                  提交申请/问题单
-                </button>
-              </div>
-            </div>
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-3">
-              <p className="font-medium text-slate-200">Telegram 快速配对</p>
-              <div className="flex gap-2">
-                <input
-                  type="text"
-                  placeholder="在这里填写机器人返回的配对码"
-                  value={telegramPairingCode}
-                  onChange={(e) => setTelegramPairingCode(e.target.value)}
-                  className="flex-1 bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm"
-                />
-                <button
-                  onClick={() => handleApprovePairing("telegram")}
-                  disabled={pairingLoading === "telegram" || !telegramPairingCode.trim()}
-                  className="px-3 py-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded-lg text-xs"
-                >
-                  批准配对码
-                </button>
-                <button
-                  onClick={() => handleListPairings("telegram")}
-                  disabled={pairingLoading === "telegram"}
-                  className="px-3 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-xs"
-                >
-                  查询待审批配对
-                </button>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={refreshAllChannelHealth}
-                  className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
-                >
-                  立即刷新全部状态灯
-                </button>
-                <label className="flex items-center gap-1 text-xs text-slate-400">
-                  <input
-                    type="checkbox"
-                    checked={autoRefreshHealth}
-                    onChange={(e) => setAutoRefreshHealth(e.target.checked)}
-                  />
-                  自动刷新（极简模式默认关闭）
-                </label>
-              </div>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-                <HealthLamp label="已配置" state={telegramHealth.configured} />
-                <HealthLamp label="Token连通" state={telegramHealth.token} />
-                <HealthLamp label="Gateway" state={telegramHealth.gateway} />
-                <HealthLamp label="配对状态" state={telegramHealth.pairing} />
-              </div>
-              <span className="text-xs text-slate-400">{telegramHealth.detail}</span>
-            </div>
-            <div className="space-y-4">
-              <p className="text-slate-300 font-medium">渠道配置（图形化）</p>
-              <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-2">
-              <p className="font-medium text-slate-200">ID / Token 获取指引（可展开教程）</p>
-              <details className="bg-slate-900/40 rounded p-3">
-                <summary className="cursor-pointer text-slate-200">Telegram（第 1/2/3 步）</summary>
-                <div className="mt-2 text-slate-300 space-y-1">
-                  <p>1) 在 Telegram 搜索并打开 <code className="mx-1 px-1 bg-slate-700 rounded">@BotFather</code></p>
-                  <p>2) 发送 <code className="mx-1 px-1 bg-slate-700 rounded">/newbot</code>，按提示设置机器人名</p>
-                  <p>3) 复制返回的 Bot Token，粘贴到本页 Telegram 卡片</p>
-                  <p className="text-amber-300">常见错误：Token 前后带空格、机器人未开始对话。</p>
-                  <p className="text-slate-500">截图位：BotFather 返回 Token 的界面</p>
-                </div>
-              </details>
-              <details className="bg-slate-900/40 rounded p-3">
-                <summary className="cursor-pointer text-slate-200">飞书（第 1/2/3 步）</summary>
-                <div className="mt-2 text-slate-300 space-y-1">
-                  <p>1) 打开飞书开放平台，创建企业自建应用</p>
-                  <p>2) 在「凭证与基础信息」获取 App ID / App Secret</p>
-                  <p>3) 在本页飞书卡片填写并先点“连通性测试”</p>
-                  <p className="text-amber-300">常见错误：应用未发布、权限范围没勾选。</p>
-                  <p className="text-slate-500">截图位：App ID / App Secret 页面</p>
-                </div>
-              </details>
-              <details className="bg-slate-900/40 rounded p-3">
-                <summary className="cursor-pointer text-slate-200">QQ（第 1/2/3 步）</summary>
-                <div className="mt-2 text-slate-300 space-y-1">
-                  <p>1) 打开 QQ 开放平台创建机器人应用</p>
-                  <p>2) 获取 App ID 和 Token</p>
-                  <p>3) 在本页 QQ 卡片填写后测试并保存</p>
-                  <p className="text-amber-300">常见错误：机器人未通过审核、回调配置未生效。</p>
-                  <p className="text-slate-500">截图位：QQ 开放平台凭证页</p>
-                </div>
-              </details>
-              <details className="bg-slate-900/40 rounded p-3">
-                <summary className="cursor-pointer text-slate-200">Discord（第 1/2/3 步）</summary>
-                <div className="mt-2 text-slate-300 space-y-1">
-                  <p>1) 打开 Discord 开发者门户创建应用</p>
-                  <p>2) 在 Bot 页面创建 Bot 并复制 Token</p>
-                  <p>3) 在本页 Discord 卡片填写 Token 并保存</p>
-                  <p className="text-slate-500">需安装 @openclaw/discord 插件（非内置）</p>
-                </div>
-              </details>
-              <details className="bg-slate-900/40 rounded p-3">
-                <summary className="cursor-pointer text-slate-200">钉钉（第 1/2/3 步）</summary>
-                <div className="mt-2 text-slate-300 space-y-1">
-                  <p>1) 打开钉钉开放平台创建应用</p>
-                  <p>2) 获取 AppKey 和 AppSecret</p>
-                  <p>3) 在本页钉钉卡片填写并保存</p>
-                  <p className="text-slate-500">需安装 @adongguo/openclaw-dingtalk 插件</p>
-                </div>
-              </details>
-                <div className="flex flex-wrap gap-2 pt-1">
-                  <button
-                    onClick={() => openUrl("https://core.telegram.org/bots#6-botfather")}
-                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
-                  >
-                    打开 Telegram BotFather 文档
-                  </button>
-                  <button
-                    onClick={() => openUrl("https://open.feishu.cn/")}
-                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
-                  >
-                    打开飞书开放平台
-                  </button>
-                  <button
-                    onClick={() => openUrl("https://q.qq.com/")}
-                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
-                  >
-                    打开 QQ 开放平台
-                  </button>
-                  <button
-                    onClick={() => openUrl("https://discord.com/developers/applications")}
-                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
-                  >
-                    打开 Discord 开发者门户
-                  </button>
-                  <button
-                    onClick={() => openUrl("https://open.dingtalk.com/")}
-                    className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
-                  >
-                    打开钉钉开放平台
-                  </button>
-                </div>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                <ChannelCard
-                  title="Telegram"
-                  channelId="telegram"
-                  configured={channelConfigStatus.telegram}
-                  onClear={() => handleClearChannel("telegram")}
-                  clearing={channelClearing === "telegram"}
-                >
-                    <>
-                      <input
-                        type="text"
-                        placeholder="Bot Token"
-                        value={telegramConfig.botToken ?? ""}
-                        onChange={(e) =>
-                          setTelegramConfig((p) => ({ ...p, botToken: e.target.value }))
-                        }
-                        className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm"
-                      />
-                      <input
-                        type="text"
-                        placeholder="Chat ID（可选）"
-                        value={telegramConfig.chatId ?? ""}
-                        onChange={(e) =>
-                          setTelegramConfig((p) => ({ ...p, chatId: e.target.value }))
-                        }
-                        className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm mt-2"
-                      />
-                      <div className="flex gap-2 mt-2">
-                        <button
-                          onClick={() => handleSaveChannel("telegram", telegramConfig)}
-                          disabled={channelSaving === "telegram"}
-                          className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-xs"
-                        >
-                          保存
-                        </button>
-                        <button
-                          onClick={() => handleTestChannel("telegram", telegramConfig)}
-                          disabled={channelTesting === "telegram"}
-                          className="px-3 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-xs"
-                        >
-                          连通性测试
-                        </button>
-                      </div>
-                      <div className="mt-3 p-2 rounded border border-slate-700 bg-slate-900/40">
-                        <p className="text-xs text-slate-400 mb-2">
-                          如果机器人返回了配对码，在这里输入后点“批准配对码”。
-                        </p>
-                        <input
-                          type="text"
-                          placeholder="输入 Telegram 配对码"
-                          value={telegramPairingCode}
-                          onChange={(e) => setTelegramPairingCode(e.target.value)}
-                          className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm"
-                        />
-                        <div className="flex gap-2 mt-2">
-                          <button
-                            onClick={() => handleApprovePairing("telegram")}
-                            disabled={pairingLoading === "telegram" || !telegramPairingCode.trim()}
-                            className="px-3 py-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded-lg text-xs"
-                          >
-                            批准配对码
-                          </button>
-                          <button
-                            onClick={() => handleListPairings("telegram")}
-                            disabled={pairingLoading === "telegram"}
-                            className="px-3 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-xs"
-                          >
-                            查询待审批配对
-                          </button>
-                        </div>
-                      </div>
-                    </>
-                </ChannelCard>
-                <ChannelCard
-                  title="飞书"
-                  channelId="feishu"
-                  configured={channelConfigStatus.feishu}
-                  onClear={() => handleClearChannel("feishu")}
-                  clearing={channelClearing === "feishu"}
-                >
-                  <>
-                      <input
-                        type="text"
-                        placeholder="App ID"
-                        value={feishuConfig.appId ?? ""}
-                        onChange={(e) =>
-                          setFeishuConfig((p) => ({ ...p, appId: e.target.value }))
-                        }
-                        className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm"
-                      />
-                      <input
-                        type="password"
-                        placeholder="App Secret"
-                        value={feishuConfig.appSecret ?? ""}
-                        onChange={(e) =>
-                          setFeishuConfig((p) => ({ ...p, appSecret: e.target.value }))
-                        }
-                        className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm mt-2"
-                      />
-                      <div className="flex gap-2 mt-2">
-                        <button
-                          onClick={() => handleSaveChannel("feishu", feishuConfig)}
-                          disabled={channelSaving === "feishu"}
-                          className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-xs"
-                        >
-                          保存
-                        </button>
-                        <button
-                          onClick={() => handleTestChannel("feishu", feishuConfig)}
-                          disabled={channelTesting === "feishu"}
-                          className="px-3 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-xs"
-                        >
-                          连通性测试
-                        </button>
-                      </div>
-                      <p className="text-xs text-slate-400 mt-2">飞书无需填写配对码。</p>
-                      <div className="grid grid-cols-2 gap-2 mt-2">
-                        <HealthLamp label="已配置" state={feishuHealth.configured} />
-                        <HealthLamp label="凭证连通" state={feishuHealth.token} />
-                        <HealthLamp label="Gateway" state={feishuHealth.gateway} />
-                        <HealthLamp label="配对状态" state={feishuHealth.pairing} />
-                      </div>
-                      <p className="text-xs text-slate-500 mt-1">{feishuHealth.detail}</p>
-                    </>
-                </ChannelCard>
-                <ChannelCard
-                  title="QQ"
-                  channelId="qq"
-                  configured={channelConfigStatus.qq}
-                  onClear={() => handleClearChannel("qq")}
-                  clearing={channelClearing === "qq"}
-                >
-                  <>
-                      <input
-                        type="text"
-                        placeholder="App ID"
-                        value={qqConfig.appId ?? ""}
-                        onChange={(e) => setQqConfig((p) => ({ ...p, appId: e.target.value }))}
-                        className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm"
-                      />
-                      <input
-                        type="password"
-                        placeholder="Token"
-                        value={qqConfig.token ?? ""}
-                        onChange={(e) => setQqConfig((p) => ({ ...p, token: e.target.value }))}
-                        className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm mt-2"
-                      />
-                      <div className="flex gap-2 mt-2">
-                        <button
-                          onClick={() => handleSaveChannel("qq", qqConfig)}
-                          disabled={channelSaving === "qq"}
-                          className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-xs"
-                        >
-                          保存
-                        </button>
-                        <button
-                          onClick={() => handleTestChannel("qq", qqConfig)}
-                          disabled={channelTesting === "qq"}
-                          className="px-3 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-xs"
-                        >
-                          连通性测试
-                        </button>
-                      </div>
-                      <p className="text-xs text-slate-400 mt-2">QQ 无需填写配对码。</p>
-                      <div className="grid grid-cols-2 gap-2 mt-2">
-                        <HealthLamp label="已配置" state={qqHealth.configured} />
-                        <HealthLamp label="凭证连通" state={qqHealth.token} />
-                        <HealthLamp label="Gateway" state={qqHealth.gateway} />
-                        <HealthLamp label="配对状态" state={qqHealth.pairing} />
-                      </div>
-                      <p className="text-xs text-slate-500 mt-1">{qqHealth.detail}</p>
-                    </>
-                </ChannelCard>
-                <ChannelCard
-                  title="Discord"
-                  channelId="discord"
-                  configured={channelConfigStatus.discord}
-                  onClear={() => handleClearChannel("discord")}
-                  clearing={channelClearing === "discord"}
-                >
-                  <>
-                    <input
-                      type="password"
-                      placeholder="Bot Token"
-                      value={discordConfig.token ?? discordConfig.botToken ?? ""}
-                      onChange={(e) => {
-                        const v = e.target.value;
-                        setDiscordConfig((p) => ({ ...p, token: v, botToken: v }));
-                      }}
-                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm"
-                    />
-                    <div className="flex gap-2 mt-2">
-                      <button
-                        onClick={() => handleSaveChannel("discord", { token: discordConfig.token || discordConfig.botToken, botToken: discordConfig.botToken || discordConfig.token })}
-                        disabled={channelSaving === "discord"}
-                        className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-xs"
-                      >
-                        保存
-                      </button>
-                      <button
-                        onClick={() => handleTestChannel("discord", { token: discordConfig.token || discordConfig.botToken, botToken: discordConfig.botToken || discordConfig.token })}
-                        disabled={channelTesting === "discord"}
-                        className="px-3 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-xs"
-                      >
-                        连通性测试
-                      </button>
-                    </div>
-                    <div className="grid grid-cols-2 gap-2 mt-2">
-                      <HealthLamp label="已配置" state={discordHealth.configured} />
-                      <HealthLamp label="凭证连通" state={discordHealth.token} />
-                      <HealthLamp label="Gateway" state={discordHealth.gateway} />
-                    </div>
-                    <p className="text-xs text-slate-500 mt-1">{discordHealth.detail}</p>
-                  </>
-                </ChannelCard>
-                <ChannelCard
-                  title="钉钉"
-                  channelId="dingtalk"
-                  configured={channelConfigStatus.dingtalk}
-                  onClear={() => handleClearChannel("dingtalk")}
-                  clearing={channelClearing === "dingtalk"}
-                >
-                  <>
-                    <input
-                      type="text"
-                      placeholder="AppKey"
-                      value={dingtalkConfig.appKey ?? ""}
-                      onChange={(e) => setDingtalkConfig((p) => ({ ...p, appKey: e.target.value }))}
-                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm"
-                    />
-                    <input
-                      type="password"
-                      placeholder="AppSecret"
-                      value={dingtalkConfig.appSecret ?? ""}
-                      onChange={(e) => setDingtalkConfig((p) => ({ ...p, appSecret: e.target.value }))}
-                      className="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm mt-2"
-                    />
-                    <div className="flex gap-2 mt-2">
-                      <button
-                        onClick={() => handleSaveChannel("dingtalk", dingtalkConfig)}
-                        disabled={channelSaving === "dingtalk"}
-                        className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-xs"
-                      >
-                        保存
-                      </button>
-                      <button
-                        onClick={() => handleTestChannel("dingtalk", dingtalkConfig)}
-                        disabled={channelTesting === "dingtalk"}
-                        className="px-3 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-xs"
-                      >
-                        连通性测试
-                      </button>
-                    </div>
-                    <div className="grid grid-cols-2 gap-2 mt-2">
-                      <HealthLamp label="已配置" state={dingtalkHealth.configured} />
-                      <HealthLamp label="凭证连通" state={dingtalkHealth.token} />
-                      <HealthLamp label="Gateway" state={dingtalkHealth.gateway} />
-                    </div>
-                    <p className="text-xs text-slate-500 mt-1">{dingtalkHealth.detail}</p>
-                  </>
-                </ChannelCard>
-              </div>
-              {channelResult && (
-                <pre className="bg-slate-800 rounded-lg p-3 text-sm overflow-auto max-h-32">
-                  {channelResult}
-                </pre>
-              )}
-            </div>
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-300 space-y-2">
-              <p className="font-medium text-slate-200">后续如何交互（推荐顺序）</p>
-              <p>1) 先点「启动 Gateway 并自动打开对话网页」，若提示服务缺失会自动安装并重试，启动后浏览器会自动打开对话界面。</p>
-              <p>2) 直接在图形化卡片配置 Telegram / 飞书 / QQ / Discord / 钉钉，并先做连通性测试。</p>
-              <p>3) 配好后，在对应聊天应用里给机器人发消息即可对话。</p>
-              <p className="text-slate-400">
-                说明：敏感信息不会在页面回显，避免泄露；请妥善保存凭证。
-              </p>
-            </div>
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-400">
-              <p className="font-medium text-slate-300 mb-2">常用命令：</p>
-              <code className="block text-emerald-400">openclaw gateway start</code>
-              <code className="block text-emerald-400 mt-1">openclaw gateway install</code>
-              <code className="block text-emerald-400 mt-1">openclaw gateway stop</code>
-              <code className="block text-emerald-400 mt-1">openclaw onboard</code>
-            </div>
-            <div className="bg-slate-800/50 rounded-lg p-4 text-sm text-slate-400">
-              <p className="font-medium text-slate-300 mb-2">开发者快捷（代码方式）</p>
-              <code className="block text-emerald-400">$env:OPENCLAW_STATE_DIR="C:/Users/Administrator/.openclaw"</code>
-              <code className="block text-emerald-400 mt-1">& "D:\openclow\openclaw.cmd" gateway status</code>
-              <code className="block text-emerald-400 mt-1">& "D:\openclow\openclaw.cmd" pairing list telegram</code>
-              <code className="block text-emerald-400 mt-1">& "D:\openclow\openclaw.cmd" pairing approve telegram &lt;CODE&gt;</code>
-            </div>
-          </div>
-        )}
+            )}
 
-        {step === 4 && (
-          <div className="w-full max-w-[1200px] mx-auto space-y-6">
-            <h2 className="text-lg font-semibold">调教中心（小白模式）</h2>
-
-            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
-              <p className="font-medium text-slate-200 flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-emerald-400" />
-                快速模式
-              </p>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  onClick={() => applyQuickModePreset("stable")}
-                  className={`px-3 py-1.5 rounded text-xs ${quickMode === "stable" ? "bg-emerald-700" : "bg-slate-700 hover:bg-slate-600"}`}
-                >
-                  稳定模式（推荐）
-                </button>
-                <button
-                  onClick={() => applyQuickModePreset("balanced")}
-                  className={`px-3 py-1.5 rounded text-xs ${quickMode === "balanced" ? "bg-emerald-700" : "bg-slate-700 hover:bg-slate-600"}`}
-                >
-                  均衡模式
-                </button>
-                <button
-                  onClick={() => applyQuickModePreset("performance")}
-                  className={`px-3 py-1.5 rounded text-xs ${quickMode === "performance" ? "bg-emerald-700" : "bg-slate-700 hover:bg-slate-600"}`}
-                >
-                  高性能模式
-                </button>
-              </div>
-              <p className="text-xs text-slate-400">
-                当前快速模式会同步调整模型、记忆策略、执行权限。应用后请在第 2 步点击“保存配置”。
-              </p>
-            </div>
-
-            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
-              <p className="font-medium text-slate-200 flex items-center gap-2">
-                <Brain className="w-4 h-4 text-sky-400" />
-                场景模板
-              </p>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-2">
-                {[
-                  { id: "customer_support" as ScenarioPreset, label: "客服回复" },
-                  { id: "short_video" as ScenarioPreset, label: "短视频脚本" },
-                  { id: "office" as ScenarioPreset, label: "办公文档" },
-                  { id: "developer" as ScenarioPreset, label: "编程助手" },
-                  { id: "none" as ScenarioPreset, label: "清空模板" },
-                ].map((t) => (
-                  <button
-                    key={t.id}
-                    onClick={() => applyScenarioPreset(t.id)}
-                    className={`px-3 py-2 rounded text-xs border ${
-                      scenarioPreset === t.id
-                        ? "bg-sky-800/60 border-sky-600 text-sky-100"
-                        : "bg-slate-700/60 border-slate-600 hover:bg-slate-700"
-                    }`}
-                  >
-                    {t.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
-              <p className="font-medium text-slate-200">个性调教</p>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                <label className="text-xs space-y-1">
-                  <span className="text-slate-400">回答长度</span>
-                  <select value={tuneLength} onChange={(e) => setTuneLength(e.target.value as TuneLength)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
-                    <option value="short">短</option>
-                    <option value="medium">中</option>
-                    <option value="long">长</option>
-                  </select>
-                </label>
-                <label className="text-xs space-y-1">
-                  <span className="text-slate-400">语气风格</span>
-                  <select value={tuneTone} onChange={(e) => setTuneTone(e.target.value as TuneTone)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
-                    <option value="professional">专业</option>
-                    <option value="friendly">亲切</option>
-                    <option value="concise">简洁</option>
-                  </select>
-                </label>
-                <label className="text-xs space-y-1">
-                  <span className="text-slate-400">主动性</span>
-                  <select value={tuneProactivity} onChange={(e) => setTuneProactivity(e.target.value as TuneProactivity)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
-                    <option value="low">少追问</option>
-                    <option value="balanced">平衡</option>
-                    <option value="high">多建议</option>
-                  </select>
-                </label>
-                <label className="text-xs space-y-1">
-                  <span className="text-slate-400">执行权限</span>
-                  <select value={tunePermission} onChange={(e) => setTunePermission(e.target.value as TunePermission)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
-                    <option value="suggest">仅建议</option>
-                    <option value="confirm">需确认后执行</option>
-                    <option value="auto_low_risk">低风险自动执行</option>
-                  </select>
-                </label>
-                <label className="text-xs space-y-1">
-                  <span className="text-slate-400">记忆策略</span>
-                  <select value={memoryMode} onChange={(e) => setMemoryMode(e.target.value as MemoryMode)} className="w-full bg-slate-900 border border-slate-600 rounded px-2 py-1.5">
-                    <option value="off">关闭记忆</option>
-                    <option value="session">仅会话记忆</option>
-                    <option value="long">长期记忆</option>
-                  </select>
-                </label>
-              </div>
-              <pre className="text-xs text-slate-300 bg-slate-900/40 rounded p-3 whitespace-pre-wrap">{tuningPromptPreview}</pre>
-              <button
-                onClick={async () => {
-                  try {
-                    await navigator.clipboard.writeText(tuningPromptPreview);
-                    setSelfCheckResult("已复制调教模板摘要");
-                  } catch {
-                    setSelfCheckResult("复制失败，请手动复制调教模板摘要");
-                  }
-                }}
-                className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded text-xs"
-              >
-                复制调教模板摘要
-              </button>
-            </div>
-
-            <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
-              <p className="font-medium text-slate-200">记忆中心</p>
-              <div className="flex flex-wrap gap-2">
-                <button onClick={refreshMemoryCenterStatus} disabled={memoryLoading} className="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs">
-                  {memoryLoading ? "刷新中..." : "刷新记忆状态"}
-                </button>
-                <button onClick={handleInitMemory} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-xs">
-                  {memoryActionLoading === "init" ? "初始化中..." : "一键初始化记忆"}
-                </button>
-                <button onClick={handleReadMemorySummary} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-sky-700 hover:bg-sky-600 disabled:opacity-50 rounded text-xs">
-                  {memoryActionLoading === "read" ? "读取中..." : "查看记忆摘要"}
-                </button>
-                <button onClick={handleClearMemory} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-rose-700 hover:bg-rose-600 disabled:opacity-50 rounded text-xs">
-                  {memoryActionLoading === "clear" ? "清空中..." : "清空记忆"}
-                </button>
-                <button onClick={handleExportMemory} disabled={memoryActionLoading !== null} className="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs">
-                  {memoryActionLoading === "export" ? "导出中..." : "导出记忆"}
-                </button>
-              </div>
-              {memoryStatus && (
-                <div className="text-xs text-slate-300 bg-slate-900/40 rounded p-3 space-y-1">
-                  <p>记忆启用：{memoryStatus.enabled ? "是" : "否"}</p>
-                  <p>记忆文件：{memoryStatus.memory_file_count} 个</p>
-                  <p>MEMORY.md：{memoryStatus.memory_file_exists ? "存在" : "不存在"}</p>
-                  <p>memory 目录：{memoryStatus.memory_dir_exists ? "存在" : "不存在"}</p>
-                  <p className="text-slate-400">{memoryStatus.note}</p>
-                </div>
-              )}
-              {memorySummary && <pre className="text-xs text-slate-300 whitespace-pre-wrap bg-slate-900/40 rounded p-3 max-h-52 overflow-auto">{memorySummary}</pre>}
-            </div>
-
+            {tuningSection === "health" && (
             <div className="bg-slate-800/50 rounded-lg p-4 space-y-3">
               <p className="font-medium text-slate-200 flex items-center gap-2">
                 <ShieldCheck className="w-4 h-4 text-emerald-400" />
@@ -3866,16 +8686,65 @@ function App() {
                 >
                   {tuningActionLoading === "heal" ? "修复中..." : "一键修复"}
                 </button>
-                <button
-                  onClick={handleExportDiagnosticBundle}
-                  disabled={diagnosticLoading}
-                  className="px-3 py-1.5 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 rounded text-xs"
-                >
-                  {diagnosticLoading ? "导出中..." : "一键反馈包"}
-                </button>
               </div>
-              {selfCheckResult && <pre className="text-xs text-sky-300 whitespace-pre-wrap bg-slate-900/40 rounded p-3 max-h-56 overflow-auto">{selfCheckResult}</pre>}
+              <div className="bg-slate-900/40 border border-slate-700 rounded-lg p-3 text-sm text-slate-300 space-y-3">
+                <p className="font-medium text-slate-200">渠道驱动的插件自动安装</p>
+                <div className="flex flex-wrap gap-3">
+                  {["telegram", "qq", "feishu", "discord", "dingtalk"].map((id) => (
+                    <label key={id} className="flex items-center gap-1 text-xs text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={!!pluginSelection[id]}
+                        onChange={(e) =>
+                          setPluginSelection((prev) => ({ ...prev, [id]: e.target.checked }))
+                        }
+                      />
+                      {id}
+                    </label>
+                  ))}
+                </div>
+                <button
+                  onClick={handleAutoInstallPlugins}
+                  disabled={pluginInstallLoading}
+                  className="px-3 py-2 bg-indigo-700 hover:bg-indigo-600 disabled:opacity-50 rounded text-xs"
+                >
+                  {pluginInstallLoading ? "安装中..." : "按勾选渠道自动安装/校验插件"}
+                </button>
+                {pluginInstallLoading && pluginInstallProgress && (
+                  <div className="space-y-2">
+                    <p className="text-xs text-sky-300">
+                      当前进度：{pluginInstallProgress?.current ?? 0}/{pluginInstallProgress?.total ?? 0}，
+                      正在处理 `{pluginInstallProgress?.channel ?? "-"}`（{pluginInstallProgress?.status ?? "-"}）
+                    </p>
+                    <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+                      <div
+                        className="h-full bg-sky-500 rounded-full transition-all duration-300"
+                        style={{
+                          width: `${Math.max(
+                            5,
+                            Math.min(
+                              100,
+                              Math.round(
+                                ((pluginInstallProgress?.current ?? 0) / Math.max(pluginInstallProgress?.total ?? 0, 1)) * 100
+                              )
+                            )
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                    <pre className="bg-slate-900/40 rounded p-3 text-xs whitespace-pre-wrap max-h-28 overflow-auto">
+                      {pluginInstallProgressLog.join("\n")}
+                    </pre>
+                  </div>
+                )}
+                {pluginInstallResult && (
+                  <pre className="bg-slate-900/40 rounded p-3 text-xs whitespace-pre-wrap max-h-40 overflow-auto">
+                    {pluginInstallResult}
+                  </pre>
+                )}
+              </div>
             </div>
+            )}
           </div>
         )}
       </main>
@@ -3979,7 +8848,7 @@ function App() {
         </button>
         {step < STEPS.length - 1 && (
           <button
-            onClick={() => setStep(step + 1)}
+            onClick={() => handleStepChange(step + 1)}
             disabled={step === 0 && !canProceed}
             className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-sm font-medium"
           >
@@ -3987,43 +8856,6 @@ function App() {
           </button>
         )}
       </footer>
-    </div>
-  );
-}
-
-function ChannelCard({
-  title,
-  channelId,
-  configured,
-  onClear,
-  clearing,
-  children,
-}: {
-  title: string;
-  channelId?: "telegram" | "feishu" | "qq" | "discord" | "dingtalk";
-  configured?: boolean;
-  onClear?: () => void;
-  clearing?: boolean;
-  children: React.ReactNode;
-}) {
-  return (
-    <div className="bg-slate-800/60 rounded-lg p-3 border border-slate-700">
-      <div className="flex items-center justify-between mb-2">
-        <p className="text-slate-200 font-medium">{title}</p>
-        {configured && (
-          <span className="text-xs text-emerald-400 font-medium">已配置</span>
-        )}
-      </div>
-      {children}
-      {configured && channelId && onClear && (
-        <button
-          onClick={onClear}
-          disabled={clearing}
-          className="mt-2 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded text-xs text-slate-300"
-        >
-          {clearing ? "清除中…" : "清除配置"}
-        </button>
-      )}
     </div>
   );
 }
@@ -4045,23 +8877,6 @@ function HealthLamp({ label, state }: { label: string; state: HealthState }) {
       <span className="text-xs text-slate-300">{label}</span>
       <span className="ml-auto text-xs text-slate-500">{text}</span>
     </div>
-  );
-}
-
-function MiniLamp({ label, state }: { label: string; state: HealthState }) {
-  const color =
-    state === "ok"
-      ? "bg-emerald-500"
-      : state === "warn"
-        ? "bg-amber-500"
-        : state === "error"
-          ? "bg-red-500"
-          : "bg-slate-500";
-  return (
-    <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded border border-slate-700 bg-slate-800 text-slate-300">
-      <span className={`inline-block w-2 h-2 rounded-full ${color}`} />
-      {label}
-    </span>
   );
 }
 

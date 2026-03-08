@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 #[cfg(target_os = "windows")]
 use encoding_rs::GBK;
 use std::io::{BufRead, BufReader};
@@ -11,8 +13,19 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager};
 use regex::Regex;
+use zip::ZipArchive;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+
+mod domain;
+mod repo;
+mod services;
+
+use crate::domain::models::{
+    AgentCapability, AuditEvent, CostSummary, DebateResult, GraphEdge, GraphNode, MemoryRecord,
+    OrchestratorTask, PromptPolicyVersion, RoleBinding, SandboxPreview, SkillGraph, TaskSnapshot,
+    UnifiedTicket, VerifierReport,
+};
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -100,7 +113,7 @@ pub struct SelfCheckItem {
     pub detail: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SkillMissing {
     pub bins: Vec<String>,
     pub any_bins: Vec<String>,
@@ -114,9 +127,23 @@ pub struct SkillCatalogItem {
     pub name: String,
     pub description: String,
     pub source: String,
+    #[serde(default)]
+    pub source_type: String,
     pub bundled: bool,
     pub eligible: bool,
     pub missing: SkillMissing,
+    #[serde(default)]
+    pub repo_url: Option<String>,
+    #[serde(default)]
+    pub package_name: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub install_method: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -964,16 +991,34 @@ fn find_openclaw_executable(config_path: Option<&str>) -> Option<String> {
 }
 
 fn resolve_openclaw_dir(custom_path: Option<&str>) -> String {
-    custom_path
+    if let Some(v) = custom_path
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.replace('\\', "/"))
-        .unwrap_or_else(|| {
-            let home = env::var("HOME")
-                .or_else(|_| env::var("USERPROFILE"))
-                .unwrap_or_else(|_| ".".to_string());
-            format!("{}/.openclaw", home.replace('\\', "/"))
-        })
+    {
+        return v;
+    }
+
+    // 未显式指定路径时，优先跟随 Gateway 实际使用的 OPENCLAW_STATE_DIR，
+    // 避免“软件内对话”和“浏览器/Telegram”使用不同配置目录。
+    if let Ok(Some(detected)) = detect_openclaw_config_path() {
+        return detected;
+    }
+
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    format!("{}/.openclaw", home.replace('\\', "/"))
+}
+
+fn resolve_runtime_chat_dir(custom_path: Option<&str>, prefer_gateway_dir: bool) -> String {
+    // 同步模式下优先跟随 Gateway 目录；隔离模式则使用当前客户端配置路径。
+    if prefer_gateway_dir {
+        if let Ok(Some(detected)) = detect_openclaw_config_path() {
+            return detected;
+        }
+    }
+    resolve_openclaw_dir(custom_path)
 }
 
 fn resolve_openclaw_dir_for_ops(custom_path: Option<&str>, install_hint: Option<&str>) -> String {
@@ -1444,6 +1489,29 @@ fn ensure_gateway_mode_local(root: &mut Value) {
     gobj.entry("mode".to_string()).or_insert_with(|| json!("local"));
 }
 
+fn set_default_agent_for_gateway(root: &mut Value, agent_id: &str) {
+    let target = agent_id.trim();
+    if target.is_empty() {
+        return;
+    }
+    let Some(list) = root
+        .get_mut("agents")
+        .and_then(|a| a.get_mut("list"))
+        .and_then(|l| l.as_array_mut())
+    else {
+        return;
+    };
+    for item in list.iter_mut() {
+        let Some(obj) = item.as_object_mut() else { continue };
+        let is_target = obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|id| id.trim().eq_ignore_ascii_case(target))
+            .unwrap_or(false);
+        obj.insert("default".to_string(), Value::Bool(is_target));
+    }
+}
+
 fn generate_gateway_token() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1454,6 +1522,35 @@ fn generate_gateway_token() -> String {
 }
 
 fn ensure_telegram_open_requirements(ch_obj: &mut Map<String, Value>) {
+    // Telegram 在国内网络常见 Node fetch 连接不稳定，默认强制 IPv4 优先并关闭 autoSelectFamily。
+    let network = ch_obj
+        .entry("network".to_string())
+        .or_insert_with(|| json!({}));
+    if !network.is_object() {
+        *network = json!({});
+    }
+    if let Some(net_obj) = network.as_object_mut() {
+        net_obj
+            .entry("autoSelectFamily".to_string())
+            .or_insert_with(|| json!(false));
+        net_obj
+            .entry("dnsResultOrder".to_string())
+            .or_insert_with(|| json!("ipv4first"));
+    }
+
+    // 若未配置 telegram.proxy，自动探测本机常见代理端口并注入。
+    let has_proxy = ch_obj
+        .get("proxy")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if !has_proxy {
+        if let Some(proxy) = detect_local_http_proxy() {
+            ch_obj.insert("proxy".to_string(), json!(proxy));
+        }
+    }
+    ch_obj.insert("streaming".to_string(), json!("off"));
+
     let dm_open = ch_obj
         .get("dmPolicy")
         .and_then(|v| v.as_str())
@@ -1477,6 +1574,18 @@ fn ensure_telegram_open_requirements(ch_obj: &mut Map<String, Value>) {
     }
 }
 
+fn detect_local_http_proxy() -> Option<String> {
+    use std::net::{SocketAddr, TcpStream};
+    let ports = [7890_u16, 10809_u16, 20171_u16, 9090_u16];
+    for port in ports {
+        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().ok()?;
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(180)).is_ok() {
+            return Some(format!("http://127.0.0.1:{}", port));
+        }
+    }
+    None
+}
+
 fn normalize_openclaw_config_for_telegram(root: &mut Value) {
     if let Some(ch_obj) = root
         .as_object_mut()
@@ -1486,8 +1595,39 @@ fn normalize_openclaw_config_for_telegram(root: &mut Value) {
         .and_then(|v| v.as_object_mut())
     {
         ch_obj.remove("chatId");
+        // 强制 open 模式，避免 pairing 导致“发了不回”（需先批准配对码）
+        ch_obj.insert("dmPolicy".to_string(), json!("open"));
         ensure_telegram_open_requirements(ch_obj);
     }
+    // 避免 Telegram 出现“同一条输入回复两次”的体验：显式把 Telegram 队列策略固定为 collect。
+    if !root.is_object() {
+        *root = json!({});
+    }
+    let obj = root.as_object_mut().expect("root object");
+    let messages = obj.entry("messages".to_string()).or_insert_with(|| json!({}));
+    if !messages.is_object() {
+        *messages = json!({});
+    }
+    let queue = messages
+        .as_object_mut()
+        .expect("messages object")
+        .entry("queue".to_string())
+        .or_insert_with(|| json!({}));
+    if !queue.is_object() {
+        *queue = json!({});
+    }
+    let by_channel = queue
+        .as_object_mut()
+        .expect("queue object")
+        .entry("byChannel".to_string())
+        .or_insert_with(|| json!({}));
+    if !by_channel.is_object() {
+        *by_channel = json!({});
+    }
+    by_channel
+        .as_object_mut()
+        .expect("byChannel object")
+        .insert("telegram".to_string(), json!("collect"));
 }
 
 fn normalize_openclaw_config_for_models(root: &mut Value) {
@@ -1663,6 +1803,17 @@ fn ensure_channel_in_openclaw_config(root: &mut Value, channel: &str, config: Va
             .as_object_mut()
             .expect("entry object")
             .insert("enabled".to_string(), json!(true));
+    }
+}
+
+fn normalize_agents_schema(root: &mut Value) {
+    if let Some(agents_obj) = root
+        .as_object_mut()
+        .and_then(|obj| obj.get_mut("agents"))
+        .and_then(|v| v.as_object_mut())
+    {
+        // 兼容旧版本：当前版本 schema 不支持 agents.bindings
+        agents_obj.remove("bindings");
     }
 }
 
@@ -1973,6 +2124,21 @@ fn is_builtin_channel_for_openclaw(channel: &str) -> bool {
             | "imessage"
             | "msteams"
     )
+}
+
+fn channel_storage_aliases(channel: &str) -> Vec<String> {
+    let id = channel.trim().to_ascii_lowercase();
+    match id.as_str() {
+        "qq" | "qqbot" => vec!["qqbot".to_string(), "qq".to_string()],
+        _ => vec![id],
+    }
+}
+
+fn channel_primary_storage_key(channel: &str) -> String {
+    channel_storage_aliases(channel)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| channel.trim().to_ascii_lowercase())
 }
 
 fn merge_legacy_channels_json(openclaw_dir: &str) -> Result<(), String> {
@@ -2479,30 +2645,11 @@ fn run_openclaw_cmd(exe: &str, args: &[&str], env_extra: Option<(&str, &str)>) -
             } else {
                 exe.to_string()
             };
-            // 使用 cmd /c 运行 .cmd；路径无空格时不要加引号，避免 cmd 解析错误
-            let exe_part = if exe_abs.contains(' ') {
-                format!("\"{}\"", exe_abs.replace('"', "\"\""))
-            } else {
-                exe_abs.clone()
-            };
-            let args_part: Vec<String> = args
-                .iter()
-                .map(|a| {
-                    if a.contains(' ') {
-                        format!("\"{}\"", a.replace('"', "\"\""))
-                    } else {
-                        (*a).to_string()
-                    }
-                })
-                .collect();
-            let full_cmd = if args_part.is_empty() {
-                exe_part
-            } else {
-                format!("{} {}", exe_part, args_part.join(" "))
-            };
             let mut cmd = Command::new("cmd");
             hide_console_window(&mut cmd);
-            cmd.args(["/c", &full_cmd]);
+            // 关键修复：不要把整条命令拼成字符串（会破坏 JSON 参数中的引号，导致 gateway call 拆参错误）。
+            // 改为参数分离传递，让系统按 argv 精确传递每个参数。
+            cmd.arg("/c").arg(&exe_abs).args(args);
             if let Some(dir) = work_dir {
                 let _ = cmd.current_dir(dir);
             }
@@ -2606,6 +2753,287 @@ fn run_openclaw_cmd_clean(exe: &str, args: &[&str], env_extra: Option<(&str, &st
     let stdout = strip_ansi_text(&decode_console_output(&output.stdout));
     let stderr = strip_ansi_text(&decode_console_output(&output.stderr));
     Ok((output.status.success(), stdout, stderr))
+}
+
+fn run_command_clean(cmd: &mut Command) -> Result<(bool, String, String), String> {
+    let output = cmd.output().map_err(|e| format!("执行失败: {}", e))?;
+    let stdout = strip_ansi_text(&decode_console_output(&output.stdout));
+    let stderr = strip_ansi_text(&decode_console_output(&output.stderr));
+    Ok((output.status.success(), stdout, stderr))
+}
+
+fn run_npm_exec_cmd_clean(pkg: &str, args: &[&str]) -> Result<(bool, String, String), String> {
+    let mut exec_args: Vec<&str> = vec!["exec", "--yes", pkg, "--"];
+    exec_args.extend_from_slice(args);
+    let output = run_npm_cmd(&exec_args).map_err(|e| format!("执行失败: {}", e))?;
+    let stdout = strip_ansi_text(&decode_console_output(&output.stdout));
+    let stderr = strip_ansi_text(&decode_console_output(&output.stderr));
+    Ok((output.status.success(), stdout, stderr))
+}
+
+fn run_clawhub_cmd_clean(openclaw_dir: &str, args: &[&str]) -> Result<(bool, String, String), String> {
+    let mut full_args: Vec<&str> = vec!["--workdir", openclaw_dir, "--dir", "skills"];
+    full_args.extend_from_slice(args);
+    run_npm_exec_cmd_clean("clawhub", &full_args)
+}
+
+fn parse_clawhub_search_slugs(stdout: &str, limit: usize) -> Vec<String> {
+    let re = Regex::new(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s{2,}.+\(([0-9.]+)\)\s*$").unwrap();
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let caps = re.captures(trimmed)?;
+            caps.get(1).map(|m| m.as_str().to_string())
+        })
+        .take(limit)
+        .collect()
+}
+
+fn parse_skill_name_from_skill_md(skill_md_path: &Path) -> Option<String> {
+    let txt = std::fs::read_to_string(skill_md_path).ok()?;
+    for line in txt.lines().take(40) {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix("name:") {
+            let value = name.trim().trim_matches('"').trim_matches('\'').trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn find_skill_root(path: &Path) -> Option<PathBuf> {
+    if !path.exists() {
+        return None;
+    }
+    if path.is_file() {
+        return path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| name.eq_ignore_ascii_case("SKILL.md"))
+            .and_then(|_| path.parent().map(|parent| parent.to_path_buf()));
+    }
+    let skill_md = path.join("SKILL.md");
+    if skill_md.exists() {
+        return Some(path.to_path_buf());
+    }
+    let entries = std::fs::read_dir(path).ok()?;
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if child.is_dir() {
+            if let Some(hit) = find_skill_root(&child) {
+                return Some(hit);
+            }
+        } else if child
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.eq_ignore_ascii_case("SKILL.md"))
+            .unwrap_or(false)
+        {
+            return child.parent().map(|parent| parent.to_path_buf());
+        }
+    }
+    None
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target).map_err(|e| format!("创建目录失败: {}", e))?;
+    let entries = std::fs::read_dir(source).map_err(|e| format!("读取目录失败: {}", e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+        let src_path = entry.path();
+        let dst_path = target.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            if let Some(parent) = dst_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+            }
+            std::fs::copy(&src_path, &dst_path).map_err(|e| format!("复制文件失败: {}", e))?;
+        }
+    }
+    Ok(())
+}
+
+fn extract_zip_to_dir(zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
+    let file = std::fs::File::open(zip_path).map_err(|e| format!("打开 ZIP 失败: {}", e))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("解析 ZIP 失败: {}", e))?;
+    for idx in 0..archive.len() {
+        let mut entry = archive
+            .by_index(idx)
+            .map_err(|e| format!("读取 ZIP 条目失败: {}", e))?;
+        let Some(rel_path) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        let out_path = dest_dir.join(rel_path);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path).map_err(|e| format!("创建目录失败: {}", e))?;
+            continue;
+        }
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+        }
+        let mut out_file = std::fs::File::create(&out_path).map_err(|e| format!("写入 ZIP 内容失败: {}", e))?;
+        std::io::copy(&mut entry, &mut out_file).map_err(|e| format!("解压 ZIP 失败: {}", e))?;
+    }
+    Ok(())
+}
+
+fn install_skill_dir_into_shared_layer(source_dir: &Path, skills_dir: &Path) -> Result<String, String> {
+    let skill_md = source_dir.join("SKILL.md");
+    if !skill_md.exists() {
+        return Err("未找到 SKILL.md，无法识别为有效 Skill".to_string());
+    }
+    let skill_name = parse_skill_name_from_skill_md(&skill_md)
+        .or_else(|| source_dir.file_name().and_then(|name| name.to_str()).map(|s| s.to_string()))
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| "无法确定 Skill 名称".to_string())?;
+    let target_dir = skills_dir.join(&skill_name);
+    if target_dir.exists() {
+        std::fs::remove_dir_all(&target_dir).map_err(|e| format!("覆盖已有 Skill 失败: {}", e))?;
+    }
+    copy_dir_recursive(source_dir, &target_dir)?;
+    Ok(format!("已安装本地 Skill 到共享层：{}", target_dir.to_string_lossy()))
+}
+
+fn inspect_clawhub_skill(openclaw_dir: &str, slug: &str) -> Option<SkillCatalogItem> {
+    let (ok, stdout, stderr) = run_clawhub_cmd_clean(openclaw_dir, &["inspect", slug]).ok()?;
+    if !ok {
+        let detail = format!("{}\n{}", stdout, stderr);
+        return Some(SkillCatalogItem {
+            name: slug.to_string(),
+            description: detail.trim().to_string(),
+            source: "ClawHub".to_string(),
+            source_type: "clawhub".to_string(),
+            bundled: false,
+            eligible: false,
+            missing: SkillMissing::default(),
+            repo_url: None,
+            package_name: Some(slug.to_string()),
+            version: None,
+            author: None,
+            verified: false,
+            install_method: Some("clawhub_install".to_string()),
+        });
+    }
+    let mut title = slug.to_string();
+    let mut description = String::new();
+    let mut owner = None;
+    let mut version = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("- ") {
+            continue;
+        }
+        if !trimmed.contains(':') && trimmed.split_whitespace().count() >= 2 {
+            let mut parts = trimmed.split_whitespace();
+            if let Some(first) = parts.next() {
+                title = parts.collect::<Vec<_>>().join(" ");
+                if title.is_empty() {
+                    title = first.to_string();
+                }
+            }
+            continue;
+        }
+        if let Some(v) = trimmed.strip_prefix("Summary:") {
+            description = v.trim().to_string();
+        } else if let Some(v) = trimmed.strip_prefix("Owner:") {
+            owner = Some(v.trim().to_string());
+        } else if let Some(v) = trimmed.strip_prefix("Latest:") {
+            version = Some(v.trim().to_string());
+        }
+    }
+    Some(SkillCatalogItem {
+        name: title,
+        description,
+        source: "ClawHub".to_string(),
+        source_type: "clawhub".to_string(),
+        bundled: false,
+        eligible: false,
+        missing: SkillMissing::default(),
+        repo_url: None,
+        package_name: Some(slug.to_string()),
+        version,
+        author: owner.clone(),
+        verified: owner
+            .as_deref()
+            .map(|v| v.eq_ignore_ascii_case("openclaw"))
+            .unwrap_or(false),
+        install_method: Some("clawhub_install".to_string()),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRepoOwner {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRepoItem {
+    full_name: String,
+    html_url: String,
+    description: Option<String>,
+    stargazers_count: u64,
+    owner: GithubRepoOwner,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubSearchResponse {
+    items: Vec<GithubRepoItem>,
+}
+
+fn search_github_skill_repos(query: &str, limit: usize) -> Vec<SkillCatalogItem> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let escaped = trimmed.replace('\'', "''");
+        let ps = format!(
+            "$q=[uri]::EscapeDataString('{} openclaw skill'); $u='https://api.github.com/search/repositories?q='+$q+'&sort=stars&order=desc&per_page={}'; Invoke-RestMethod -Headers @{{'User-Agent'='openclaw-deploy'}} -Uri $u | ConvertTo-Json -Depth 8 -Compress",
+            escaped,
+            limit
+        );
+        let mut cmd = Command::new("powershell");
+        hide_console_window(&mut cmd);
+        cmd.args(["-NoProfile", "-Command", &ps]);
+        let Ok((ok, stdout, _stderr)) = run_command_clean(&mut cmd) else {
+            return Vec::new();
+        };
+        if !ok || stdout.trim().is_empty() {
+            return Vec::new();
+        }
+        let Ok(parsed) = serde_json::from_str::<GithubSearchResponse>(&stdout) else {
+            return Vec::new();
+        };
+        return parsed
+            .items
+            .into_iter()
+            .map(|item| SkillCatalogItem {
+                name: item.full_name.clone(),
+                description: item.description.unwrap_or_else(|| format!("GitHub 仓库 · {} stars", item.stargazers_count)),
+                source: "GitHub".to_string(),
+                source_type: "github".to_string(),
+                bundled: false,
+                eligible: false,
+                missing: SkillMissing::default(),
+                repo_url: Some(item.html_url),
+                package_name: Some(item.full_name),
+                version: None,
+                author: Some(item.owner.login),
+                verified: false,
+                install_method: Some("git_clone".to_string()),
+            })
+            .collect();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (query, limit);
+        Vec::new()
+    }
 }
 
 fn try_repair_control_ui_assets(exe: &str) -> String {
@@ -2730,6 +3158,65 @@ fn cleanup_processes_listening_on_port(_port: u16) -> Vec<String> {
     vec![]
 }
 
+#[cfg(target_os = "windows")]
+fn cleanup_duplicate_gateway_processes() -> Vec<String> {
+    let mut killed = Vec::<String>::new();
+    let mut cmd = Command::new("powershell");
+    hide_console_window(&mut cmd);
+    let script = "$ErrorActionPreference='SilentlyContinue'; \
+Get-CimInstance Win32_Process | \
+Where-Object { ($_.Name -match '^(node|cmd|powershell)\\.exe$') -and $_.CommandLine -and (($_.CommandLine -match 'openclaw\\s+gateway') -or ($_.CommandLine -match 'gateway\\.cmd')) } | \
+Select-Object ProcessId, Name, CommandLine | ConvertTo-Json -Compress";
+    let out = match cmd.args(["-NoProfile", "-Command", script]).output() {
+        Ok(v) => v,
+        Err(_) => return killed,
+    };
+    if !out.status.success() {
+        return killed;
+    }
+    let txt = decode_console_output(&out.stdout);
+    if txt.trim().is_empty() || txt.trim() == "null" {
+        return killed;
+    }
+    let val: Value = match serde_json::from_str(&txt) {
+        Ok(v) => v,
+        Err(_) => return killed,
+    };
+    let mut pids: Vec<u32> = Vec::new();
+    let push_pid = |v: &Value, pids: &mut Vec<u32>| {
+        if let Some(pid) = v.get("ProcessId").and_then(|x| x.as_u64()) {
+            let pid_u32 = pid as u32;
+            if pid_u32 > 0 && pid_u32 != std::process::id() {
+                pids.push(pid_u32);
+            }
+        }
+    };
+    if let Some(arr) = val.as_array() {
+        for it in arr {
+            push_pid(it, &mut pids);
+        }
+    } else {
+        push_pid(&val, &mut pids);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    for pid in pids {
+        let mut kill_cmd = Command::new("cmd");
+        hide_console_window(&mut kill_cmd);
+        if let Ok(k) = kill_cmd.args(["/c", "taskkill", "/PID", &pid.to_string(), "/F"]).output() {
+            if k.status.success() {
+                killed.push(format!("已清理重复 Gateway 进程 PID {}", pid));
+            }
+        }
+    }
+    killed
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cleanup_duplicate_gateway_processes() -> Vec<String> {
+    vec![]
+}
+
 #[tauri::command]
 fn start_gateway(custom_path: Option<String>, install_hint: Option<String>) -> Result<String, String> {
     let mut config_dir = custom_path
@@ -2771,6 +3258,7 @@ fn start_gateway(custom_path: Option<String>, install_hint: Option<String>) -> R
         if let Ok(mut root) = load_openclaw_config(dir) {
             ensure_gateway_mode_local(&mut root);
             normalize_openclaw_config_for_telegram(&mut root);
+            normalize_agents_schema(&mut root);
             normalize_openclaw_config_for_models(&mut root);
             let _ = save_openclaw_config(dir, &root);
         }
@@ -2788,6 +3276,7 @@ fn start_gateway(custom_path: Option<String>, install_hint: Option<String>) -> R
     // 启动前清理旧进程，避免端口被占用
     let _ = run_openclaw_cmd_clean(&exe, &["gateway", "stop"], env_extra);
     let cleaned_port_pids = cleanup_processes_listening_on_port(18789);
+    let cleaned_gateway_pids = cleanup_duplicate_gateway_processes();
     std::thread::sleep(Duration::from_secs(2));
 
     let (ok, stdout, stderr) = run_openclaw_cmd_clean(&exe, &["gateway", "start"], env_extra)?;
@@ -2806,6 +3295,12 @@ fn start_gateway(custom_path: Option<String>, install_hint: Option<String>) -> R
         if !cleaned_port_pids.is_empty() {
             msg.push_str("\n\n[端口清理]");
             for item in &cleaned_port_pids {
+                msg.push_str(&format!("\n- {}", item));
+            }
+        }
+        if !cleaned_gateway_pids.is_empty() {
+            msg.push_str("\n\n[重复进程清理]");
+            for item in &cleaned_gateway_pids {
                 msg.push_str(&format!("\n- {}", item));
             }
         }
@@ -2915,7 +3410,7 @@ fn reset_gateway_auth_and_restart(custom_path: Option<String>, install_hint: Opt
     let ui_fix = try_repair_control_ui_assets(&exe);
     let _ = get_gateway_auth_token(custom_path.clone())?;
     let start_msg = start_gateway(custom_path.clone(), install_hint)?;
-    let url = get_gateway_dashboard_url(custom_path)?;
+    let url = get_gateway_dashboard_url(custom_path, None)?;
     Ok(format!(
         "{}\n\n[doctor --fix]\n{}\n{}\n\n[ui 修复]\n{}\n\n已重置 Gateway 认证并重启。\n请使用此地址进入：{}",
         start_msg, d_out, d_err, ui_fix, url
@@ -3281,6 +3776,8 @@ fn save_channel_config(
     custom_path: Option<String>,
 ) -> Result<String, String> {
     let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let primary_key = channel_primary_storage_key(&channel);
+    let aliases = channel_storage_aliases(&channel);
     std::fs::create_dir_all(&openclaw_dir).map_err(|e| format!("创建配置目录失败: {}", e))?;
     let _ = create_config_snapshot(&openclaw_dir, "pre-save-channel");
     let config_path = format!("{}/channels.json", openclaw_dir);
@@ -3304,7 +3801,10 @@ fn save_channel_config(
         root = Value::Object(Map::new());
     }
     let obj = root.as_object_mut().ok_or("配置格式错误")?;
-    obj.insert(channel.clone(), effective_config.clone());
+    for alias in &aliases {
+        obj.remove(alias);
+    }
+    obj.insert(primary_key.clone(), effective_config.clone());
     std::fs::write(
         &config_path,
         serde_json::to_string_pretty(&root).map_err(|e| format!("序列化失败: {}", e))?,
@@ -3314,6 +3814,10 @@ fn save_channel_config(
     if is_builtin_channel_for_openclaw(&channel) {
         let mut openclaw_root = load_openclaw_config(&openclaw_dir)?;
         ensure_channel_in_openclaw_config(&mut openclaw_root, &channel, effective_config);
+        if channel == "telegram" {
+            normalize_openclaw_config_for_telegram(&mut openclaw_root);
+        }
+        normalize_agents_schema(&mut openclaw_root);
         ensure_gateway_mode_local(&mut openclaw_root);
         save_openclaw_config(&openclaw_dir, &openclaw_root)?;
         Ok(format!("{} 渠道配置已保存并已同步到 openclaw.json：{}", channel, openclaw_dir))
@@ -3325,7 +3829,7 @@ fn save_channel_config(
         };
         Ok(format!(
             "{} 渠道配置已保存到 channels.json：{}。{}",
-            channel, openclaw_dir, tip
+            primary_key, openclaw_dir, tip
         ))
     }
 }
@@ -3364,7 +3868,8 @@ fn is_channel_configured(channel_id: &str, ch: &Value) -> bool {
         }
         "qq" => {
             let app_ok = non_empty(obj.get("appId"));
-            let cred_ok = non_empty(obj.get("token")) || non_empty(obj.get("appSecret"));
+            let cred_ok =
+                non_empty(obj.get("clientSecret")) || non_empty(obj.get("token")) || non_empty(obj.get("appSecret"));
             app_ok && cred_ok
         }
         _ => false,
@@ -3391,7 +3896,11 @@ fn get_channel_config_status(custom_path: Option<String>) -> Result<Value, Strin
         Map::new()
     };
     for id in channels {
-        let ch = chs.get(id).or_else(|| chs_legacy.get(id)).cloned().unwrap_or(json!({}));
+        let aliases = channel_storage_aliases(id);
+        let ch = aliases
+            .iter()
+            .find_map(|key| chs.get(key).or_else(|| chs_legacy.get(key)).cloned())
+            .unwrap_or(json!({}));
         result.insert(id.to_string(), json!(is_channel_configured(id, &ch)));
     }
     Ok(Value::Object(result))
@@ -3400,6 +3909,7 @@ fn get_channel_config_status(custom_path: Option<String>) -> Result<Value, Strin
 #[tauri::command]
 fn remove_channel_config(channel: String, custom_path: Option<String>) -> Result<String, String> {
     let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let aliases = channel_storage_aliases(&channel);
     let channels_path = format!("{}/channels.json", openclaw_dir.replace('\\', "/"));
     let config_path = format!("{}/openclaw.json", openclaw_dir.replace('\\', "/"));
     let mut modified = false;
@@ -3410,7 +3920,13 @@ fn remove_channel_config(channel: String, custom_path: Option<String>) -> Result
             .and_then(|o| o.get_mut("channels"))
             .and_then(|c| c.as_object_mut())
         {
-            if chs.remove(&channel).is_some() {
+            let mut removed_any = false;
+            for key in &aliases {
+                if chs.remove(key).is_some() {
+                    removed_any = true;
+                }
+            }
+            if removed_any {
                 modified = true;
                 save_openclaw_config(&openclaw_dir, &root)?;
             }
@@ -3422,7 +3938,13 @@ fn remove_channel_config(channel: String, custom_path: Option<String>) -> Result
         let mut root: Value =
             serde_json::from_str(&txt).map_err(|e| format!("解析 channels.json 失败: {}", e))?;
         if let Some(obj) = root.as_object_mut() {
-            if obj.remove(&channel).is_some() {
+            let mut removed_any = false;
+            for key in &aliases {
+                if obj.remove(key).is_some() {
+                    removed_any = true;
+                }
+            }
+            if removed_any {
                 modified = true;
                 std::fs::write(
                     &channels_path,
@@ -3443,17 +3965,18 @@ fn remove_channel_config(channel: String, custom_path: Option<String>) -> Result
 #[tauri::command]
 fn read_channel_config(channel: String, custom_path: Option<String>) -> Result<Value, String> {
     let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let aliases = channel_storage_aliases(&channel);
     let channels_path = format!("{}/channels.json", openclaw_dir.replace('\\', "/"));
     if Path::new(&channels_path).exists() {
         let txt = std::fs::read_to_string(&channels_path)
             .map_err(|e| format!("读取 channels.json 失败: {}", e))?;
         if let Ok(root) = serde_json::from_str::<Value>(&txt) {
-            if let Some(v) = root
-                .as_object()
-                .and_then(|obj| obj.get(&channel))
-                .cloned()
-            {
-                return Ok(v);
+            if let Some(obj) = root.as_object() {
+                for key in &aliases {
+                    if let Some(v) = obj.get(key).cloned() {
+                        return Ok(v);
+                    }
+                }
             }
         }
     }
@@ -3463,8 +3986,7 @@ fn read_channel_config(channel: String, custom_path: Option<String>) -> Result<V
         .as_object()
         .and_then(|obj| obj.get("channels"))
         .and_then(|chs| chs.as_object())
-        .and_then(|chs| chs.get(&channel))
-        .cloned()
+        .and_then(|chs| aliases.iter().find_map(|key| chs.get(key).cloned()))
         .unwrap_or_else(|| json!({}));
     Ok(fallback)
 }
@@ -3871,9 +4393,19 @@ fn get_gateway_auth_token(custom_path: Option<String>) -> Result<String, String>
 }
 
 #[tauri::command]
-fn get_gateway_dashboard_url(custom_path: Option<String>) -> Result<String, String> {
+fn get_gateway_dashboard_url(custom_path: Option<String>, gateway_id: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
     let token = get_gateway_auth_token(custom_path)?;
-    Ok(format!("http://127.0.0.1:18789/?token={}", token))
+    let port = if let Some(gid_raw) = gateway_id.as_deref() {
+        let gid = sanitize_gateway_key(gid_raw);
+        let settings = load_agent_runtime_settings(&openclaw_dir)?;
+        find_gateway_binding(&settings, &gid)
+            .and_then(|g| g.listen_port)
+            .unwrap_or(18789)
+    } else {
+        18789
+    };
+    Ok(format!("http://127.0.0.1:{}/?token={}", port, token))
 }
 
 #[tauri::command]
@@ -3984,8 +4516,8 @@ fn read_key_sync_status(custom_path: Option<String>) -> Result<KeySyncStatus, St
 #[tauri::command]
 fn test_channel_connection(channel: String, config: Value) -> Result<String, String> {
     if (channel == "qq" || channel == "feishu") && !is_builtin_channel_for_openclaw(&channel) {
-        return Err(format!(
-            "{} 连通性测试提示：当前 OpenClaw 版本非内置该渠道，平台可能提示机器人离线（例如“去火星”）。如需稳定对话，建议使用 Telegram 或安装对应插件。",
+        return Ok(format!(
+            "{} 配置已识别；当前 OpenClaw 版本对该渠道不提供可靠的在线连通性验证，平台侧仍可能提示离线（例如“去火星”）。如需稳定对话，建议安装对应插件后再验证，或优先使用 Telegram。",
             channel
         ));
     }
@@ -4014,7 +4546,13 @@ fn test_channel_connection(channel: String, config: Value) -> Result<String, Str
         "qq" => {
             let app_id = obj.get("appId").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
             let token = obj.get("token").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
-            app_id && token
+            let client_secret = obj
+                .get("clientSecret")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            let app_secret = obj.get("appSecret").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false);
+            app_id && (token || client_secret || app_secret)
         }
         _ => false,
     };
@@ -4079,6 +4617,26 @@ fn list_pairings(channel: String, custom_path: Option<String>) -> Result<String,
 }
 
 #[tauri::command]
+fn list_pairings_json(channel: String, custom_path: Option<String>) -> Result<Value, String> {
+    let cfg = custom_path
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let exe = find_openclaw_executable(cfg.as_deref()).unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = cfg.as_ref().map(|s| ("OPENCLAW_STATE_DIR", s.as_str()));
+    let (ok, stdout, stderr) =
+        run_openclaw_cmd_clean(&exe, &["pairing", "list", channel.as_str(), "--json"], env_extra)?;
+    if !ok {
+        return Err(format!("查询配对失败:\n{}\n{}", stdout, stderr));
+    }
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Ok(json!({ "channel": channel, "requests": [] }));
+    }
+    serde_json::from_str(trimmed).map_err(|e| format!("解析配对列表 JSON 失败: {}\n{}", e, stdout))
+}
+
+#[tauri::command]
 fn approve_pairing(
     channel: String,
     code: String,
@@ -4111,6 +4669,16 @@ fn approve_pairing(
     } else {
         Err(format!("配对失败:\n{}\n{}", stdout, stderr))
     }
+}
+
+#[tauri::command]
+fn fix_telegram_dm_policy(custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut root = load_openclaw_config(&openclaw_dir).map_err(|e| e.to_string())?;
+    normalize_openclaw_config_for_telegram(&mut root);
+    normalize_agents_schema(&mut root);
+    save_openclaw_config(&openclaw_dir, &root).map_err(|e| e.to_string())?;
+    Ok("Telegram 已切换为 open 模式（无需配对即可对话）。请点击「启动 Gateway」或重启 Gateway 使配置生效。".to_string())
 }
 
 #[tauri::command]
@@ -4572,6 +5140,92 @@ fn auto_install_channel_plugins(
     Ok(msg)
 }
 
+fn ensure_channel_plugins_installed(
+    channels: &[String],
+    openclaw_dir: &str,
+    install_hint: Option<String>,
+) -> Result<Vec<String>, String> {
+    let _ = ensure_extension_manifest_compat(openclaw_dir);
+    let install_hint_norm = install_hint
+        .as_deref()
+        .map(|s| s.trim().replace('\\', "/"))
+        .filter(|s| !s.is_empty());
+    let exe = find_openclaw_executable(install_hint_norm.as_deref().or(Some(openclaw_dir)))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir));
+    let mut changed = Vec::new();
+
+    for channel in channels {
+        let id = normalize_channel_id(channel);
+        let Some(pkg) = channel_plugin_package(&id) else {
+            continue;
+        };
+        let (list_ok_before, list_out_before, list_err_before) =
+            run_openclaw_cmd_clean(&exe, &["plugins", "list"], env_extra)?;
+        let list_before = format!("{}\n{}", list_out_before, list_err_before).to_lowercase();
+        let pkg_short = pkg.split('/').last().unwrap_or(pkg).to_lowercase();
+        if list_ok_before
+            && (list_before.contains(&pkg.to_lowercase()) || list_before.contains(&pkg_short))
+        {
+            continue;
+        }
+
+        let (ok, out, err) = run_openclaw_cmd_clean(
+            &exe,
+            &["plugins", "install", &format!("{}@latest", pkg)],
+            env_extra,
+        )?;
+        let lower = format!("{}\n{}", out, err).to_lowercase();
+        if ok || lower.contains("duplicate plugin id") {
+            changed.push(format!("{} -> {}", id, pkg));
+            continue;
+        }
+        return Err(format!("安装渠道插件失败({} -> {}): {}\n{}", id, pkg, out, err));
+    }
+
+    Ok(changed)
+}
+
+fn gateway_install_stamp_path(state_dir: &str) -> PathBuf {
+    Path::new(state_dir).join(".gateway-installed")
+}
+
+fn gateway_start_requires_reinstall(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("program not found")
+        || lower.contains("not recognized as an internal or external command")
+        || lower.contains("系统找不到指定的文件")
+        || lower.contains("no such file or directory")
+        || lower.contains("gateway service missing")
+        || lower.contains("gateway install")
+        || lower.contains("schtasks")
+}
+
+fn ensure_gateway_service_installed(
+    exe: &str,
+    state_dir: &str,
+    gateway_id: &str,
+    port: Option<u16>,
+) -> Result<bool, String> {
+    let stamp_path = gateway_install_stamp_path(state_dir);
+    if stamp_path.exists() {
+        return Ok(false);
+    }
+    let (ok, out, err) =
+        run_openclaw_gateway_cmd_clean(exe, &["gateway", "install", "--force"], state_dir, gateway_id, port)?;
+    if !ok {
+        return Err(format!("安装网关服务失败: {}\n{}", out, err));
+    }
+    let stamp = format!(
+        "installed_at={}\ngateway_id={}\nport={}\n",
+        now_stamp(),
+        gateway_id,
+        port.map(|v| v.to_string()).unwrap_or_default()
+    );
+    let _ = std::fs::write(stamp_path, stamp);
+    Ok(true)
+}
+
 #[tauri::command]
 fn list_skills_catalog(custom_path: Option<String>, install_hint: Option<String>) -> Result<Vec<SkillCatalogItem>, String> {
     let openclaw_dir = resolve_openclaw_dir_for_ops(custom_path.as_deref(), install_hint.as_deref());
@@ -4592,6 +5246,7 @@ fn list_skills_catalog(custom_path: Option<String>, install_hint: Option<String>
             name: s.name,
             description: s.description.trim().to_string(),
             source: s.source,
+            source_type: "shared".to_string(),
             bundled: s.bundled,
             eligible: s.eligible,
             missing: SkillMissing {
@@ -4601,10 +5256,197 @@ fn list_skills_catalog(custom_path: Option<String>, install_hint: Option<String>
                 config: s.missing.config,
                 os: s.missing.os,
             },
+            repo_url: None,
+            package_name: None,
+            version: None,
+            author: None,
+            verified: false,
+            install_method: None,
         })
         .collect();
     items.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(items)
+}
+
+#[tauri::command]
+async fn search_market_skills(
+    query: String,
+    custom_path: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<SkillCatalogItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+        let q = query.trim().to_string();
+        if q.is_empty() {
+            return Err("请输入要搜索的 Skills 关键词".to_string());
+        }
+        let max_results = limit.unwrap_or(12).clamp(1, 20);
+        let mut results = search_github_skill_repos(&q, max_results);
+
+        match run_clawhub_cmd_clean(&openclaw_dir, &["search", "--limit", &max_results.to_string(), &q]) {
+            Ok((ok, stdout, stderr)) => {
+                let combined = format!("{}\n{}", stdout, stderr).to_lowercase();
+                if ok || (!stdout.trim().is_empty() && !combined.contains("rate limit exceeded")) {
+                    for slug in parse_clawhub_search_slugs(&stdout, 3) {
+                        if let Some(item) = inspect_clawhub_skill(&openclaw_dir, &slug) {
+                            results.push(item);
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // 桌面端缺 PATH 时静默降级为 GitHub 搜索。
+            }
+        }
+
+        let mut seen = BTreeSet::new();
+        results.retain(|item| {
+            let key = format!(
+                "{}:{}",
+                item.source_type.to_lowercase(),
+                item.package_name
+                    .clone()
+                    .unwrap_or_else(|| item.name.clone())
+                    .to_lowercase()
+            );
+            seen.insert(key)
+        });
+        if results.is_empty() {
+            return Err("没有找到可用的第三方 Skills 结果。ClawHub 可能被限流，建议直接下载 ZIP 后走“本地 Skills 安装”。".to_string());
+        }
+        Ok(results)
+    })
+    .await
+    .map_err(|e| format!("搜索任务执行失败: {}", e))?
+}
+
+#[tauri::command]
+async fn install_market_skill(
+    source_type: String,
+    package_name: Option<String>,
+    repo_url: Option<String>,
+    version: Option<String>,
+    custom_path: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+        let skills_dir = Path::new(&openclaw_dir).join("skills");
+        std::fs::create_dir_all(&skills_dir).map_err(|e| format!("创建 skills 目录失败: {}", e))?;
+        let source = source_type.trim().to_lowercase();
+
+        if source == "clawhub" {
+            let slug = package_name
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "缺少 ClawHub skill 标识".to_string())?;
+            let mut args = vec!["install", slug.as_str()];
+            let version_value = version
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(ref v) = version_value {
+                args.push("--version");
+                args.push(v.as_str());
+            }
+            let (ok, stdout, stderr) = run_clawhub_cmd_clean(&openclaw_dir, &args)?;
+            if ok {
+                return Ok(format!("已安装到共享 Skills 层\n{}", stdout));
+            }
+            let combined = format!("{}\n{}", stdout, stderr).to_lowercase();
+            if combined.contains("rate limit exceeded") {
+                return Err("ClawHub 当前限流，建议到网站下载 ZIP 后使用“本地 Skills 安装”导入。".to_string());
+            }
+            return Err(format!("ClawHub 安装失败:\n{}\n{}", stdout, stderr));
+        }
+
+        if source == "github" {
+            let repo = repo_url
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "缺少 GitHub 仓库地址".to_string())?;
+            let folder_name = package_name
+                .as_deref()
+                .and_then(|s| s.split('/').last())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "github-skill".to_string());
+            let target_dir = skills_dir.join(folder_name);
+            if target_dir.exists() {
+                return Ok(format!("共享 Skills 层已存在该仓库：{}", target_dir.to_string_lossy()));
+            }
+            let mut cmd = Command::new("git");
+            hide_console_window(&mut cmd);
+            cmd.args([
+                "clone",
+                "--depth",
+                "1",
+                repo.as_str(),
+                target_dir.to_string_lossy().as_ref(),
+            ]);
+            let (ok, stdout, stderr) = run_command_clean(&mut cmd)?;
+            if ok {
+                return Ok(format!("已克隆到共享 Skills 层\n{}\n{}", target_dir.to_string_lossy(), stdout));
+            }
+            return Err(format!("GitHub 仓库安装失败:\n{}\n{}", stdout, stderr));
+        }
+
+        Err(format!("暂不支持的来源类型: {}", source_type))
+    })
+    .await
+    .map_err(|e| format!("安装任务执行失败: {}", e))?
+}
+
+#[tauri::command]
+async fn install_local_skill(
+    local_path: String,
+    custom_path: Option<String>,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let src = local_path.trim();
+        if src.is_empty() {
+            return Err("请先提供本地 Skill 目录或 ZIP 路径".to_string());
+        }
+        let source_path = PathBuf::from(src);
+        if !source_path.exists() {
+            return Err(format!("本地路径不存在: {}", src));
+        }
+
+        let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+        let skills_dir = Path::new(&openclaw_dir).join("skills");
+        std::fs::create_dir_all(&skills_dir).map_err(|e| format!("创建共享 Skills 目录失败: {}", e))?;
+
+        let mut extracted_temp_dir: Option<PathBuf> = None;
+        let skill_root = if source_path.is_dir() {
+            find_skill_root(&source_path)
+                .ok_or_else(|| "所选目录中未找到 SKILL.md，请确认它是一个完整 Skill 目录".to_string())?
+        } else {
+            let ext = source_path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if ext != "zip" {
+                return Err("当前只支持本地 Skill 目录或 .zip 压缩包".to_string());
+            }
+            let temp_dir = env::temp_dir().join(format!("openclaw-skill-import-{}", now_stamp().replace(':', "-")));
+            std::fs::create_dir_all(&temp_dir).map_err(|e| format!("创建临时目录失败: {}", e))?;
+            extract_zip_to_dir(&source_path, &temp_dir)?;
+            let root = find_skill_root(&temp_dir)
+                .ok_or_else(|| "ZIP 中未找到 SKILL.md，请确认压缩包内容完整".to_string())?;
+            extracted_temp_dir = Some(temp_dir);
+            root
+        };
+
+        let result = install_skill_dir_into_shared_layer(&skill_root, &skills_dir)?;
+        if let Some(temp_dir) = extracted_temp_dir {
+            let _ = std::fs::remove_dir_all(temp_dir);
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|e| format!("本地安装任务执行失败: {}", e))?
 }
 
 fn summarize_skill_missing(m: &SkillMissing) -> String {
@@ -5299,6 +6141,3386 @@ fn fix_self_check_item(
     }
 }
 
+// ========== Agents (多 Agent 管理) ==========
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub id: String,
+    pub name: Option<String>,
+    pub default: bool,
+    pub workspace: Option<String>,
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BindingRule {
+    pub channel: String,
+    pub agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentsListResponse {
+    pub agents: Vec<AgentInfo>,
+    pub bindings: Vec<BindingRule>,
+    pub config_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRuntimeProfile {
+    pub agent_id: String,
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentSkillBinding {
+    pub agent_id: String,
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub enabled_skills: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolated_state_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentChannelRoute {
+    pub id: String,
+    pub channel: String,
+    pub agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_instance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GatewayRuntimeHealth {
+    pub status: String,
+    pub detail: String,
+    pub checked_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GatewayBinding {
+    pub gateway_id: String,
+    pub agent_id: String,
+    pub channel: String,
+    pub instance_id: String,
+    #[serde(default)]
+    pub channel_instances: BTreeMap<String, String>,
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub auto_restart: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub health: Option<GatewayRuntimeHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramBotInstance {
+    pub id: String,
+    pub name: String,
+    pub bot_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelBotInstance {
+    pub id: String,
+    pub name: String,
+    pub channel: String,
+    pub credential1: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential2: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AgentRuntimeSettings {
+    #[serde(default)]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub profiles: Vec<AgentRuntimeProfile>,
+    #[serde(default)]
+    pub channel_routes: Vec<AgentChannelRoute>,
+    #[serde(default)]
+    pub telegram_instances: Vec<TelegramBotInstance>,
+    #[serde(default)]
+    pub active_telegram_instance: Option<String>,
+    #[serde(default)]
+    pub channel_instances: Vec<ChannelBotInstance>,
+    #[serde(default)]
+    pub active_channel_instances: BTreeMap<String, String>,
+    #[serde(default)]
+    pub gateways: Vec<GatewayBinding>,
+    #[serde(default)]
+    pub skills_scope: String,
+    #[serde(default)]
+    pub agent_skill_bindings: Vec<AgentSkillBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRuntimeSettingsResponse {
+    pub schema_version: u32,
+    pub profiles: Vec<AgentRuntimeProfile>,
+    pub channel_routes: Vec<AgentChannelRoute>,
+    pub telegram_instances: Vec<TelegramBotInstance>,
+    pub active_telegram_instance: Option<String>,
+    pub channel_instances: Vec<ChannelBotInstance>,
+    pub active_channel_instances: BTreeMap<String, String>,
+    pub gateways: Vec<GatewayBinding>,
+    pub skills_scope: String,
+    pub agent_skill_bindings: Vec<AgentSkillBinding>,
+    pub settings_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRouteResolveResult {
+    pub agent_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_id: Option<String>,
+    pub matched_route_id: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramInstanceHealth {
+    pub id: String,
+    pub ok: bool,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelInstanceHealth {
+    pub channel: String,
+    pub id: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+fn agent_runtime_settings_path(openclaw_dir: &str) -> String {
+    format!(
+        "{}/control_plane/agent_runtime_settings.json",
+        openclaw_dir.replace('\\', "/")
+    )
+}
+
+fn runtime_now_ts() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(v) => v.as_secs() as i64,
+        Err(_) => 0,
+    }
+}
+
+fn sanitize_gateway_key(s: &str) -> String {
+    s.trim()
+        .to_ascii_lowercase()
+        .replace([' ', '/', '\\', ':'], "-")
+}
+
+fn gateway_default_id(channel: &str, instance_id: &str) -> String {
+    format!(
+        "gw-{}-{}",
+        sanitize_gateway_key(channel),
+        sanitize_gateway_key(instance_id)
+    )
+}
+
+fn gateway_default_id_for_agent(agent_id: &str) -> String {
+    format!("gw-agent-{}", sanitize_gateway_key(agent_id))
+}
+
+fn gateway_default_state_dir(openclaw_dir: &str, gateway_id: &str) -> String {
+    format!(
+        "{}/multi_gateways/{}",
+        openclaw_dir.replace('\\', "/"),
+        sanitize_gateway_key(gateway_id)
+    )
+}
+
+fn normalize_gateway_binding(openclaw_dir: &str, g: &mut GatewayBinding) {
+    g.gateway_id = if g.gateway_id.trim().is_empty() {
+        gateway_default_id(&g.channel, &g.instance_id)
+    } else {
+        sanitize_gateway_key(&g.gateway_id)
+    };
+    g.channel = normalize_channel_id(&g.channel);
+    g.agent_id = g.agent_id.trim().to_string();
+    g.instance_id = g.instance_id.trim().to_string();
+    let mut normalized_map = BTreeMap::new();
+    for (ch, iid) in g.channel_instances.clone() {
+        let ch_norm = normalize_channel_id(&ch);
+        let iid_norm = iid.trim().to_string();
+        if ch_norm.is_empty() || iid_norm.is_empty() {
+            continue;
+        }
+        normalized_map.insert(ch_norm, iid_norm);
+    }
+    if normalized_map.is_empty() && !g.channel.is_empty() && !g.instance_id.is_empty() {
+        normalized_map.insert(g.channel.clone(), g.instance_id.clone());
+    }
+    g.channel_instances = normalized_map;
+    if (g.channel.is_empty() || g.instance_id.is_empty()) && !g.channel_instances.is_empty() {
+        if let Some((ch, iid)) = g.channel_instances.iter().next() {
+            g.channel = ch.clone();
+            g.instance_id = iid.clone();
+        }
+    }
+    if g.state_dir.as_deref().map(|v| v.trim().is_empty()).unwrap_or(true) {
+        g.state_dir = Some(gateway_default_state_dir(openclaw_dir, &g.gateway_id));
+    } else {
+        g.state_dir = g
+            .state_dir
+            .as_deref()
+            .map(|v| v.trim().replace('\\', "/"))
+            .filter(|v| !v.is_empty());
+    }
+    if g.listen_port.is_none() {
+        let seed = g
+            .gateway_id
+            .as_bytes()
+            .iter()
+            .fold(0usize, |acc, b| acc.wrapping_add(*b as usize));
+        g.listen_port = Some((42000 + (seed % 3000)) as u16);
+    }
+    if g.health.is_none() {
+        g.health = Some(GatewayRuntimeHealth {
+            status: "unknown".to_string(),
+            detail: "未探活".to_string(),
+            checked_at: runtime_now_ts(),
+        });
+    }
+}
+
+fn gateway_channel_pairs(binding: &GatewayBinding) -> Vec<(String, String)> {
+    if !binding.channel_instances.is_empty() {
+        return binding
+            .channel_instances
+            .iter()
+            .map(|(ch, iid)| (normalize_channel_id(ch), iid.trim().to_string()))
+            .filter(|(ch, iid)| !ch.is_empty() && !iid.is_empty())
+            .collect();
+    }
+    let ch = normalize_channel_id(&binding.channel);
+    let iid = binding.instance_id.trim().to_string();
+    if ch.is_empty() || iid.is_empty() {
+        Vec::new()
+    } else {
+        vec![(ch, iid)]
+    }
+}
+
+fn infer_agent_id_from_instance_id(channel: &str, instance_id: &str) -> Option<String> {
+    let ch = normalize_channel_id(channel);
+    let iid = instance_id.trim();
+    if ch.is_empty() || iid.is_empty() {
+        return None;
+    }
+    let prefix = if ch == "telegram" {
+        "tg-".to_string()
+    } else {
+        format!("{}-", ch)
+    };
+    iid.strip_prefix(prefix.as_str())
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn derive_agent_gateway_channel_map(settings: &AgentRuntimeSettings, agent_id: &str) -> BTreeMap<String, String> {
+    let aid = agent_id.trim();
+    if aid.is_empty() {
+        return BTreeMap::new();
+    }
+
+    let mut out = BTreeMap::new();
+
+    for r in settings.channel_routes.iter().filter(|r| r.enabled && r.agent_id.trim() == aid) {
+        let ch = normalize_channel_id(&r.channel);
+        let iid = r
+            .bot_instance
+            .as_deref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        if let Some(iid) = iid {
+            if !ch.is_empty() {
+                out.entry(ch).or_insert(iid);
+            }
+        }
+    }
+
+    for g in settings.gateways.iter().filter(|g| g.agent_id.trim() == aid) {
+        for (ch, iid) in gateway_channel_pairs(g) {
+            let inferred = infer_agent_id_from_instance_id(&ch, &iid);
+            let derived = derive_gateway_agent_id(settings, &ch, &iid);
+            let belongs_to_agent = inferred
+                .as_deref()
+                .map(|v| v == aid)
+                .unwrap_or(false)
+                || derived == aid;
+            if belongs_to_agent {
+                out.entry(ch).or_insert(iid);
+            }
+        }
+    }
+
+    let tg_fallback = format!("tg-{}", aid);
+    if !out.contains_key("telegram")
+        && settings
+            .telegram_instances
+            .iter()
+            .any(|x| x.enabled && x.id.trim().eq_ignore_ascii_case(tg_fallback.as_str()))
+    {
+        out.insert("telegram".to_string(), tg_fallback);
+    }
+
+    for ch in ["feishu", "dingtalk", "discord", "qq"] {
+        let iid = format!("{}-{}", ch, aid);
+        if out.contains_key(ch) {
+            continue;
+        }
+        if settings.channel_instances.iter().any(|x| {
+            x.enabled
+                && normalize_channel_id(&x.channel) == ch
+                && x.id.trim().eq_ignore_ascii_case(iid.as_str())
+        }) {
+            out.insert(ch.to_string(), iid);
+        }
+    }
+
+    if !out.contains_key("telegram") {
+        if let Some(iid) = settings
+            .active_telegram_instance
+            .as_deref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            if derive_gateway_agent_id(settings, "telegram", &iid) == aid {
+                out.insert("telegram".to_string(), iid);
+            }
+        }
+    }
+
+    for (channel, iid_raw) in settings.active_channel_instances.iter() {
+        let ch = normalize_channel_id(channel);
+        let iid = iid_raw.trim().to_string();
+        if ch.is_empty() || iid.is_empty() || out.contains_key(&ch) {
+            continue;
+        }
+        if derive_gateway_agent_id(settings, &ch, &iid) == aid {
+            out.insert(ch, iid);
+        }
+    }
+
+    out
+}
+
+fn reconcile_gateways_per_agent(openclaw_dir: &str, settings: &mut AgentRuntimeSettings) {
+    let mut ordered_agent_ids = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    let mut push_agent = |aid_raw: &str| {
+        let aid = aid_raw.trim().to_string();
+        if aid.is_empty() || seen.contains(&aid) {
+            return;
+        }
+        seen.insert(aid.clone());
+        ordered_agent_ids.push(aid);
+    };
+
+    for g in settings.gateways.iter() {
+        push_agent(&g.agent_id);
+    }
+    for r in settings.channel_routes.iter() {
+        push_agent(&r.agent_id);
+    }
+    for p in settings.profiles.iter() {
+        push_agent(&p.agent_id);
+    }
+
+    let old_gateways = settings.gateways.clone();
+    let mut merged = Vec::new();
+
+    for aid in ordered_agent_ids {
+        let related: Vec<GatewayBinding> = old_gateways
+            .iter()
+            .filter(|g| g.agent_id.trim() == aid)
+            .cloned()
+            .collect();
+        let channel_map = derive_agent_gateway_channel_map(settings, &aid);
+        if channel_map.is_empty() && related.is_empty() {
+            continue;
+        }
+
+        let gateway_id = related
+            .iter()
+            .find_map(|g| {
+                let gid = sanitize_gateway_key(&g.gateway_id);
+                if gid.starts_with("gw-agent-") {
+                    Some(gid)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                related.iter().find_map(|g| {
+                    let gid = sanitize_gateway_key(&g.gateway_id);
+                    if gid.is_empty() {
+                        None
+                    } else {
+                        Some(gid)
+                    }
+                })
+            })
+            .unwrap_or_else(|| gateway_default_id_for_agent(&aid));
+
+        let primary_pair = channel_map
+            .iter()
+            .next()
+            .map(|(ch, iid)| (ch.clone(), iid.clone()))
+            .or_else(|| {
+                related
+                    .iter()
+                    .flat_map(gateway_channel_pairs)
+                    .next()
+            });
+        let (channel, instance_id) = primary_pair.unwrap_or_else(|| ("telegram".to_string(), "".to_string()));
+
+        let mut next = GatewayBinding {
+            gateway_id,
+            agent_id: aid.clone(),
+            channel,
+            instance_id,
+            channel_instances: channel_map,
+            enabled: if related.is_empty() {
+                true
+            } else {
+                related.iter().any(|g| g.enabled)
+            },
+            state_dir: related.iter().find_map(|g| g.state_dir.clone()),
+            listen_port: related.iter().find_map(|g| g.listen_port),
+            pid: related.iter().find_map(|g| g.pid),
+            auto_restart: if related.is_empty() {
+                true
+            } else {
+                related.iter().any(|g| g.auto_restart)
+            },
+            last_error: related.iter().find_map(|g| g.last_error.clone()),
+            health: related.iter().find_map(|g| g.health.clone()),
+        };
+        normalize_gateway_binding(openclaw_dir, &mut next);
+        merged.push(next);
+    }
+
+    settings.gateways = merged;
+}
+
+fn derive_gateway_agent_id(settings: &AgentRuntimeSettings, channel: &str, instance_id: &str) -> String {
+    settings
+        .channel_routes
+        .iter()
+        .find(|r| {
+            r.enabled
+                && normalize_channel_id(&r.channel) == channel
+                && r
+                    .bot_instance
+                    .as_deref()
+                    .map(|s| s.trim().eq_ignore_ascii_case(instance_id))
+                    .unwrap_or(false)
+        })
+        .map(|r| r.agent_id.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| infer_agent_id_from_instance_id(channel, instance_id))
+        .unwrap_or_else(|| "main".to_string())
+}
+
+fn normalize_runtime_settings_v2(openclaw_dir: &str, settings: &mut AgentRuntimeSettings) {
+    if settings.schema_version < 3 {
+        settings.schema_version = 3;
+    }
+
+    let scope = settings.skills_scope.trim().to_lowercase();
+    settings.skills_scope = if scope == "agent_override" {
+        "agent_override".to_string()
+    } else {
+        "shared".to_string()
+    };
+
+    let mut skill_binding_seen = BTreeSet::new();
+    settings.agent_skill_bindings.retain_mut(|binding| {
+        binding.agent_id = binding.agent_id.trim().to_string();
+        if binding.agent_id.is_empty() {
+            return false;
+        }
+        let key = binding.agent_id.to_lowercase();
+        if skill_binding_seen.contains(&key) {
+            return false;
+        }
+        skill_binding_seen.insert(key);
+        let mode = binding.mode.trim().to_lowercase();
+        binding.mode = if mode == "custom" { "custom".to_string() } else { "inherit".to_string() };
+        let mut dedup = BTreeSet::new();
+        binding.enabled_skills = binding
+            .enabled_skills
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .filter(|s| dedup.insert(s.to_lowercase()))
+            .collect();
+        binding.enabled_skills.sort();
+        binding.isolated_state_dir = binding
+            .isolated_state_dir
+            .as_deref()
+            .map(|s| s.trim().replace('\\', "/"))
+            .filter(|s| !s.is_empty());
+        true
+    });
+
+    for it in settings.channel_instances.iter_mut() {
+        let ch = normalize_channel_id(&it.channel);
+        if ch == "qq" {
+            it.credential1 = it.credential1.trim().to_string();
+            it.credential2 = it
+                .credential2
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(c2) = it.credential2.clone() {
+                let prefix = format!("{}:", it.credential1);
+                if !it.credential1.is_empty() && c2.starts_with(&prefix) {
+                    it.credential2 = Some(c2[prefix.len()..].to_string());
+                }
+            }
+        }
+    }
+
+    if settings.gateways.is_empty() {
+        if let Some(tg) = settings
+            .active_telegram_instance
+            .as_deref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            settings.gateways.push(GatewayBinding {
+                gateway_id: gateway_default_id("telegram", &tg),
+                agent_id: derive_gateway_agent_id(settings, "telegram", &tg),
+                channel: "telegram".to_string(),
+                instance_id: tg,
+                channel_instances: BTreeMap::new(),
+                enabled: true,
+                state_dir: None,
+                listen_port: None,
+                pid: None,
+                auto_restart: true,
+                last_error: None,
+                health: None,
+            });
+        }
+        for (channel, instance_id) in settings.active_channel_instances.clone() {
+            let ch = normalize_channel_id(&channel);
+            let iid = instance_id.trim().to_string();
+            if ch.is_empty() || iid.is_empty() {
+                continue;
+            }
+            settings.gateways.push(GatewayBinding {
+                gateway_id: gateway_default_id(&ch, &iid),
+                agent_id: derive_gateway_agent_id(settings, &ch, &iid),
+                channel: ch,
+                instance_id: iid,
+                channel_instances: BTreeMap::new(),
+                enabled: true,
+                state_dir: None,
+                listen_port: None,
+                pid: None,
+                auto_restart: true,
+                last_error: None,
+                health: None,
+            });
+        }
+    }
+
+    // v2 增强：即使已有 gateways，也要从已启用路由里补齐缺失的 bot_instance 绑定，
+    // 避免“只存在 active_telegram_instance 导致其它实例无网关”的情况。
+    let route_snapshots: Vec<(String, String, String)> = settings
+        .channel_routes
+        .iter()
+        .filter(|r| r.enabled)
+        .filter_map(|r| {
+            let ch = normalize_channel_id(&r.channel);
+            let aid = r.agent_id.trim().to_string();
+            let iid = r
+                .bot_instance
+                .as_deref()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())?;
+            if ch.is_empty() {
+                return None;
+            }
+            Some((ch, aid, iid))
+        })
+        .collect();
+    for (ch, fallback_agent, instance_id) in route_snapshots {
+        let _ = upsert_gateway_binding(
+            settings,
+            openclaw_dir,
+            &ch,
+            &instance_id,
+            if fallback_agent.is_empty() { None } else { Some(fallback_agent.as_str()) },
+        );
+    }
+
+    let mut dedup = BTreeSet::new();
+    settings.gateways.retain(|g| {
+        let key = sanitize_gateway_key(&g.gateway_id);
+        if key.is_empty() || dedup.contains(&key) {
+            return false;
+        }
+        dedup.insert(key);
+        true
+    });
+    for g in settings.gateways.iter_mut() {
+        normalize_gateway_binding(openclaw_dir, g);
+    }
+    reconcile_gateways_per_agent(openclaw_dir, settings);
+}
+
+fn build_agent_runtime_settings_response(
+    openclaw_dir: &str,
+    settings: AgentRuntimeSettings,
+) -> AgentRuntimeSettingsResponse {
+    AgentRuntimeSettingsResponse {
+        schema_version: settings.schema_version,
+        profiles: settings.profiles,
+        channel_routes: settings.channel_routes,
+        telegram_instances: settings.telegram_instances,
+        active_telegram_instance: settings.active_telegram_instance,
+        channel_instances: settings.channel_instances,
+        active_channel_instances: settings.active_channel_instances,
+        gateways: settings.gateways,
+        skills_scope: settings.skills_scope,
+        agent_skill_bindings: settings.agent_skill_bindings,
+        settings_path: agent_runtime_settings_path(openclaw_dir),
+    }
+}
+
+fn sync_legacy_fields_from_gateways(settings: &mut AgentRuntimeSettings) {
+    let mut active_by_channel = BTreeMap::new();
+    for g in settings.gateways.iter().filter(|g| g.enabled) {
+        for (ch, iid) in gateway_channel_pairs(g) {
+            if ch.is_empty() || iid.trim().is_empty() {
+                continue;
+            }
+            active_by_channel.entry(ch).or_insert(iid);
+        }
+    }
+    settings.active_telegram_instance = active_by_channel.get("telegram").cloned();
+    settings.active_channel_instances = active_by_channel
+        .into_iter()
+        .filter(|(ch, _)| ch != "telegram")
+        .collect();
+}
+
+fn upsert_gateway_binding(
+    settings: &mut AgentRuntimeSettings,
+    openclaw_dir: &str,
+    channel: &str,
+    instance_id: &str,
+    fallback_agent: Option<&str>,
+) -> String {
+    let ch = normalize_channel_id(channel);
+    let iid = instance_id.trim().to_string();
+    let gid = gateway_default_id(&ch, &iid);
+    let aid = fallback_agent
+        .map(|s| s.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .or_else(|| infer_agent_id_from_instance_id(&ch, &iid))
+        .unwrap_or_else(|| derive_gateway_agent_id(settings, &ch, &iid));
+    if let Some(existing) = settings.gateways.iter_mut().find(|g| g.gateway_id == gid) {
+        existing.agent_id = aid.clone();
+        existing.channel = ch.clone();
+        existing.instance_id = iid.clone();
+        existing.enabled = true;
+        normalize_gateway_binding(openclaw_dir, existing);
+        return gid;
+    }
+    let mut next = GatewayBinding {
+        gateway_id: gid.clone(),
+        agent_id: aid,
+        channel: ch,
+        instance_id: iid,
+        channel_instances: BTreeMap::new(),
+        enabled: true,
+        state_dir: None,
+        listen_port: None,
+        pid: None,
+        auto_restart: true,
+        last_error: None,
+        health: None,
+    };
+    normalize_gateway_binding(openclaw_dir, &mut next);
+    settings.gateways.push(next);
+    gid
+}
+
+fn find_gateway_binding_mut<'a>(settings: &'a mut AgentRuntimeSettings, gateway_id: &str) -> Option<&'a mut GatewayBinding> {
+    let gid = sanitize_gateway_key(gateway_id);
+    settings
+        .gateways
+        .iter_mut()
+        .find(|g| sanitize_gateway_key(&g.gateway_id) == gid)
+}
+
+fn find_gateway_binding<'a>(settings: &'a AgentRuntimeSettings, gateway_id: &str) -> Option<&'a GatewayBinding> {
+    let gid = sanitize_gateway_key(gateway_id);
+    settings
+        .gateways
+        .iter()
+        .find(|g| sanitize_gateway_key(&g.gateway_id) == gid)
+}
+
+fn run_openclaw_gateway_cmd_clean(
+    exe: &str,
+    args: &[&str],
+    state_dir: &str,
+    gateway_id: &str,
+    listen_port: Option<u16>,
+) -> Result<(bool, String, String), String> {
+    let mut cmd = Command::new(exe);
+    #[cfg(target_os = "windows")]
+    hide_console_window(&mut cmd);
+    cmd.args(args);
+    cmd.env("OPENCLAW_STATE_DIR", state_dir);
+    cmd.env("OPENCLAW_PROFILE", sanitize_gateway_key(gateway_id));
+    if let Some(port) = listen_port {
+        cmd.env("OPENCLAW_GATEWAY_PORT", port.to_string());
+    }
+    let output = cmd.output().map_err(|e| format!("执行失败: {}", e))?;
+    let stdout = strip_ansi_text(&decode_console_output(&output.stdout));
+    let stderr = strip_ansi_text(&decode_console_output(&output.stderr));
+    Ok((output.status.success(), stdout, stderr))
+}
+
+fn read_gateway_health_with_state_dir(exe: &str, state_dir: &str, gateway_id: &str) -> GatewayRuntimeHealth {
+    match run_openclaw_gateway_cmd_clean(exe, &["gateway", "status"], state_dir, gateway_id, None) {
+        Ok((ok, out, err)) => {
+            let text = format!("{}\n{}", out, err).trim().to_string();
+            let lower = text.to_ascii_lowercase();
+            let healthy = ok
+                && (lower.contains("rpc probe: ok")
+                    || lower.contains("service: scheduled task")
+                    || lower.contains("running"));
+            GatewayRuntimeHealth {
+                status: if healthy { "ok" } else { "warn" }.to_string(),
+                detail: if text.is_empty() {
+                    if healthy {
+                        "gateway 正常".to_string()
+                    } else {
+                        "gateway 状态未知".to_string()
+                    }
+                } else {
+                    text
+                },
+                checked_at: runtime_now_ts(),
+            }
+        }
+        Err(e) => GatewayRuntimeHealth {
+            status: "error".to_string(),
+            detail: e,
+            checked_at: runtime_now_ts(),
+        },
+    }
+}
+
+fn update_gateway_runtime_snapshot(
+    settings: &mut AgentRuntimeSettings,
+    gateway_id: &str,
+    health: GatewayRuntimeHealth,
+    last_error: Option<String>,
+) {
+    if let Some(g) = find_gateway_binding_mut(settings, gateway_id) {
+        g.health = Some(health);
+        g.last_error = last_error;
+        if g.health.as_ref().map(|h| h.status.as_str() == "error").unwrap_or(false) {
+            g.pid = None;
+        }
+    }
+}
+
+fn load_agent_runtime_settings(openclaw_dir: &str) -> Result<AgentRuntimeSettings, String> {
+    let path = agent_runtime_settings_path(openclaw_dir);
+    if !Path::new(&path).exists() {
+        return Ok(AgentRuntimeSettings::default());
+    }
+    let txt = std::fs::read_to_string(&path).map_err(|e| format!("读取 Agent 运行时配置失败: {}", e))?;
+    let mut parsed = serde_json::from_str::<AgentRuntimeSettings>(&txt)
+        .map_err(|e| format!("解析 Agent 运行时配置失败: {}", e))?;
+    normalize_runtime_settings_v2(openclaw_dir, &mut parsed);
+    Ok(parsed)
+}
+
+fn save_agent_runtime_settings(openclaw_dir: &str, settings: &AgentRuntimeSettings) -> Result<(), String> {
+    let path = agent_runtime_settings_path(openclaw_dir);
+    if let Some(parent) = Path::new(&path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 Agent 运行时配置目录失败: {}", e))?;
+    }
+    let mut normalized = settings.clone();
+    normalize_runtime_settings_v2(openclaw_dir, &mut normalized);
+    sync_legacy_fields_from_gateways(&mut normalized);
+    let txt = serde_json::to_string_pretty(&normalized).map_err(|e| format!("序列化 Agent 运行时配置失败: {}", e))?;
+    std::fs::write(&path, txt).map_err(|e| format!("写入 Agent 运行时配置失败: {}", e))
+}
+
+fn parse_agents_list_cli(stdout: &str) -> Vec<AgentInfo> {
+    let mut agents = Vec::new();
+    let mut current: Option<AgentInfo> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            if let Some(a) = current.take() {
+                agents.push(a);
+            }
+            continue;
+        }
+        if line.starts_with("- ") {
+            if let Some(a) = current.take() {
+                agents.push(a);
+            }
+            let id_part = line.trim_start_matches("- ").trim();
+            let (id, default) = if id_part.contains("(default)") {
+                (id_part.replace("(default)", "").trim().to_string(), true)
+            } else {
+                (id_part.to_string(), false)
+            };
+            current = Some(AgentInfo {
+                id: id.clone(),
+                name: Some(id.clone()),
+                default,
+                workspace: None,
+                model: None,
+            });
+        } else if let Some(ref mut a) = current {
+            if line.starts_with("Workspace:") {
+                a.workspace = Some(line.replace("Workspace:", "").trim().to_string());
+            } else if line.starts_with("Model:") {
+                a.model = Some(line.replace("Model:", "").trim().to_string());
+            } else if line.starts_with("Identity:") {
+                let identity = line.replace("Identity:", "").trim().to_string();
+                if !identity.is_empty() && identity != "-" {
+                    a.name = Some(identity);
+                }
+            }
+        }
+    }
+    if let Some(a) = current {
+        agents.push(a);
+    }
+    if agents.is_empty() {
+        agents.push(AgentInfo {
+            id: "main".to_string(),
+            name: Some("main".to_string()),
+            default: true,
+            workspace: Some("~/.openclaw/workspace".to_string()),
+            model: None,
+        });
+    }
+    agents
+}
+
+#[tauri::command]
+fn read_agents_list(custom_path: Option<String>) -> Result<AgentsListResponse, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let config_path = format!("{}/openclaw.json", openclaw_dir.replace('\\', "/"));
+    if !Path::new(&config_path).exists() {
+        return Err(format!("配置文件不存在: {}", config_path));
+    }
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("读取配置失败: {}", e))?;
+    let config: Value =
+        serde_json::from_str(&content).map_err(|e| format!("解析 JSON 失败: {}", e))?;
+
+    let mut agents: Vec<AgentInfo> = Vec::new();
+    let mut bindings: Vec<BindingRule> = Vec::new();
+
+    if let Some(list) = config
+        .get("agents")
+        .and_then(|a| a.get("list"))
+        .and_then(|l| l.as_array())
+    {
+        for item in list {
+            if let Some(obj) = item.as_object() {
+                let id = obj
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("main")
+                    .to_string();
+                let default = obj.get("default").and_then(|v| v.as_bool()).unwrap_or(false);
+                let workspace = obj
+                    .get("workspace")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let name = obj
+                    .get("identity")
+                    .and_then(|i| i.get("name"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let model = obj
+                    .get("model")
+                    .and_then(|m| m.get("primary"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                agents.push(AgentInfo {
+                    id,
+                    name,
+                    default,
+                    workspace,
+                    model,
+                });
+            }
+        }
+    }
+
+    if let Some(bind_list) = config
+        .get("agents")
+        .and_then(|a| a.get("bindings"))
+        .and_then(|b| b.as_array())
+    {
+        for item in bind_list {
+            if let Some(obj) = item.as_object() {
+                let channel = obj
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let agent_id = obj
+                    .get("agent")
+                    .or_else(|| obj.get("agentId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !channel.is_empty() && !agent_id.is_empty() {
+                    bindings.push(BindingRule {
+                        channel,
+                        agent_id,
+                        account: obj.get("account").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        peer: obj.get("peer").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    if agents.is_empty() {
+        let exe = find_openclaw_executable(Some(openclaw_dir.as_str()))
+            .unwrap_or_else(|| "openclaw".to_string());
+        let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+        let (ok, stdout, _) =
+            run_openclaw_cmd_clean(&exe, &["agents", "list", "--bindings"], env_extra)?;
+        if ok {
+            agents = parse_agents_list_cli(&stdout);
+        } else {
+            agents = vec![AgentInfo {
+                id: "main".to_string(),
+                name: Some("main".to_string()),
+                default: true,
+                workspace: Some("~/.openclaw/workspace".to_string()),
+                model: None,
+            }];
+        }
+    }
+
+    Ok(AgentsListResponse {
+        agents,
+        bindings,
+        config_path: config_path.clone(),
+    })
+}
+
+#[tauri::command]
+fn create_agent(
+    id: String,
+    name: Option<String>,
+    workspace: Option<String>,
+    custom_path: Option<String>,
+) -> Result<(), String> {
+    let re = Regex::new(r"^[a-z0-9_-]+$").unwrap();
+    if !re.is_match(&id) {
+        return Err("Agent id 必须为小写字母、数字、下划线或连字符".to_string());
+    }
+    if id == "main" {
+        return Err("不能创建名为 main 的 agent（main 已存在）".to_string());
+    }
+
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let workspace_path = workspace.unwrap_or_else(|| {
+        format!("{}/workspace-{}", openclaw_dir.replace('\\', "/"), id)
+    });
+
+    let exe = find_openclaw_executable(Some(openclaw_dir.as_str()))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+
+    let (ok, _stdout, stderr) =
+        run_openclaw_cmd_clean(&exe, &["agents", "add", &id, "--workspace", &workspace_path], env_extra)?;
+    if !ok {
+        return Err(format!("openclaw agents add 失败:\n{}", stderr));
+    }
+
+    if name.is_some() {
+        let _ = run_openclaw_cmd_clean(
+            &exe,
+            &["agents", "set-identity", "--agent", &id, "--name", &name.as_ref().unwrap()],
+            env_extra,
+        );
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_agent(id: String, force: bool, custom_path: Option<String>) -> Result<(), String> {
+    if id == "main" {
+        return Err("不能删除 main agent".to_string());
+    }
+
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let exe = find_openclaw_executable(Some(openclaw_dir.as_str()))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+
+    let mut args = vec!["agents", "delete", &id];
+    if force {
+        args.push("--force");
+    }
+
+    let (ok, _stdout, stderr) = run_openclaw_cmd_clean(&exe, &args, env_extra)?;
+    if !ok {
+        return Err(format!("openclaw agents delete 失败:\n{}", stderr));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_default_agent(id: String, custom_path: Option<String>) -> Result<(), String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut root = load_openclaw_config(&openclaw_dir).map_err(|e| e.to_string())?;
+
+    let exe = find_openclaw_executable(Some(openclaw_dir.as_str()))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir.as_str()));
+    let (ok, stdout, _) = run_openclaw_cmd_clean(&exe, &["agents", "list"], env_extra)?;
+    let cli_agents = if ok {
+        parse_agents_list_cli(&stdout)
+    } else {
+        vec![]
+    };
+
+    let defaults_workspace = root
+        .get("agents")
+        .and_then(|a| a.get("defaults"))
+        .and_then(|d| d.get("workspace"))
+        .and_then(|w| w.as_str())
+        .unwrap_or("~/.openclaw/workspace");
+
+    let mut list: Vec<Value> = if let Some(arr) = root
+        .get("agents")
+        .and_then(|a| a.get("list"))
+        .and_then(|l| l.as_array())
+    {
+        arr.clone()
+    } else if cli_agents.is_empty() {
+        vec![json!({
+            "id": "main",
+            "default": id == "main",
+            "workspace": defaults_workspace
+        })]
+    } else {
+        cli_agents
+            .iter()
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "default": a.id == id,
+                    "workspace": a.workspace.as_deref().unwrap_or(defaults_workspace)
+                })
+            })
+            .collect()
+    };
+
+    for item in list.iter_mut() {
+        if let Some(obj) = item.as_object_mut() {
+            let item_id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            obj.insert(
+                "default".to_string(),
+                Value::Bool(item_id == id),
+            );
+        }
+    }
+
+    let mut agents_obj = root
+        .get("agents")
+        .and_then(|a| a.as_object())
+        .cloned()
+        .unwrap_or_default();
+    agents_obj.insert("list".to_string(), Value::Array(list));
+    root.as_object_mut()
+        .unwrap()
+        .insert("agents".to_string(), Value::Object(agents_obj));
+
+    save_openclaw_config(&openclaw_dir, &root)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn update_bindings(bindings: Vec<BindingRule>, custom_path: Option<String>) -> Result<(), String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut root = load_openclaw_config(&openclaw_dir).map_err(|e| e.to_string())?;
+
+    let bindings_value: Vec<Value> = bindings
+        .into_iter()
+        .map(|b| {
+            let mut m = Map::new();
+            m.insert("channel".to_string(), Value::String(b.channel));
+            m.insert("agent".to_string(), Value::String(b.agent_id));
+            if let Some(a) = b.account {
+                m.insert("account".to_string(), Value::String(a));
+            }
+            if let Some(p) = b.peer {
+                m.insert("peer".to_string(), Value::String(p));
+            }
+            Value::Object(m)
+        })
+        .collect();
+
+    let agents = root.get_mut("agents").and_then(|a| a.as_object_mut());
+    if let Some(agents_obj) = agents {
+        agents_obj.insert(
+            "bindings".to_string(),
+            Value::Array(bindings_value),
+        );
+    } else {
+        let mut agents_obj = Map::new();
+        agents_obj.insert(
+            "bindings".to_string(),
+            Value::Array(bindings_value),
+        );
+        root.as_object_mut()
+            .unwrap()
+            .insert("agents".to_string(), Value::Object(agents_obj));
+    }
+
+    save_openclaw_config(&openclaw_dir, &root)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn read_agent_runtime_settings(custom_path: Option<String>) -> Result<AgentRuntimeSettingsResponse, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    // 以当前生效 token 反推 active_telegram_instance，避免 UI 与网关实际状态不一致。
+    if let Ok(root) = load_openclaw_config(&openclaw_dir) {
+        let active_token = root
+            .get("channels")
+            .and_then(|v| v.get("telegram"))
+            .and_then(|v| v.get("botToken"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(token) = active_token {
+            if let Some(hit) = settings
+                .telegram_instances
+                .iter()
+                .find(|x| x.bot_token.trim() == token)
+                .map(|x| x.id.clone())
+            {
+                settings.active_telegram_instance = Some(hit);
+            }
+        }
+    }
+    Ok(build_agent_runtime_settings_response(&openclaw_dir, settings))
+}
+
+#[tauri::command]
+fn save_gateway_bindings(
+    gateways: Vec<GatewayBinding>,
+    custom_path: Option<String>,
+) -> Result<Vec<GatewayBinding>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    settings.gateways = gateways
+        .into_iter()
+        .filter(|g| {
+            if g.agent_id.trim().is_empty() {
+                return false;
+            }
+            if !g.channel_instances.is_empty() {
+                return g.channel_instances.iter().any(|(ch, iid)| !ch.trim().is_empty() && !iid.trim().is_empty());
+            }
+            !g.channel.trim().is_empty() && !g.instance_id.trim().is_empty()
+        })
+        .map(|mut g| {
+            normalize_gateway_binding(&openclaw_dir, &mut g);
+            g
+        })
+        .collect();
+    normalize_runtime_settings_v2(&openclaw_dir, &mut settings);
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    Ok(settings.gateways)
+}
+
+#[tauri::command]
+fn save_skills_scope(
+    skills_scope: String,
+    custom_path: Option<String>,
+) -> Result<AgentRuntimeSettingsResponse, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    settings.skills_scope = skills_scope;
+    normalize_runtime_settings_v2(&openclaw_dir, &mut settings);
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    Ok(build_agent_runtime_settings_response(&openclaw_dir, settings))
+}
+
+#[tauri::command]
+fn save_agent_skill_binding(
+    agent_id: String,
+    mode: String,
+    enabled_skills: Vec<String>,
+    custom_path: Option<String>,
+) -> Result<AgentRuntimeSettingsResponse, String> {
+    let aid = agent_id.trim().to_string();
+    if aid.is_empty() {
+        return Err("agent_id 不能为空".to_string());
+    }
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let normalized_mode = if mode.trim().eq_ignore_ascii_case("custom") {
+        "custom".to_string()
+    } else {
+        "inherit".to_string()
+    };
+    let mut dedup = BTreeSet::new();
+    let normalized_skills: Vec<String> = enabled_skills
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| dedup.insert(s.to_lowercase()))
+        .collect();
+
+    if let Some(existing) = settings
+        .agent_skill_bindings
+        .iter_mut()
+        .find(|binding| binding.agent_id.eq_ignore_ascii_case(&aid))
+    {
+        existing.agent_id = aid;
+        existing.mode = normalized_mode;
+        existing.enabled_skills = normalized_skills;
+        existing.isolated_state_dir = None;
+    } else {
+        settings.agent_skill_bindings.push(AgentSkillBinding {
+            agent_id: aid,
+            mode: normalized_mode,
+            enabled_skills: normalized_skills,
+            isolated_state_dir: None,
+        });
+    }
+
+    normalize_runtime_settings_v2(&openclaw_dir, &mut settings);
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    Ok(build_agent_runtime_settings_response(&openclaw_dir, settings))
+}
+
+#[tauri::command]
+fn upsert_agent_runtime_profile(
+    agent_id: String,
+    provider: String,
+    model: String,
+    custom_path: Option<String>,
+) -> Result<AgentRuntimeProfile, String> {
+    let aid = agent_id.trim().to_string();
+    if aid.is_empty() {
+        return Err("agent_id 不能为空".to_string());
+    }
+    let p = provider.trim().to_string();
+    if p.is_empty() {
+        return Err("provider 不能为空".to_string());
+    }
+    let m = model.trim().to_string();
+    if m.is_empty() {
+        return Err("model 不能为空".to_string());
+    }
+
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let out = AgentRuntimeProfile {
+        agent_id: aid.clone(),
+        provider: p.clone(),
+        model: m.clone(),
+    };
+    if let Some(existing) = settings.profiles.iter_mut().find(|x| x.agent_id == aid) {
+        *existing = out.clone();
+    } else {
+        settings.profiles.push(out.clone());
+    }
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+
+    // 同步到 openclaw.json 的 agents.list[].model.primary，让 Agent 在运行时使用对应主模型。
+    let mut root = load_openclaw_config(&openclaw_dir).map_err(|e| e.to_string())?;
+    let primary = normalize_primary_model(&p, Some(&m));
+    let mut found = false;
+    if let Some(list) = root
+        .get_mut("agents")
+        .and_then(|a| a.get_mut("list"))
+        .and_then(|l| l.as_array_mut())
+    {
+        for item in list.iter_mut() {
+            let Some(obj) = item.as_object_mut() else { continue };
+            let Some(id) = obj.get("id").and_then(|v| v.as_str()) else { continue };
+            if id != aid {
+                continue;
+            }
+            let mut model_obj = obj
+                .get("model")
+                .and_then(|m| m.as_object())
+                .cloned()
+                .unwrap_or_default();
+            model_obj.insert("primary".to_string(), Value::String(primary.clone()));
+            obj.insert("model".to_string(), Value::Object(model_obj));
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return Err(format!("未找到 Agent: {}", aid));
+    }
+    save_openclaw_config(&openclaw_dir, &root)?;
+    Ok(out)
+}
+
+#[tauri::command]
+fn save_agent_channel_routes(
+    routes: Vec<AgentChannelRoute>,
+    custom_path: Option<String>,
+) -> Result<Vec<AgentChannelRoute>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    settings.channel_routes = routes
+        .into_iter()
+        .filter(|r| !r.channel.trim().is_empty() && !r.agent_id.trim().is_empty())
+        .map(|mut r| {
+            r.channel = r.channel.trim().to_string();
+            r.agent_id = r.agent_id.trim().to_string();
+            r.bot_instance = r
+                .bot_instance
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            r.account = r
+                .account
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            r.peer = r
+                .peer
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            r.gateway_id = r
+                .gateway_id
+                .as_deref()
+                .map(|s| sanitize_gateway_key(s))
+                .filter(|s| !s.is_empty());
+            if r.id.trim().is_empty() {
+                r.id = format!("{}-{}-{}", r.channel, r.agent_id, now_stamp());
+            }
+            r
+        })
+        .collect();
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    Ok(settings.channel_routes)
+}
+
+#[tauri::command]
+fn save_telegram_instances(
+    instances: Vec<TelegramBotInstance>,
+    active_instance_id: Option<String>,
+    custom_path: Option<String>,
+) -> Result<AgentRuntimeSettingsResponse, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let normalized: Vec<TelegramBotInstance> = instances
+        .into_iter()
+        .filter_map(|mut it| {
+            let id = it.id.trim().to_string();
+            let token = it.bot_token.trim().to_string();
+            if id.is_empty() || token.is_empty() {
+                return None;
+            }
+            it.id = id;
+            it.name = if it.name.trim().is_empty() {
+                it.id.clone()
+            } else {
+                it.name.trim().to_string()
+            };
+            it.bot_token = token;
+            it.chat_id = it
+                .chat_id
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Some(it)
+        })
+        .collect();
+    let active = active_instance_id
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| normalized.first().map(|x| x.id.clone()));
+    settings.telegram_instances = normalized;
+    settings.active_telegram_instance = active;
+    if let Some(active_id) = settings.active_telegram_instance.clone() {
+        let _ = upsert_gateway_binding(&mut settings, &openclaw_dir, "telegram", &active_id, None);
+    }
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    Ok(build_agent_runtime_settings_response(&openclaw_dir, settings))
+}
+
+fn normalize_channel_id(channel: &str) -> String {
+    channel.trim().to_ascii_lowercase()
+}
+
+fn supports_channel_instances(channel: &str) -> bool {
+    matches!(channel, "telegram" | "feishu" | "dingtalk" | "discord" | "qq")
+}
+
+fn build_channel_config_from_instance(channel: &str, it: &ChannelBotInstance) -> Result<Value, String> {
+    let c1 = it.credential1.trim().to_string();
+    let c2 = it
+        .credential2
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut cfg = Map::new();
+    match channel {
+        "telegram" => {
+            if c1.is_empty() {
+                return Err(format!("实例 {} 缺少 bot token", it.id));
+            }
+            cfg.insert("botToken".to_string(), Value::String(c1));
+            if let Some(chat) = it
+                .chat_id
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                cfg.insert("chatId".to_string(), Value::String(chat));
+            }
+        }
+        "discord" => {
+            if c1.is_empty() {
+                return Err(format!("实例 {} 缺少 token", it.id));
+            }
+            cfg.insert("token".to_string(), Value::String(c1.clone()));
+            cfg.insert("botToken".to_string(), Value::String(c1));
+        }
+        "feishu" => {
+            if c1.is_empty() || c2.is_none() {
+                return Err(format!("实例 {} 缺少 appId/appSecret", it.id));
+            }
+            cfg.insert("appId".to_string(), Value::String(c1));
+            cfg.insert("appSecret".to_string(), Value::String(c2.unwrap_or_default()));
+            cfg.insert("connectionMode".to_string(), Value::String("websocket".to_string()));
+            cfg.insert("enabled".to_string(), Value::Bool(true));
+        }
+        "dingtalk" => {
+            if c1.is_empty() || c2.is_none() {
+                return Err(format!("实例 {} 缺少 appKey/appSecret", it.id));
+            }
+            cfg.insert("appKey".to_string(), Value::String(c1));
+            cfg.insert("appSecret".to_string(), Value::String(c2.unwrap_or_default()));
+        }
+        "qq" => {
+            if c1.is_empty() || c2.is_none() {
+                return Err(format!("实例 {} 缺少 AppID/AppSecret", it.id));
+            }
+            let secret = c2.unwrap_or_default();
+            let composed = if secret.starts_with(&format!("{}:", c1)) {
+                secret.clone()
+            } else {
+                format!("{}:{}", c1, secret)
+            };
+            cfg.insert("appId".to_string(), Value::String(c1));
+            cfg.insert("clientSecret".to_string(), Value::String(secret.clone()));
+            cfg.insert("appSecret".to_string(), Value::String(secret));
+            cfg.insert("token".to_string(), Value::String(composed));
+        }
+        _ => {
+            return Err(format!("不支持的渠道: {}", channel));
+        }
+    }
+    Ok(Value::Object(cfg))
+}
+
+#[tauri::command]
+fn save_channel_instances(
+    channel: String,
+    instances: Vec<ChannelBotInstance>,
+    active_instance_id: Option<String>,
+    custom_path: Option<String>,
+) -> Result<AgentRuntimeSettingsResponse, String> {
+    let ch = normalize_channel_id(&channel);
+    if !supports_channel_instances(&ch) {
+        return Err(format!("不支持的渠道: {}", ch));
+    }
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+
+    let normalized: Vec<ChannelBotInstance> = instances
+        .into_iter()
+        .filter_map(|mut it| {
+            let id = it.id.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            it.channel = ch.clone();
+            it.id = id;
+            it.name = if it.name.trim().is_empty() {
+                it.id.clone()
+            } else {
+                it.name.trim().to_string()
+            };
+            it.credential1 = it.credential1.trim().to_string();
+            it.credential2 = it
+                .credential2
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            it.chat_id = it
+                .chat_id
+                .as_deref()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Some(it)
+        })
+        .collect();
+
+    settings
+        .channel_instances
+        .retain(|it| normalize_channel_id(&it.channel) != ch);
+    settings.channel_instances.extend(normalized.clone());
+    let active = active_instance_id
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| normalized.first().map(|x| x.id.clone()));
+    if let Some(id) = active.clone() {
+        settings.active_channel_instances.insert(ch.clone(), id);
+    } else {
+        settings.active_channel_instances.remove(&ch);
+    }
+    if let Some(active_id) = active {
+        let _ = upsert_gateway_binding(&mut settings, &openclaw_dir, &ch, &active_id, None);
+    }
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    Ok(build_agent_runtime_settings_response(&openclaw_dir, settings))
+}
+
+fn check_telegram_get_me(token: &str) -> Result<(String, Option<String>), String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err("token 为空".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let url = format!("https://api.telegram.org/bot{}/getMe", token);
+        let mut cmd = Command::new("powershell");
+        hide_console_window(&mut cmd);
+        let script = format!(
+            "$r=Invoke-WebRequest -UseBasicParsing -Uri '{}' -Method GET -TimeoutSec 10; $r.Content",
+            url
+        );
+        let out = cmd
+            .args(["-NoProfile", "-Command", &script])
+            .output()
+            .map_err(|e| format!("请求失败: {}", e))?;
+        let body = String::from_utf8_lossy(&out.stdout).to_string();
+        if !body.contains("\"ok\":true") {
+            return Err("getMe 返回失败".to_string());
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+            let uname = v
+                .get("result")
+                .and_then(|r| r.get("username"))
+                .and_then(|u| u.as_str())
+                .unwrap_or("");
+            if !uname.is_empty() {
+                return Ok((format!("getMe 成功 @{}", uname), Some(uname.to_string())));
+            }
+        }
+        return Ok(("getMe 成功".to_string(), None));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Err("当前平台暂不支持批量 getMe 检查".to_string())
+    }
+}
+
+#[tauri::command]
+fn test_telegram_instances(custom_path: Option<String>) -> Result<Vec<TelegramInstanceHealth>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let mut out: Vec<TelegramInstanceHealth> = Vec::new();
+    for it in settings.telegram_instances {
+        if !it.enabled {
+            out.push(TelegramInstanceHealth {
+                id: it.id,
+                ok: false,
+                detail: "已禁用，跳过".to_string(),
+                username: None,
+            });
+            continue;
+        }
+        match check_telegram_get_me(&it.bot_token) {
+            Ok((detail, username)) => out.push(TelegramInstanceHealth {
+                id: it.id,
+                ok: true,
+                detail,
+                username,
+            }),
+            Err(e) => out.push(TelegramInstanceHealth {
+                id: it.id,
+                ok: false,
+                detail: e,
+                username: None,
+            }),
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn test_single_telegram_instance(instance_id: String, custom_path: Option<String>) -> Result<TelegramInstanceHealth, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let target = instance_id.trim();
+    if target.is_empty() {
+        return Err("instance_id 不能为空".to_string());
+    }
+    let Some(it) = settings
+        .telegram_instances
+        .iter()
+        .find(|x| x.id.trim().eq_ignore_ascii_case(target)) else {
+        return Err(format!("未找到 Telegram 实例: {}", target));
+    };
+    if !it.enabled {
+        return Ok(TelegramInstanceHealth {
+            id: it.id.clone(),
+            ok: false,
+            detail: "已禁用，跳过".to_string(),
+            username: None,
+        });
+    }
+    match check_telegram_get_me(&it.bot_token) {
+        Ok((detail, username)) => Ok(TelegramInstanceHealth {
+            id: it.id.clone(),
+            ok: true,
+            detail,
+            username,
+        }),
+        Err(e) => Ok(TelegramInstanceHealth {
+            id: it.id.clone(),
+            ok: false,
+            detail: e,
+            username: None,
+        }),
+    }
+}
+
+#[tauri::command]
+fn test_channel_instances(channel: String, custom_path: Option<String>) -> Result<Vec<ChannelInstanceHealth>, String> {
+    let ch = normalize_channel_id(&channel);
+    if !supports_channel_instances(&ch) {
+        return Err(format!("不支持的渠道: {}", ch));
+    }
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let mut out = Vec::new();
+    for it in settings
+        .channel_instances
+        .iter()
+        .filter(|x| normalize_channel_id(&x.channel) == ch)
+    {
+        if !it.enabled {
+            out.push(ChannelInstanceHealth {
+                channel: ch.clone(),
+                id: it.id.clone(),
+                ok: false,
+                detail: "已禁用，跳过".to_string(),
+            });
+            continue;
+        }
+        let cfg = match build_channel_config_from_instance(&ch, it) {
+            Ok(v) => v,
+            Err(e) => {
+                out.push(ChannelInstanceHealth {
+                    channel: ch.clone(),
+                    id: it.id.clone(),
+                    ok: false,
+                    detail: e,
+                });
+                continue;
+            }
+        };
+        match test_channel_connection(ch.clone(), cfg) {
+            Ok(msg) => out.push(ChannelInstanceHealth {
+                channel: ch.clone(),
+                id: it.id.clone(),
+                ok: true,
+                detail: msg,
+            }),
+            Err(e) => out.push(ChannelInstanceHealth {
+                channel: ch.clone(),
+                id: it.id.clone(),
+                ok: false,
+                detail: e,
+            }),
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn test_single_channel_instance(
+    channel: String,
+    instance_id: String,
+    custom_path: Option<String>,
+) -> Result<ChannelInstanceHealth, String> {
+    let ch = normalize_channel_id(&channel);
+    if !supports_channel_instances(&ch) {
+        return Err(format!("不支持的渠道: {}", ch));
+    }
+    let target = instance_id.trim();
+    if target.is_empty() {
+        return Err("instance_id 不能为空".to_string());
+    }
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let Some(it) = settings.channel_instances.iter().find(|x| {
+        normalize_channel_id(&x.channel) == ch && x.id.trim().eq_ignore_ascii_case(target)
+    }) else {
+        return Err(format!("未找到 {} 实例: {}", ch, target));
+    };
+    if !it.enabled {
+        return Ok(ChannelInstanceHealth {
+            channel: ch,
+            id: it.id.clone(),
+            ok: false,
+            detail: "已禁用，跳过".to_string(),
+        });
+    }
+    let cfg = build_channel_config_from_instance(&ch, it)?;
+    match test_channel_connection(ch.clone(), cfg) {
+        Ok(msg) => Ok(ChannelInstanceHealth {
+            channel: ch,
+            id: it.id.clone(),
+            ok: true,
+            detail: msg,
+        }),
+        Err(e) => Ok(ChannelInstanceHealth {
+            channel: ch,
+            id: it.id.clone(),
+            ok: false,
+            detail: e,
+        }),
+    }
+}
+
+fn restart_enabled_agent_gateways(openclaw_dir: &str) -> Result<Vec<String>, String> {
+    let settings = load_agent_runtime_settings(openclaw_dir)?;
+    let targets: Vec<String> = settings
+        .gateways
+        .iter()
+        .filter(|g| g.enabled)
+        .map(|g| g.gateway_id.clone())
+        .collect();
+    let mut restarted = Vec::new();
+    for gid in targets {
+        start_gateway_instance(
+            gid.clone(),
+            Some(openclaw_dir.to_string()),
+            Some(openclaw_dir.to_string()),
+        )?;
+        restarted.push(gid);
+    }
+    Ok(restarted)
+}
+
+#[tauri::command]
+fn apply_channel_instance(
+    channel: String,
+    instance_id: String,
+    custom_path: Option<String>,
+) -> Result<String, String> {
+    let ch = normalize_channel_id(&channel);
+    if !supports_channel_instances(&ch) {
+        return Err(format!("不支持的渠道: {}", ch));
+    }
+    let target = instance_id.trim();
+    if target.is_empty() {
+        return Err("instance_id 不能为空".to_string());
+    }
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let Some(instance) = settings.channel_instances.iter().find(|x| {
+        x.enabled
+            && normalize_channel_id(&x.channel) == ch
+            && x.id.trim().eq_ignore_ascii_case(target)
+    }) else {
+        return Err(format!("未找到可用实例: {} / {}", ch, target));
+    };
+    let instance_id_cloned = instance.id.clone();
+    let cfg = build_channel_config_from_instance(&ch, instance)?;
+    let _ = save_channel_config(ch.clone(), cfg, Some(openclaw_dir.clone()))?;
+    settings
+        .active_channel_instances
+        .insert(ch.clone(), instance_id_cloned.clone());
+    let _ = upsert_gateway_binding(&mut settings, &openclaw_dir, &ch, &instance_id_cloned, None);
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    let restarted = restart_enabled_agent_gateways(&openclaw_dir)?;
+    Ok(format!(
+        "已应用 {} 实例: {}（已刷新 {} 条 Agent 网关：{}）",
+        ch,
+        instance_id_cloned,
+        restarted.len(),
+        if restarted.is_empty() {
+            "无".to_string()
+        } else {
+            restarted.join(", ")
+        }
+    ))
+}
+
+#[tauri::command]
+fn apply_telegram_instance(instance_id: String, custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let target = instance_id.trim();
+    if target.is_empty() {
+        return Err("instance_id 不能为空".to_string());
+    }
+    let Some(instance) = settings
+        .telegram_instances
+        .iter()
+        .find(|x| x.id.trim().eq_ignore_ascii_case(target) && x.enabled) else {
+        return Err(format!("未找到可用 Telegram 实例: {}", target));
+    };
+    let instance_id_cloned = instance.id.clone();
+
+    let mut cfg = serde_json::Map::new();
+    cfg.insert("botToken".to_string(), Value::String(instance.bot_token.clone()));
+    if let Some(chat) = instance.chat_id.as_deref().filter(|s| !s.trim().is_empty()) {
+        cfg.insert("chatId".to_string(), Value::String(chat.trim().to_string()));
+    }
+    let _ = save_channel_config(
+        "telegram".to_string(),
+        Value::Object(cfg),
+        Some(openclaw_dir.clone()),
+    )?;
+    // OpenClaw 当前版本对 inbound Telegram 仍以“默认 agent”作为主要入口；
+    // 因此在切换实例时，同步把默认 agent 切到该实例绑定的 agent，避免“看起来切了 bot 但还进 main”。
+    let mapped_agent = settings
+        .channel_routes
+        .iter()
+        .find(|r| {
+            r.enabled
+                && r.channel.trim().eq_ignore_ascii_case("telegram")
+                && r
+                    .bot_instance
+                    .as_deref()
+                    .map(|s| s.trim().eq_ignore_ascii_case(instance_id_cloned.as_str()))
+                    .unwrap_or(false)
+        })
+        .map(|r| r.agent_id.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(agent_id) = mapped_agent.clone() {
+        if let Ok(mut root) = load_openclaw_config(&openclaw_dir) {
+            if let Some(list) = root
+                .get_mut("agents")
+                .and_then(|a| a.get_mut("list"))
+                .and_then(|l| l.as_array_mut())
+            {
+                for item in list.iter_mut() {
+                    if let Some(obj) = item.as_object_mut() {
+                        let is_target = obj
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .map(|id| id == agent_id)
+                            .unwrap_or(false);
+                        obj.insert("default".to_string(), Value::Bool(is_target));
+                    }
+                }
+                let _ = save_openclaw_config(&openclaw_dir, &root);
+            }
+        }
+    }
+    settings.active_telegram_instance = Some(instance_id_cloned.clone());
+    let _ = upsert_gateway_binding(
+        &mut settings,
+        &openclaw_dir,
+        "telegram",
+        &instance_id_cloned,
+        mapped_agent.as_deref(),
+    );
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    let restarted = restart_enabled_agent_gateways(&openclaw_dir)?;
+    Ok(format!(
+        "已应用 Telegram 实例: {}（已刷新 {} 条 Agent 网关：{}{}）",
+        instance_id_cloned,
+        restarted.len(),
+        if restarted.is_empty() {
+            "无".to_string()
+        } else {
+            restarted.join(", ")
+        },
+        mapped_agent
+            .as_deref()
+            .map(|a| format!("，默认 Agent -> {}", a))
+            .unwrap_or_else(|| "".to_string())
+    ))
+}
+
+fn channel_configs_from_binding(settings: &AgentRuntimeSettings, binding: &GatewayBinding) -> Result<Vec<(String, Value)>, String> {
+    let pairs = gateway_channel_pairs(binding);
+    if pairs.is_empty() {
+        return Err(format!("网关 {} 未配置有效渠道实例", binding.gateway_id));
+    }
+    let mut out = Vec::new();
+    for (ch, iid) in pairs {
+        if ch == "telegram" {
+            let Some(instance) = settings
+                .telegram_instances
+                .iter()
+                .find(|x| x.enabled && x.id.trim().eq_ignore_ascii_case(iid.as_str())) else {
+                return Err(format!("未找到可用 Telegram 实例: {}", iid));
+            };
+            let mut cfg = serde_json::Map::new();
+            cfg.insert("botToken".to_string(), Value::String(instance.bot_token.clone()));
+            if let Some(chat) = instance.chat_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                cfg.insert("chatId".to_string(), Value::String(chat.trim().to_string()));
+            }
+            out.push((ch, Value::Object(cfg)));
+            continue;
+        }
+        let Some(instance) = settings.channel_instances.iter().find(|x| {
+            x.enabled
+                && normalize_channel_id(&x.channel) == ch
+                && x.id.trim().eq_ignore_ascii_case(iid.as_str())
+        }) else {
+            return Err(format!("未找到可用实例: {} / {}", ch, iid));
+        };
+        out.push((ch.clone(), build_channel_config_from_instance(&ch, instance)?));
+    }
+    Ok(out)
+}
+
+fn save_gateway_health_snapshot(
+    settings: &mut AgentRuntimeSettings,
+    gateway_id: &str,
+    exe: &str,
+    state_dir: &str,
+    fallback_error: Option<String>,
+) {
+    let health = read_gateway_health_with_state_dir(exe, state_dir, gateway_id);
+    let err = if health.status == "error" {
+        Some(health.detail.clone())
+    } else {
+        fallback_error
+    };
+    update_gateway_runtime_snapshot(settings, gateway_id, health, err);
+}
+
+fn copy_file_if_exists(src: &Path, dst: &Path) -> Result<bool, String> {
+    if !src.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败 ({}): {}", parent.display(), e))?;
+    }
+    std::fs::copy(src, dst).map_err(|e| format!("复制文件失败 ({} -> {}): {}", src.display(), dst.display(), e))?;
+    Ok(true)
+}
+
+fn sync_gateway_state_runtime_assets(base_openclaw_dir: &str, state_dir: &str) -> Result<Vec<String>, String> {
+    let mut copied = Vec::new();
+    let base = Path::new(base_openclaw_dir);
+    let state = Path::new(state_dir);
+
+    let pairs = [
+        ("openclaw.json", "openclaw.json"),
+        ("channels.json", "channels.json"),
+        ("env", "env"),
+        ("agents/main/agent/auth-profiles.json", "agents/main/agent/auth-profiles.json"),
+        ("agents/main/agent/models.json", "agents/main/agent/models.json"),
+    ];
+    for (src_rel, dst_rel) in pairs {
+        let src = base.join(src_rel);
+        let dst = state.join(dst_rel);
+        if copy_file_if_exists(&src, &dst)? {
+            copied.push(dst.to_string_lossy().to_string().replace('\\', "/"));
+        }
+    }
+    Ok(copied)
+}
+
+#[tauri::command]
+fn list_gateway_instances(custom_path: Option<String>) -> Result<Vec<GatewayBinding>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let exe = find_openclaw_executable(Some(openclaw_dir.as_str())).unwrap_or_else(|| "openclaw".to_string());
+    for g in settings.gateways.iter_mut() {
+        normalize_gateway_binding(&openclaw_dir, g);
+        let state_dir = g
+            .state_dir
+            .clone()
+            .unwrap_or_else(|| gateway_default_state_dir(&openclaw_dir, &g.gateway_id));
+        g.state_dir = Some(state_dir.clone());
+        g.health = Some(read_gateway_health_with_state_dir(&exe, &state_dir, &g.gateway_id));
+        if g.health.as_ref().map(|h| h.status.as_str() == "error").unwrap_or(false) {
+            g.pid = None;
+        }
+    }
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    Ok(settings.gateways)
+}
+
+#[tauri::command]
+fn health_gateway_instance(gateway_id: String, custom_path: Option<String>) -> Result<GatewayBinding, String> {
+    let gid = sanitize_gateway_key(&gateway_id);
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let exe = find_openclaw_executable(Some(openclaw_dir.as_str())).unwrap_or_else(|| "openclaw".to_string());
+    let state_dir = find_gateway_binding(&settings, &gid)
+        .and_then(|g| g.state_dir.clone())
+        .unwrap_or_else(|| gateway_default_state_dir(&openclaw_dir, &gid));
+    save_gateway_health_snapshot(&mut settings, &gid, &exe, &state_dir, None);
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    find_gateway_binding(&settings, &gid)
+        .cloned()
+        .ok_or_else(|| format!("未找到网关绑定: {}", gid))
+}
+
+#[tauri::command]
+fn start_gateway_instance(
+    gateway_id: String,
+    custom_path: Option<String>,
+    install_hint: Option<String>,
+) -> Result<String, String> {
+    let gid = sanitize_gateway_key(&gateway_id);
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let binding = find_gateway_binding(&settings, &gid)
+        .cloned()
+        .ok_or_else(|| format!("未找到网关绑定: {}", gid))?;
+    if !binding.enabled {
+        return Err(format!("网关 {} 已禁用", gid));
+    }
+    let state_dir = binding
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| gateway_default_state_dir(&openclaw_dir, &gid));
+    std::fs::create_dir_all(&state_dir).map_err(|e| format!("创建网关状态目录失败: {}", e))?;
+    let synced_assets = sync_gateway_state_runtime_assets(&openclaw_dir, &state_dir)?;
+
+    let plugin_channels: Vec<String> = gateway_channel_pairs(&binding)
+        .into_iter()
+        .map(|(ch, _)| ch)
+        .filter(|ch| !is_builtin_channel_for_openclaw(ch))
+        .collect();
+    let installed_plugins = ensure_channel_plugins_installed(&plugin_channels, &state_dir, install_hint.clone())?;
+
+    let channel_cfgs = channel_configs_from_binding(&settings, &binding)?;
+    let has_qq = channel_cfgs.iter().any(|(ch, _)| ch.eq_ignore_ascii_case("qq"));
+    let has_feishu = channel_cfgs.iter().any(|(ch, _)| ch.eq_ignore_ascii_case("feishu"));
+    for (ch, cfg) in channel_cfgs.iter() {
+        let _ = save_channel_config(ch.clone(), cfg.clone(), Some(state_dir.clone()))?;
+    }
+
+    let mut root = load_openclaw_config(&state_dir).map_err(|e| e.to_string())?;
+    ensure_gateway_mode_local(&mut root);
+    set_default_agent_for_gateway(&mut root, &binding.agent_id);
+    // 仅保留绑定内的渠道，移除 base 同步来的多余渠道，避免 getUpdates 冲突（如飞书网关误带 tg-code token）
+    let binding_channel_keys: std::collections::HashSet<String> = gateway_channel_pairs(&binding)
+        .into_iter()
+        .map(|(ch, _)| {
+            if ch.eq_ignore_ascii_case("qq") {
+                "qqbot".to_string()
+            } else {
+                ch.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    if let Some(obj) = root.as_object_mut() {
+        if let Some(chs) = obj.get_mut("channels").and_then(|v| v.as_object_mut()) {
+            let to_remove: Vec<String> = chs
+                .keys()
+                .filter(|k| !binding_channel_keys.contains(*k))
+                .cloned()
+                .collect();
+            for k in to_remove {
+                chs.remove(&k);
+            }
+        }
+        if let Some(plugins) = obj.get_mut("plugins").and_then(|p| p.as_object_mut()) {
+            if let Some(entries) = plugins.get_mut("entries").and_then(|e| e.as_object_mut()) {
+                let to_remove: Vec<String> = entries
+                    .keys()
+                    .filter(|k| !binding_channel_keys.contains(*k))
+                    .cloned()
+                    .collect();
+                for k in to_remove {
+                    entries.remove(&k);
+                }
+            }
+        }
+    }
+    // 若网关绑定含 QQ，将 channels.json 的 qqbot 合并进 openclaw.json，并启用 qqbot 插件
+    if has_qq {
+        let channels_path = format!("{}/channels.json", state_dir.replace('\\', "/"));
+        if let Ok(txt) = std::fs::read_to_string(&channels_path) {
+            if let Ok(legacy) = serde_json::from_str::<Value>(&txt) {
+                if let Some(obj) = legacy.as_object() {
+                    let qq_cfg = obj.get("qqbot").or_else(|| obj.get("qq"));
+                    if let Some(qq) = qq_cfg {
+                        let app_id = qq.get("appId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if !app_id.is_empty() {
+                            let client_secret = qq
+                                .get("clientSecret")
+                                .or_else(|| qq.get("appSecret"))
+                                .and_then(|v| v.as_str())
+                                .map(String::from)
+                                .or_else(|| {
+                                    qq.get("token")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|t| t.split_once(':').map(|(_, s)| s.to_string()))
+                                })
+                                .unwrap_or_default();
+                            if !client_secret.is_empty() {
+                                let obj_mut = root.as_object_mut().expect("root object");
+                                let chs = obj_mut.entry("channels".to_string()).or_insert_with(|| json!({}));
+                                if let Some(chs_obj) = chs.as_object_mut() {
+                                    chs_obj.insert(
+                                        "qqbot".to_string(),
+                                        json!({
+                                            "enabled": true,
+                                            "allowFrom": ["*"],
+                                            "appId": app_id,
+                                            "clientSecret": client_secret
+                                        }),
+                                    );
+                                }
+                                let plugins = obj_mut.entry("plugins".to_string()).or_insert_with(|| json!({}));
+                                if let Some(p) = plugins.as_object_mut() {
+                                    let entries = p.entry("entries".to_string()).or_insert_with(|| json!({}));
+                                    if let Some(e) = entries.as_object_mut() {
+                                        e.insert("qqbot".to_string(), json!({"enabled": true}));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if has_feishu {
+        let channels_path = format!("{}/channels.json", state_dir.replace('\\', "/"));
+        if let Ok(txt) = std::fs::read_to_string(&channels_path) {
+            if let Ok(legacy) = serde_json::from_str::<Value>(&txt) {
+                if let Some(obj) = legacy.as_object() {
+                    if let Some(feishu) = obj.get("feishu") {
+                        let app_id = feishu
+                            .get("appId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let app_secret = feishu
+                            .get("appSecret")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if !app_id.is_empty() && !app_secret.is_empty() {
+                            let obj_mut = root.as_object_mut().expect("root object");
+                            let chs = obj_mut.entry("channels".to_string()).or_insert_with(|| json!({}));
+                            if let Some(chs_obj) = chs.as_object_mut() {
+                                chs_obj.insert(
+                                    "feishu".to_string(),
+                                    json!({
+                                        "enabled": true,
+                                        "appId": app_id,
+                                        "appSecret": app_secret,
+                                        "connectionMode": "websocket"
+                                    }),
+                                );
+                            }
+                            let plugins = obj_mut.entry("plugins".to_string()).or_insert_with(|| json!({}));
+                            if let Some(p) = plugins.as_object_mut() {
+                                let entries = p.entry("entries".to_string()).or_insert_with(|| json!({}));
+                                if let Some(e) = entries.as_object_mut() {
+                                    e.insert("feishu".to_string(), json!({"enabled": true}));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let port = binding.listen_port.unwrap_or(18789);
+    if !root.is_object() {
+        root = json!({});
+    }
+    let obj = root.as_object_mut().expect("object");
+    let gateway = obj.entry("gateway".to_string()).or_insert_with(|| json!({}));
+    if !gateway.is_object() {
+        *gateway = json!({});
+    }
+    let gw_obj = gateway.as_object_mut().expect("gateway object");
+    gw_obj.insert("port".to_string(), json!(port));
+    save_openclaw_config(&state_dir, &root)?;
+
+    let exe = find_openclaw_executable(Some(openclaw_dir.as_str()))
+        .or_else(|| find_openclaw_executable(install_hint.as_deref()))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let _ = ensure_gateway_service_installed(&exe, &state_dir, &gid, Some(port));
+    let _ = run_openclaw_gateway_cmd_clean(&exe, &["gateway", "stop"], &state_dir, &gid, Some(port));
+    let mut start_res = run_openclaw_gateway_cmd_clean(&exe, &["gateway", "start"], &state_dir, &gid, Some(port));
+    if let Ok((ok, out, err)) = &start_res {
+        if !*ok && gateway_start_requires_reinstall(&format!("{}\n{}", out, err)) {
+            let _ = std::fs::remove_file(gateway_install_stamp_path(&state_dir));
+            ensure_gateway_service_installed(&exe, &state_dir, &gid, Some(port))?;
+            start_res = run_openclaw_gateway_cmd_clean(&exe, &["gateway", "start"], &state_dir, &gid, Some(port));
+        }
+    }
+    let start_err = start_res
+        .as_ref()
+        .err()
+        .map(|e| e.to_string())
+        .or_else(|| {
+            start_res
+                .as_ref()
+                .ok()
+                .filter(|(ok, _, _)| !ok)
+                .map(|(_, _, se)| se.clone())
+        });
+    save_gateway_health_snapshot(&mut settings, &gid, &exe, &state_dir, start_err.clone());
+    if let Some(g) = find_gateway_binding_mut(&mut settings, &gid) {
+        g.state_dir = Some(state_dir.clone());
+        g.listen_port = Some(port);
+    }
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    if let Some(err) = start_err {
+        return Err(format!("网关 {} 启动失败: {}", gid, err));
+    }
+    Ok(format!(
+        "网关已启动: {} (agent={}, channels={}, port={}, synced_assets={}, plugins={})",
+        gid,
+        binding.agent_id,
+        gateway_channel_pairs(&binding)
+            .into_iter()
+            .map(|(ch, iid)| format!("{}/{}", ch, iid))
+            .collect::<Vec<String>>()
+            .join(","),
+        port,
+        synced_assets.len(),
+        if installed_plugins.is_empty() {
+            "ok".to_string()
+        } else {
+            installed_plugins.join("; ")
+        }
+    ))
+}
+
+#[tauri::command]
+fn stop_gateway_instance(
+    gateway_id: String,
+    custom_path: Option<String>,
+    install_hint: Option<String>,
+) -> Result<String, String> {
+    let gid = sanitize_gateway_key(&gateway_id);
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let mut settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let binding = find_gateway_binding(&settings, &gid)
+        .cloned()
+        .ok_or_else(|| format!("未找到网关绑定: {}", gid))?;
+    let state_dir = binding
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| gateway_default_state_dir(&openclaw_dir, &gid));
+    let exe = find_openclaw_executable(Some(openclaw_dir.as_str()))
+        .or_else(|| find_openclaw_executable(install_hint.as_deref()))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let stop_res = run_openclaw_gateway_cmd_clean(
+        &exe,
+        &["gateway", "stop"],
+        &state_dir,
+        &gid,
+        binding.listen_port,
+    );
+    let mut stop_msg = "已请求停止".to_string();
+    if let Ok((ok, out, err)) = &stop_res {
+        stop_msg = if *ok {
+            format!("已停止: {}", out.trim())
+        } else {
+            format!("停止返回异常: {}", err.trim())
+        };
+    }
+    save_gateway_health_snapshot(
+        &mut settings,
+        &gid,
+        &exe,
+        &state_dir,
+        stop_res.err().map(|e| e.to_string()),
+    );
+    if let Some(g) = find_gateway_binding_mut(&mut settings, &gid) {
+        g.pid = None;
+    }
+    save_agent_runtime_settings(&openclaw_dir, &settings)?;
+    Ok(format!("网关 {} {}", gid, stop_msg))
+}
+
+#[tauri::command]
+fn restart_gateway_instance(
+    gateway_id: String,
+    custom_path: Option<String>,
+    install_hint: Option<String>,
+) -> Result<String, String> {
+    let _ = stop_gateway_instance(gateway_id.clone(), custom_path.clone(), install_hint.clone());
+    start_gateway_instance(gateway_id, custom_path, install_hint)
+}
+
+#[tauri::command]
+fn tail_gateway_logs(
+    gateway_id: String,
+    lines: Option<usize>,
+    custom_path: Option<String>,
+) -> Result<String, String> {
+    let gid = sanitize_gateway_key(&gateway_id);
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let binding = find_gateway_binding(&settings, &gid)
+        .ok_or_else(|| format!("未找到网关绑定: {}", gid))?;
+    let state_dir = binding
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| gateway_default_state_dir(&openclaw_dir, &gid));
+    let path = Path::new(&state_dir).join("gateway.log");
+    if !path.exists() {
+        return Ok(format!(
+            "未找到日志文件：{}\n提示：先启动该网关实例后再查看日志。",
+            path.to_string_lossy()
+        ));
+    }
+    let txt = std::fs::read_to_string(&path).map_err(|e| format!("读取日志失败: {}", e))?;
+    let max_lines = lines.unwrap_or(160).max(20).min(1000);
+    let mut all: Vec<&str> = txt.lines().collect();
+    if all.len() > max_lines {
+        all = all.split_off(all.len() - max_lines);
+    }
+    Ok(all.join("\n"))
+}
+
+#[tauri::command]
+fn start_all_enabled_gateways(
+    custom_path: Option<String>,
+    install_hint: Option<String>,
+) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let targets: Vec<String> = settings
+        .gateways
+        .iter()
+        .filter(|g| g.enabled)
+        .map(|g| g.gateway_id.clone())
+        .collect();
+    if targets.is_empty() {
+        return Ok("未找到启用中的网关绑定".to_string());
+    }
+    let mut ok_msgs = Vec::new();
+    let mut fail_msgs = Vec::new();
+    for gid in targets {
+        match start_gateway_instance(gid.clone(), Some(openclaw_dir.clone()), install_hint.clone()) {
+            Ok(m) => ok_msgs.push(m),
+            Err(e) => fail_msgs.push(format!("{} -> {}", gid, e)),
+        }
+    }
+    let mut out = format!("批量启动完成：成功 {}，失败 {}", ok_msgs.len(), fail_msgs.len());
+    if !ok_msgs.is_empty() {
+        out.push_str("\n\n[成功]\n");
+        out.push_str(&ok_msgs.join("\n"));
+    }
+    if !fail_msgs.is_empty() {
+        out.push_str("\n\n[失败]\n");
+        out.push_str(&fail_msgs.join("\n"));
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn health_all_enabled_gateways(custom_path: Option<String>) -> Result<Vec<GatewayBinding>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let targets: Vec<String> = settings
+        .gateways
+        .iter()
+        .filter(|g| g.enabled)
+        .map(|g| g.gateway_id.clone())
+        .collect();
+    for gid in targets {
+        let _ = health_gateway_instance(gid, Some(openclaw_dir.clone()));
+    }
+    list_gateway_instances(Some(openclaw_dir))
+}
+
+#[tauri::command]
+fn export_multi_gateway_diagnostic_report(custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let list = list_gateway_instances(Some(openclaw_dir.clone()))?;
+    let mut lines = Vec::new();
+    lines.push(format!("OpenClaw 多网关诊断报告 {}", now_stamp()));
+    lines.push(format!("config_dir: {}", openclaw_dir));
+    lines.push(String::new());
+    for g in list {
+        lines.push(format!("- gateway_id: {}", g.gateway_id));
+        lines.push(format!("  agent_id: {}", g.agent_id));
+        let channel_pairs = gateway_channel_pairs(&g)
+            .into_iter()
+            .map(|(ch, iid)| format!("{}/{}", ch, iid))
+            .collect::<Vec<String>>()
+            .join(", ");
+        lines.push(format!("  channels: {}", channel_pairs));
+        lines.push(format!("  enabled: {}", g.enabled));
+        lines.push(format!("  state_dir: {}", g.state_dir.unwrap_or_default()));
+        lines.push(format!("  port: {}", g.listen_port.map(|v| v.to_string()).unwrap_or_default()));
+        lines.push(format!(
+            "  health: {}",
+            g.health
+                .as_ref()
+                .map(|h| format!("{} ({})", h.status, h.checked_at))
+                .unwrap_or_else(|| "unknown".to_string())
+        ));
+        if let Ok(log_tail) = tail_gateway_logs(g.gateway_id.clone(), Some(60), Some(openclaw_dir.clone())) {
+            lines.push("  ---- tail gateway.log ----".to_string());
+            for l in log_tail.lines() {
+                lines.push(format!("  {}", l));
+            }
+            lines.push("  ---- end log ----".to_string());
+        }
+        lines.push(String::new());
+    }
+    let report_dir = Path::new(&openclaw_dir).join("control_plane");
+    std::fs::create_dir_all(&report_dir).map_err(|e| format!("创建报告目录失败: {}", e))?;
+    let file_path = report_dir.join(format!("gateway-diagnostic-{}.txt", now_stamp()));
+    std::fs::write(&file_path, lines.join("\n")).map_err(|e| format!("写入诊断报告失败: {}", e))?;
+    Ok(file_path.to_string_lossy().to_string().replace('\\', "/"))
+}
+
+#[tauri::command]
+fn resolve_agent_channel_route(
+    channel: String,
+    gateway_id: Option<String>,
+    bot_instance: Option<String>,
+    account: Option<String>,
+    peer: Option<String>,
+    fallback_agent: Option<String>,
+    custom_path: Option<String>,
+) -> Result<AgentRouteResolveResult, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let channel_norm = channel.trim().to_ascii_lowercase();
+    if channel_norm.is_empty() {
+        return Err("channel 不能为空".to_string());
+    }
+    let account_norm = account
+        .as_deref()
+        .map(|s| s.trim().trim_start_matches('@').to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let peer_norm = peer
+        .as_deref()
+        .map(|s| s.trim().trim_start_matches('@').to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let bot_instance_norm = bot_instance
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+    let gateway_id_norm = gateway_id
+        .as_deref()
+        .map(|s| sanitize_gateway_key(s))
+        .filter(|s| !s.is_empty());
+
+    let input_tokens: Vec<&str> = [account_norm.as_deref(), peer_norm.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let matches_input = |expected: Option<&String>| -> bool {
+        let Some(raw) = expected else { return true };
+        let exp = raw.trim().trim_start_matches('@').to_ascii_lowercase();
+        if exp.is_empty() {
+            return true;
+        }
+        input_tokens.iter().any(|v| *v == exp.as_str())
+    };
+
+    let mut picked: Option<(usize, &AgentChannelRoute)> = None;
+    let mut same_channel_count = 0usize;
+    let mut blocked_by_account = 0usize;
+    let mut blocked_by_peer = 0usize;
+    for route in settings.channel_routes.iter().filter(|r| r.enabled) {
+        if route.channel.trim().to_ascii_lowercase() != channel_norm {
+            continue;
+        }
+        let route_gateway = route
+            .gateway_id
+            .as_deref()
+            .map(|s| sanitize_gateway_key(s))
+            .filter(|s| !s.is_empty());
+        if let Some(input_gateway) = gateway_id_norm.as_deref() {
+            if let Some(expect_gateway) = route_gateway.as_deref() {
+                if expect_gateway != input_gateway {
+                    continue;
+                }
+            }
+        }
+        if let Some(expect_bot) = route
+            .bot_instance
+            .as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+        {
+            let Some(input_bot) = bot_instance_norm.as_deref() else { continue };
+            if expect_bot != input_bot {
+                continue;
+            }
+        }
+        same_channel_count += 1;
+        if !matches_input(route.account.as_ref()) {
+            blocked_by_account += 1;
+            continue;
+        }
+        if !matches_input(route.peer.as_ref()) {
+            blocked_by_peer += 1;
+            continue;
+        }
+        let mut score = usize::from(route.account.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false))
+            + usize::from(route.peer.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false));
+        if let (Some(expect), Some(input)) = (route_gateway.as_deref(), gateway_id_norm.as_deref()) {
+            if expect == input {
+                score += 4;
+            }
+        }
+        match picked {
+            Some((best, _)) if best >= score => {}
+            _ => picked = Some((score, route)),
+        }
+    }
+
+    if let Some((_, route)) = picked {
+        let resolved_gateway = route
+            .gateway_id
+            .clone()
+            .or_else(|| {
+                route.bot_instance.as_deref().and_then(|iid| {
+                    settings
+                        .gateways
+                        .iter()
+                        .find(|g| {
+                            g.enabled
+                                && normalize_channel_id(&g.channel) == channel_norm
+                                && g.instance_id.trim().eq_ignore_ascii_case(iid.trim())
+                        })
+                        .map(|g| g.gateway_id.clone())
+                })
+            })
+            .or_else(|| gateway_id_norm.clone());
+        return Ok(AgentRouteResolveResult {
+            agent_id: route.agent_id.clone(),
+            gateway_id: resolved_gateway,
+            matched_route_id: Some(route.id.clone()),
+            detail: format!("命中路由 {}", route.id),
+        });
+    }
+
+    let fallback = fallback_agent
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("main")
+        .to_string();
+    Ok(AgentRouteResolveResult {
+        agent_id: fallback,
+        gateway_id: gateway_id_norm,
+        matched_route_id: None,
+        detail: if settings.channel_routes.iter().any(|r| r.enabled) {
+            format!(
+                "未命中路由，使用默认 Agent（同渠道规则 {} 条；account 不匹配 {} 条；peer 不匹配 {} 条）",
+                same_channel_count, blocked_by_account, blocked_by_peer
+            )
+        } else {
+            "未命中路由，使用默认 Agent（当前没有启用的渠道路由规则）".to_string()
+        },
+    })
+}
+
+#[tauri::command]
+fn cleanup_browser_sessions_for_telegram_bindings(custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let mut keep_keys = BTreeSet::new();
+    for route in settings.channel_routes.iter().filter(|r| {
+        r.enabled
+            && r.channel.trim().eq_ignore_ascii_case("telegram")
+            && !r.agent_id.trim().is_empty()
+    }) {
+        let agent_id = route.agent_id.trim();
+        keep_keys.insert(format!("agent:{}:main", agent_id));
+    }
+    if keep_keys.is_empty() {
+        return Err("未找到启用中的 Telegram 路由，已取消会话清理".to_string());
+    }
+
+    let agents_root = Path::new(&openclaw_dir).join("agents");
+    if !agents_root.exists() {
+        return Err(format!("agents 目录不存在: {}", agents_root.display()));
+    }
+
+    let mut touched_files = 0usize;
+    let mut removed_count = 0usize;
+    let mut kept_count = 0usize;
+    for entry in std::fs::read_dir(&agents_root).map_err(|e| format!("读取 agents 目录失败: {}", e))? {
+        let entry = entry.map_err(|e| format!("读取 agents 子目录失败: {}", e))?;
+        let agent_dir = entry.path();
+        if !agent_dir.is_dir() {
+            continue;
+        }
+        let sessions_path = agent_dir.join("sessions").join("sessions.json");
+        if !sessions_path.exists() {
+            continue;
+        }
+        let txt = std::fs::read_to_string(&sessions_path)
+            .map_err(|e| format!("读取 sessions.json 失败 ({}): {}", sessions_path.display(), e))?;
+        let mut root: Value = serde_json::from_str(&txt)
+            .map_err(|e| format!("解析 sessions.json 失败 ({}): {}", sessions_path.display(), e))?;
+        let Some(obj) = root.as_object_mut() else {
+            continue;
+        };
+        let all_keys: Vec<String> = obj.keys().cloned().collect();
+        let mut changed = false;
+        for key in all_keys {
+            if keep_keys.contains(&key) {
+                kept_count += 1;
+                continue;
+            }
+            if obj.remove(&key).is_some() {
+                removed_count += 1;
+                changed = true;
+            }
+        }
+        if changed {
+            touched_files += 1;
+            let serialized = serde_json::to_string_pretty(&Value::Object(obj.clone()))
+                .map_err(|e| format!("序列化 sessions.json 失败 ({}): {}", sessions_path.display(), e))?;
+            std::fs::write(&sessions_path, serialized)
+                .map_err(|e| format!("写入 sessions.json 失败 ({}): {}", sessions_path.display(), e))?;
+        }
+    }
+
+    Ok(format!(
+        "会话清理完成：保留键 {} 个，移除键 {} 个，更新文件 {} 个。保留目标: {}",
+        kept_count,
+        removed_count,
+        touched_files,
+        keep_keys.into_iter().collect::<Vec<String>>().join(", ")
+    ))
+}
+
+#[tauri::command]
+fn get_gateway_url(custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    let root = load_openclaw_config(&openclaw_dir).map_err(|e| e.to_string())?;
+
+    let port = root
+        .get("gateway")
+        .and_then(|g| g.get("port"))
+        .and_then(|p| p.as_u64())
+        .unwrap_or(18789);
+
+    let base_path = root
+        .get("gateway")
+        .and_then(|g| g.get("controlUi"))
+        .and_then(|c| c.get("basePath"))
+        .and_then(|b| b.as_str())
+        .unwrap_or("/openclaw");
+
+    Ok(format!("http://127.0.0.1:{}{}", port, base_path))
+}
+
+fn get_agent_workspace(agent_id: String, custom_path: Option<String>) -> Result<String, String> {
+    let resp = read_agents_list(custom_path)?;
+    let agent = resp
+        .agents
+        .iter()
+        .find(|a| a.id == agent_id)
+        .ok_or_else(|| format!("Agent 未找到: {}", agent_id))?;
+    let ws = agent
+        .workspace
+        .as_deref()
+        .unwrap_or("~/.openclaw/workspace");
+    let home = env::var("HOME")
+        .or_else(|_| env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let expanded = if ws.starts_with("~/") {
+        format!("{}{}", home.replace('\\', "/"), &ws[1..])
+    } else {
+        ws.to_string()
+    };
+    Ok(expanded.replace('\\', "/"))
+}
+
+#[tauri::command]
+fn read_workspace_file(
+    agent_id: String,
+    relative_path: String,
+    custom_path: Option<String>,
+) -> Result<String, String> {
+    let base = PathBuf::from(get_agent_workspace(agent_id, custom_path)?);
+    let path = base.join(&relative_path);
+    if path.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err("路径不能包含 ..".to_string());
+    }
+    std::fs::read_to_string(&path).map_err(|e| format!("读取失败: {}", e))
+}
+
+#[tauri::command]
+fn write_workspace_file(
+    agent_id: String,
+    relative_path: String,
+    content: String,
+    custom_path: Option<String>,
+) -> Result<(), String> {
+    let base = PathBuf::from(get_agent_workspace(agent_id, custom_path)?);
+    let path = base.join(&relative_path);
+    if path.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err("路径不能包含 ..".to_string());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
+    }
+    std::fs::write(&path, content).map_err(|e| format!("写入失败: {}", e))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatUiMessage {
+    pub id: String,
+    pub role: String,
+    pub text: String,
+    pub timestamp: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatHistoryResponse {
+    pub session_key: String,
+    pub messages: Vec<ChatUiMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatHistoryDeltaResponse {
+    pub session_key: String,
+    pub cursor: usize,
+    pub messages: Vec<ChatUiMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatSendResponse {
+    pub session_key: String,
+    pub run_id: Option<String>,
+    pub status: String,
+}
+
+fn build_chat_session_key(agent_id: &str, session_name: Option<&str>) -> String {
+    // Canonical agent session key format expected by gateway: agent:<agentId>:<sessionName>
+    let name = session_name
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("main");
+    format!("agent:{}:{}", agent_id.trim(), name)
+}
+
+fn extract_json_payload(stdout: &str) -> Result<Value, String> {
+    let s = stdout.trim();
+    if s.is_empty() {
+        return Err("网关返回为空".to_string());
+    }
+    if let Ok(v) = serde_json::from_str::<Value>(s) {
+        return Ok(v);
+    }
+    // 兼容偶发混合输出：取最后一个 JSON 起始位置重试
+    if let Some(pos) = s.rfind('{').or_else(|| s.rfind('[')) {
+        let tail = &s[pos..];
+        if let Ok(v) = serde_json::from_str::<Value>(tail) {
+            return Ok(v);
+        }
+    }
+    Err(format!("无法解析网关 JSON 返回: {}", s))
+}
+
+fn normalize_message_text(v: &Value) -> String {
+    if let Some(s) = v.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = v.as_array() {
+        let mut parts = Vec::new();
+        for item in arr {
+            if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
+                if !t.trim().is_empty() {
+                    parts.push(t.to_string());
+                }
+            } else if let Some(t) = item.as_str() {
+                if !t.trim().is_empty() {
+                    parts.push(t.to_string());
+                }
+            }
+        }
+        return parts.join("\n");
+    }
+    if let Some(obj) = v.as_object() {
+        if let Some(t) = obj.get("text").and_then(|x| x.as_str()) {
+            return t.to_string();
+        }
+        if let Some(t) = obj.get("content") {
+            return normalize_message_text(t);
+        }
+    }
+    String::new()
+}
+
+fn parse_chat_messages(value: &Value) -> Vec<ChatUiMessage> {
+    let entries = value
+        .get("messages")
+        .or_else(|| value.get("entries"))
+        .or_else(|| value.get("data").and_then(|d| d.get("messages")))
+        .or_else(|| value.get("data").and_then(|d| d.get("entries")))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for (idx, item) in entries.iter().enumerate() {
+        let role = item
+            .get("role")
+            .and_then(|v| v.as_str())
+            .or_else(|| item.get("author").and_then(|v| v.as_str()))
+            .unwrap_or("assistant")
+            .to_string();
+        let text = item
+            .get("text")
+            .map(normalize_message_text)
+            .or_else(|| item.get("content").map(normalize_message_text))
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            continue;
+        }
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("msg-{}", idx));
+        let timestamp = item
+            .get("timestamp")
+            .or_else(|| item.get("createdAt"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        out.push(ChatUiMessage {
+            id,
+            role,
+            text,
+            timestamp,
+        });
+    }
+    out
+}
+
+fn gateway_call_value(
+    openclaw_dir: &str,
+    method: &str,
+    params: Value,
+    expect_final: bool,
+) -> Result<Value, String> {
+    let exe = find_openclaw_executable(Some(openclaw_dir))
+        .unwrap_or_else(|| "openclaw".to_string());
+    let env_extra = Some(("OPENCLAW_STATE_DIR", openclaw_dir));
+    let params_str =
+        serde_json::to_string(&params).map_err(|e| format!("参数序列化失败: {}", e))?;
+    let mut args = vec![
+        "gateway",
+        "call",
+        method,
+        "--json",
+        "--params",
+        params_str.as_str(),
+        "--timeout",
+        "20000",
+    ];
+    if expect_final {
+        args.push("--expect-final");
+    }
+    let (ok, stdout, stderr) = run_openclaw_cmd_clean(&exe, &args, env_extra)?;
+    if !ok {
+        return Err(format!("gateway call 失败 [{}]: {}", method, stderr));
+    }
+    extract_json_payload(&stdout)
+}
+
+fn resolve_chat_runtime_dir(
+    custom_path: Option<&str>,
+    prefer_gateway_dir: bool,
+    gateway_id: Option<&str>,
+) -> Result<String, String> {
+    let openclaw_dir = resolve_runtime_chat_dir(custom_path, prefer_gateway_dir);
+    let Some(gid_raw) = gateway_id else {
+        return Ok(openclaw_dir);
+    };
+    let gid = sanitize_gateway_key(gid_raw);
+    if gid.is_empty() {
+        return Ok(openclaw_dir);
+    }
+    let settings = load_agent_runtime_settings(&openclaw_dir)?;
+    let Some(binding) = find_gateway_binding(&settings, &gid) else {
+        return Err(format!("未找到网关绑定: {}", gid));
+    };
+    let state_dir = binding
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| gateway_default_state_dir(&openclaw_dir, &gid));
+    Ok(state_dir)
+}
+
+#[tauri::command]
+fn chat_list_history(
+    agent_id: String,
+    session_name: Option<String>,
+    gateway_id: Option<String>,
+    custom_path: Option<String>,
+    prefer_gateway_dir: Option<bool>,
+) -> Result<ChatHistoryResponse, String> {
+    let openclaw_dir = resolve_chat_runtime_dir(
+        custom_path.as_deref(),
+        prefer_gateway_dir.unwrap_or(true),
+        gateway_id.as_deref(),
+    )?;
+    let session_key = build_chat_session_key(&agent_id, session_name.as_deref());
+    let value = gateway_call_value(
+        &openclaw_dir,
+        "chat.history",
+        json!({
+            "sessionKey": session_key,
+            "limit": 80
+        }),
+        false,
+    )?;
+    let messages = parse_chat_messages(&value);
+    Ok(ChatHistoryResponse {
+        session_key,
+        messages,
+    })
+}
+
+#[tauri::command]
+fn chat_list_history_delta(
+    agent_id: String,
+    session_name: Option<String>,
+    cursor: usize,
+    gateway_id: Option<String>,
+    custom_path: Option<String>,
+    prefer_gateway_dir: Option<bool>,
+) -> Result<ChatHistoryDeltaResponse, String> {
+    let openclaw_dir = resolve_chat_runtime_dir(
+        custom_path.as_deref(),
+        prefer_gateway_dir.unwrap_or(true),
+        gateway_id.as_deref(),
+    )?;
+    let session_key = build_chat_session_key(&agent_id, session_name.as_deref());
+    let value = gateway_call_value(
+        &openclaw_dir,
+        "chat.history",
+        json!({
+            "sessionKey": session_key,
+            "limit": 80
+        }),
+        false,
+    )?;
+    let all = parse_chat_messages(&value);
+    let total = all.len();
+    let from = cursor.min(total);
+    let messages = if from >= total {
+        Vec::new()
+    } else {
+        all[from..].to_vec()
+    };
+    Ok(ChatHistoryDeltaResponse {
+        session_key,
+        cursor: total,
+        messages,
+    })
+}
+
+#[tauri::command]
+fn chat_send(
+    agent_id: String,
+    session_name: Option<String>,
+    text: String,
+    gateway_id: Option<String>,
+    custom_path: Option<String>,
+    prefer_gateway_dir: Option<bool>,
+) -> Result<ChatSendResponse, String> {
+    let msg = text.trim();
+    if msg.is_empty() {
+        return Err("消息不能为空".to_string());
+    }
+    let openclaw_dir = resolve_chat_runtime_dir(
+        custom_path.as_deref(),
+        prefer_gateway_dir.unwrap_or(true),
+        gateway_id.as_deref(),
+    )?;
+    let session_key = build_chat_session_key(&agent_id, session_name.as_deref());
+
+    // 先尝试 text 参数；失败时自动回退 message 参数
+    let first = gateway_call_value(
+        &openclaw_dir,
+        "chat.send",
+        json!({
+            "sessionKey": session_key,
+            "text": msg,
+            "idempotencyKey": format!("{}-{}", agent_id, now_stamp())
+        }),
+        false,
+    );
+    let value = match first {
+        Ok(v) => v,
+        Err(_) => gateway_call_value(
+            &openclaw_dir,
+            "chat.send",
+            json!({
+                "sessionKey": session_key,
+                "message": msg,
+                "idempotencyKey": format!("{}-{}", agent_id, now_stamp())
+            }),
+            false,
+        )?,
+    };
+
+    let run_id = value
+        .get("runId")
+        .or_else(|| value.get("data").and_then(|d| d.get("runId")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let status = value
+        .get("status")
+        .or_else(|| value.get("data").and_then(|d| d.get("status")))
+        .and_then(|v| v.as_str())
+        .unwrap_or("started")
+        .to_string();
+    Ok(ChatSendResponse {
+        session_key,
+        run_id,
+        status,
+    })
+}
+
+#[tauri::command]
+fn chat_abort(
+    agent_id: String,
+    session_name: Option<String>,
+    gateway_id: Option<String>,
+    custom_path: Option<String>,
+    prefer_gateway_dir: Option<bool>,
+) -> Result<String, String> {
+    let openclaw_dir = resolve_chat_runtime_dir(
+        custom_path.as_deref(),
+        prefer_gateway_dir.unwrap_or(true),
+        gateway_id.as_deref(),
+    )?;
+    let session_key = build_chat_session_key(&agent_id, session_name.as_deref());
+    let _ = gateway_call_value(
+        &openclaw_dir,
+        "chat.abort",
+        json!({
+            "sessionKey": session_key
+        }),
+        false,
+    )?;
+    Ok("已请求停止当前会话生成".to_string())
+}
+
+#[tauri::command]
+fn orchestrator_submit_task(
+    title: String,
+    input: String,
+    custom_path: Option<String>,
+) -> Result<OrchestratorTask, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::orchestrator_submit_task(&openclaw_dir, title, input)
+}
+
+#[tauri::command]
+fn orchestrator_list_tasks(custom_path: Option<String>) -> Result<Vec<OrchestratorTask>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::orchestrator_list_tasks(&openclaw_dir)
+}
+
+#[tauri::command]
+fn orchestrator_retry_step(
+    task_id: String,
+    step_id: String,
+    custom_path: Option<String>,
+) -> Result<OrchestratorTask, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::orchestrator_retry_step(&openclaw_dir, task_id, step_id)
+}
+
+#[tauri::command]
+fn capabilities_list(custom_path: Option<String>) -> Result<Vec<AgentCapability>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::capabilities_list(&openclaw_dir)
+}
+
+#[tauri::command]
+fn capabilities_upsert(
+    agent_id: String,
+    specialty: String,
+    primary_model: String,
+    fallback_model: Option<String>,
+    tools: Vec<String>,
+    strengths: Vec<String>,
+    max_cost_tier: String,
+    custom_path: Option<String>,
+) -> Result<AgentCapability, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::capabilities_upsert(
+        &openclaw_dir,
+        agent_id,
+        specialty,
+        primary_model,
+        fallback_model,
+        tools,
+        strengths,
+        max_cost_tier,
+    )
+}
+
+#[tauri::command]
+fn verifier_check_output(output: String, constraints: Vec<String>) -> Result<VerifierReport, String> {
+    Ok(services::control_plane::verifier_check_output(output, constraints))
+}
+
+#[tauri::command]
+fn skill_graph_save(
+    name: String,
+    nodes: Vec<GraphNode>,
+    edges: Vec<GraphEdge>,
+    custom_path: Option<String>,
+) -> Result<SkillGraph, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::save_skill_graph(&openclaw_dir, name, nodes, edges)
+}
+
+#[tauri::command]
+fn skill_graph_list(custom_path: Option<String>) -> Result<Vec<SkillGraph>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::list_skill_graphs(&openclaw_dir)
+}
+
+#[tauri::command]
+fn skill_graph_execute(
+    graph_id: String,
+    input: String,
+    custom_path: Option<String>,
+) -> Result<OrchestratorTask, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::execute_skill_graph(&openclaw_dir, graph_id, input)
+}
+
+#[tauri::command]
+fn ticket_ingest(
+    channel: String,
+    external_ref: String,
+    title: String,
+    payload: Value,
+    custom_path: Option<String>,
+) -> Result<UnifiedTicket, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::ticket_ingest(&openclaw_dir, channel, external_ref, title, payload)
+}
+
+#[tauri::command]
+fn ticket_list(custom_path: Option<String>) -> Result<Vec<UnifiedTicket>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::ticket_list(&openclaw_dir)
+}
+
+#[tauri::command]
+fn ticket_update(
+    ticket_id: String,
+    status: String,
+    assignee: Option<String>,
+    custom_path: Option<String>,
+) -> Result<UnifiedTicket, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::ticket_update(&openclaw_dir, ticket_id, status, assignee)
+}
+
+#[tauri::command]
+fn memory_write_layered(
+    layer: String,
+    scope: String,
+    content: String,
+    rationale: String,
+    tags: Vec<String>,
+    custom_path: Option<String>,
+) -> Result<MemoryRecord, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::memory_write(&openclaw_dir, layer, scope, content, rationale, tags)
+}
+
+#[tauri::command]
+fn memory_query_layered(
+    layer: Option<String>,
+    query: Option<String>,
+    custom_path: Option<String>,
+) -> Result<Vec<MemoryRecord>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::memory_query(&openclaw_dir, layer, query)
+}
+
+#[tauri::command]
+fn sandbox_preview_action(action_type: String, resource: String) -> Result<SandboxPreview, String> {
+    Ok(services::control_plane::sandbox_preview(action_type, resource))
+}
+
+#[tauri::command]
+fn sandbox_execute_action(
+    action_type: String,
+    resource: String,
+    approved: bool,
+    custom_path: Option<String>,
+) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::sandbox_execute(&openclaw_dir, action_type, resource, approved)
+}
+
+#[tauri::command]
+fn debate_run(task: String) -> Result<DebateResult, String> {
+    Ok(services::control_plane::debate_run(task))
+}
+
+#[tauri::command]
+fn replay_snapshot_create(
+    task_id: String,
+    input: String,
+    tool_calls: Vec<String>,
+    config: Value,
+    custom_path: Option<String>,
+) -> Result<TaskSnapshot, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::snapshot_create(&openclaw_dir, task_id, input, tool_calls, config)
+}
+
+#[tauri::command]
+fn replay_snapshot_list(custom_path: Option<String>) -> Result<Vec<TaskSnapshot>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::snapshot_list(&openclaw_dir)
+}
+
+#[tauri::command]
+fn replay_snapshot_replay(snapshot_id: String, custom_path: Option<String>) -> Result<OrchestratorTask, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::snapshot_replay(&openclaw_dir, snapshot_id)
+}
+
+#[tauri::command]
+fn promptops_create_version(
+    name: String,
+    rules: HashMap<String, String>,
+    traffic_percent: u8,
+    custom_path: Option<String>,
+) -> Result<PromptPolicyVersion, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::promptops_create_version(&openclaw_dir, name, rules, traffic_percent)
+}
+
+#[tauri::command]
+fn promptops_activate(version_id: String, custom_path: Option<String>) -> Result<Vec<PromptPolicyVersion>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::promptops_activate(&openclaw_dir, version_id)
+}
+
+#[tauri::command]
+fn promptops_list(custom_path: Option<String>) -> Result<Vec<PromptPolicyVersion>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::promptops_list(&openclaw_dir)
+}
+
+#[tauri::command]
+fn enterprise_set_role(user_id: String, role: String, custom_path: Option<String>) -> Result<RoleBinding, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::role_binding_set(&openclaw_dir, user_id, role)
+}
+
+#[tauri::command]
+fn enterprise_list_roles(custom_path: Option<String>) -> Result<Vec<RoleBinding>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::role_binding_list(&openclaw_dir)
+}
+
+#[tauri::command]
+fn enterprise_list_audit(category: Option<String>, custom_path: Option<String>) -> Result<Vec<AuditEvent>, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::audit_list(&openclaw_dir, category)
+}
+
+#[tauri::command]
+fn enterprise_cost_summary(custom_path: Option<String>) -> Result<CostSummary, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::cost_summary(&openclaw_dir)
+}
+
+#[tauri::command]
+fn control_plane_seed_demo(custom_path: Option<String>) -> Result<String, String> {
+    let openclaw_dir = resolve_openclaw_dir(custom_path.as_deref());
+    services::control_plane::seed_demo_data(&openclaw_dir)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -5346,7 +9568,9 @@ pub fn run() {
             read_key_sync_status,
             test_channel_connection,
             list_pairings,
+            list_pairings_json,
             approve_pairing,
+            fix_telegram_dm_policy,
             open_external_url,
             fix_node,
             fix_npm,
@@ -5365,6 +9589,9 @@ pub fn run() {
             list_config_snapshots,
             rollback_config_snapshot,
             list_skills_catalog,
+            search_market_skills,
+            install_market_skill,
+            install_local_skill,
             repair_selected_skills,
             install_selected_skills,
             run_startup_migrations,
@@ -5373,6 +9600,71 @@ pub fn run() {
             memory_center_clear,
             memory_center_export,
             memory_center_bootstrap,
+            read_agents_list,
+            create_agent,
+            delete_agent,
+            set_default_agent,
+            update_bindings,
+            read_agent_runtime_settings,
+            save_gateway_bindings,
+            save_skills_scope,
+            save_agent_skill_binding,
+            list_gateway_instances,
+            start_gateway_instance,
+            stop_gateway_instance,
+            restart_gateway_instance,
+            health_gateway_instance,
+            tail_gateway_logs,
+            start_all_enabled_gateways,
+            health_all_enabled_gateways,
+            export_multi_gateway_diagnostic_report,
+            upsert_agent_runtime_profile,
+            save_agent_channel_routes,
+            save_telegram_instances,
+            save_channel_instances,
+            apply_telegram_instance,
+            apply_channel_instance,
+            test_telegram_instances,
+            test_single_telegram_instance,
+            test_channel_instances,
+            test_single_channel_instance,
+            cleanup_browser_sessions_for_telegram_bindings,
+            resolve_agent_channel_route,
+            get_gateway_url,
+            read_workspace_file,
+            write_workspace_file,
+            chat_list_history,
+            chat_list_history_delta,
+            chat_send,
+            chat_abort,
+            orchestrator_submit_task,
+            orchestrator_list_tasks,
+            orchestrator_retry_step,
+            capabilities_list,
+            capabilities_upsert,
+            verifier_check_output,
+            skill_graph_save,
+            skill_graph_list,
+            skill_graph_execute,
+            ticket_ingest,
+            ticket_list,
+            ticket_update,
+            memory_write_layered,
+            memory_query_layered,
+            sandbox_preview_action,
+            sandbox_execute_action,
+            debate_run,
+            replay_snapshot_create,
+            replay_snapshot_list,
+            replay_snapshot_replay,
+            promptops_create_version,
+            promptops_activate,
+            promptops_list,
+            enterprise_set_role,
+            enterprise_list_roles,
+            enterprise_list_audit,
+            enterprise_cost_summary,
+            control_plane_seed_demo,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
