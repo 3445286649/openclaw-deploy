@@ -1,8 +1,8 @@
 [package]
-name = "openclaw-deploy"
+name = "yunrui-openclaw"
 version = "2.0.0"
-description = "OpenClaw 一键部署工具"
-authors = ["OpenClaw"]
+description = "云睿OpenClaw 桌面引导与部署工具"
+authors = ["OpenClaw contributors", "云睿OpenClaw"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

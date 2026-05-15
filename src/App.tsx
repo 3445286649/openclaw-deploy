@@ -1083,6 +1083,7 @@ const AI_SERVICE_OPTIONS = [
 
 const DEFAULT_OPENAI_BASE_URL = "https://api.siliconflow.cn/v1";
 const DEFAULT_KIMI_BASE_URL = "https://api.moonshot.cn/v1";
+const DEFAULT_RELAY_STATION_URL = (import.meta.env.VITE_YUNRUI_RELAY_STATION_URL || "").trim();
 const RECOMMENDED_MODEL_FALLBACK = "deepseek-ai/DeepSeek-V3";
 
 /** 固定硅基流动模型列表（引流用，后续接入自建中转支持更多） */
@@ -1238,6 +1239,8 @@ function App() {
   const [provider, setProvider] = useState("openai");
   const [apiKey, setApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
+  const [apiEntryMode, setApiEntryMode] = useState<"undecided" | "own" | "relay">("undecided");
+  const [relayStationUrl, setRelayStationUrl] = useState("");
   const [baseUrl, setBaseUrl] = useState(DEFAULT_OPENAI_BASE_URL);
   const [proxyUrl, setProxyUrl] = useState("");
   const [noProxy, setNoProxy] = useState("");
@@ -1803,10 +1806,16 @@ function App() {
     const savedRouteMode = localStorage.getItem("openclaw_chat_route_mode");
     const savedExecutionMode = localStorage.getItem("openclaw_chat_execution_mode");
     const savedAutoStopOnClose = localStorage.getItem("openclaw_auto_stop_gateways_on_close");
+    const savedApiEntryMode = localStorage.getItem("openclaw_api_entry_mode");
+    const savedRelayStationUrl = localStorage.getItem("openclaw_relay_station_url") ?? DEFAULT_RELAY_STATION_URL;
     let cancelled = false;
     startupBootstrapDoneRef.current = false;
     if (savedInstall) setCustomInstallPath(savedInstall);
     if (savedAutoStopOnClose === "1") setAutoStopGatewaysOnClose(true);
+    if (savedApiEntryMode === "own" || savedApiEntryMode === "relay") {
+      setApiEntryMode(savedApiEntryMode);
+    }
+    if (savedRelayStationUrl) setRelayStationUrl(savedRelayStationUrl);
     chatSessionModeRef.current = "synced";
     localStorage.setItem("openclaw_chat_session_mode", "synced");
     localStorage.removeItem("openclaw_chat_session_mode_user_set");
@@ -2383,6 +2392,18 @@ function App() {
   }, [queueTasks]);
 
   useEffect(() => {
+    localStorage.setItem("openclaw_api_entry_mode", apiEntryMode);
+  }, [apiEntryMode]);
+
+  useEffect(() => {
+    if (relayStationUrl.trim()) {
+      localStorage.setItem("openclaw_relay_station_url", relayStationUrl.trim());
+    } else {
+      localStorage.removeItem("openclaw_relay_station_url");
+    }
+  }, [relayStationUrl]);
+
+  useEffect(() => {
     if (customInstallPath.trim()) {
       localStorage.setItem("openclaw_install_dir", customInstallPath.trim());
     }
@@ -2919,6 +2940,10 @@ function App() {
   };
 
   const handleSaveConfig = async () => {
+    if (apiEntryMode === "relay" && !apiKey.trim()) {
+      setSaveResult("请先去中转站获取 API Key，拿到后切回“我已经有 API Key”再保存。");
+      return;
+    }
     if (looksLikeApiKey(customConfigPath)) {
       setApiKey(customConfigPath.trim());
       setCustomConfigPath("");
@@ -2987,6 +3012,10 @@ function App() {
   };
 
   const handleTestModel = async () => {
+    if (apiEntryMode === "relay" && !apiKey.trim()) {
+      setModelTestResult("请先去中转站获取 API Key，拿到后切回“我已经有 API Key”再验证。");
+      return;
+    }
     if (looksLikeApiKey(customConfigPath)) {
       setApiKey(customConfigPath.trim());
       setCustomConfigPath("");
@@ -8708,75 +8737,166 @@ function App() {
                 </div>
 
                 <div className="rounded-2xl border border-slate-700 bg-slate-800/50 p-5 space-y-4">
-                  <div>
-                    <p className="text-sm font-medium text-slate-100">接入密钥</p>
-                    <p className="text-xs text-slate-400 mt-1">填入当前服务渠道的密钥，验证通过后即可启用。</p>
-                  </div>
-                  <div className="space-y-3">
-                    <div className="flex gap-2">
-                      <input
-                        type={showApiKey ? "text" : "password"}
-                        value={apiKey}
-                        onChange={(e) => setApiKey(e.target.value)}
-                        placeholder={provider === "kimi" ? "输入你的 Kimi API Key" : "输入你的硅基流动 API Key"}
-                        className="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-4 py-3"
-                      />
+                  <div className="flex items-start justify-between gap-3 flex-wrap">
+                    <div>
+                      <p className="text-sm font-medium text-slate-100">接入密钥</p>
+                      <p className="text-xs text-slate-400 mt-1">先选入口方式，再继续输入和验证。</p>
+                    </div>
+                    <div className="flex gap-2 flex-wrap text-xs">
                       <button
                         type="button"
-                        onClick={async () => {
-                          try {
-                            const text = await navigator.clipboard.readText();
-                            if (text) setApiKey(text);
-                          } catch {}
-                        }}
-                        className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs"
+                        onClick={() => setApiEntryMode("own")}
+                        className={`px-3 py-1.5 rounded-lg border ${apiEntryMode === "own" ? "border-emerald-500 bg-emerald-700/25 text-emerald-100" : "border-slate-700 bg-slate-900/50 text-slate-300"}`}
                       >
-                        粘贴
+                        我已经有 API Key
                       </button>
                       <button
                         type="button"
-                        onClick={() => setShowApiKey((prev) => !prev)}
-                        className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs"
+                        onClick={() => setApiEntryMode("relay")}
+                        className={`px-3 py-1.5 rounded-lg border ${apiEntryMode === "relay" ? "border-sky-500 bg-sky-700/25 text-sky-100" : "border-slate-700 bg-slate-900/50 text-slate-300"}`}
                       >
-                        {showApiKey ? "隐藏" : "显示"}
+                        去中转站获取 API Key
                       </button>
                     </div>
-                    <div className="flex gap-2 flex-wrap">
-                      <button
-                        onClick={handleTestModel}
-                        disabled={modelTesting || cleaningLegacy}
-                        className="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-sm font-medium"
-                      >
-                        {modelTesting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wrench className="w-4 h-4" />}
-                        验证密钥
-                      </button>
-                      <button
-                        onClick={handleSaveConfig}
-                        disabled={saving || modelTesting || cleaningLegacy}
-                        className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-sm font-medium"
-                      >
-                        {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Key className="w-4 h-4" />}
-                        保存并启用服务
-                      </button>
-                      <button
-                        onClick={() => handlePrimaryNavChange("chat")}
-                        className="px-4 py-2 bg-sky-700 hover:bg-sky-600 rounded-lg text-sm font-medium"
-                      >
-                        立即开始试聊
-                      </button>
-                    </div>
-                    {saveResult && (
-                      <p className={`text-sm ${saveResult.startsWith("错误") ? "text-red-400" : "text-emerald-400"}`}>
-                        {saveResult}
-                      </p>
-                    )}
-                    {modelTestResult && (
-                      <p className={`text-sm ${modelTestResult.includes("通过") ? "text-emerald-400" : "text-amber-300"}`}>
-                        {modelTestResult}
-                      </p>
-                    )}
-                    {savedAiHint && <p className="text-sky-300 text-sm">{savedAiHint}</p>}
                   </div>
+
+                  {apiEntryMode === "undecided" && (
+                    <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-4 space-y-3">
+                      <p className="text-sm text-slate-200">先选一个入口：</p>
+                      <div className="flex gap-2 flex-wrap">
+                        <button
+                          type="button"
+                          onClick={() => setApiEntryMode("own")}
+                          className="px-3 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-sm"
+                        >
+                          我已经有 API Key
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setApiEntryMode("relay")}
+                          className="px-3 py-2 rounded-lg bg-sky-700 hover:bg-sky-600 text-sm"
+                        >
+                          去中转站获取 API Key
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {apiEntryMode === "relay" && (
+                    <div className="rounded-xl border border-sky-700/60 bg-sky-950/20 p-4 space-y-3">
+                      <div>
+                        <p className="text-sm font-medium text-sky-100">中转站入口</p>
+                        <p className="text-xs text-sky-200/80 mt-1">把你的中转站链接填在这里，按钮会直接打开它。</p>
+                      </div>
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          value={relayStationUrl}
+                          onChange={(e) => setRelayStationUrl(e.target.value)}
+                          placeholder={DEFAULT_RELAY_STATION_URL || "https://..."}
+                          className="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-4 py-3"
+                        />
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const url = relayStationUrl.trim();
+                            if (!url) return;
+                            try {
+                              await openUrl(url);
+                            } catch (error) {
+                              console.error("failed to open relay station", error);
+                              setModelTestResult("中转站链接打开失败，请检查网址是否正确。");
+                            }
+                          }}
+                          disabled={!relayStationUrl.trim()}
+                          className="px-4 py-2 rounded-lg bg-sky-700 hover:bg-sky-600 disabled:opacity-50 text-sm"
+                        >
+                          打开
+                        </button>
+                      </div>
+                      <p className="text-xs text-slate-400">拿到 Key 之后，再切回“我已经有 API Key”。</p>
+                      <button
+                        type="button"
+                        onClick={() => setApiEntryMode("own")}
+                        className="px-3 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-sm"
+                      >
+                        我已拿到 Key，去填写
+                      </button>
+                    </div>
+                  )}
+
+                  {apiEntryMode !== "relay" && (
+                    <div className="space-y-3">
+                      <div className="flex gap-2">
+                        <input
+                          type={showApiKey ? "text" : "password"}
+                          value={apiKey}
+                          onChange={(e) => setApiKey(e.target.value)}
+                          placeholder={provider === "kimi" ? "输入你的 Kimi API Key" : "输入你的硅基流动 API Key"}
+                          className="flex-1 bg-slate-900 border border-slate-600 rounded-lg px-4 py-3"
+                        />
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              const text = await navigator.clipboard.readText();
+                              if (text) setApiKey(text);
+                            } catch {}
+                          }}
+                          className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs"
+                        >
+                          粘贴
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowApiKey((prev) => !prev)}
+                          className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-xs"
+                        >
+                          {showApiKey ? "隐藏" : "显示"}
+                        </button>
+                      </div>
+                      <div className="flex gap-2 flex-wrap">
+                        <button
+                          onClick={handleTestModel}
+                          disabled={modelTesting || cleaningLegacy}
+                          className="flex items-center gap-2 px-4 py-2 bg-slate-700 hover:bg-slate-600 disabled:opacity-50 rounded-lg text-sm font-medium"
+                        >
+                          {modelTesting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wrench className="w-4 h-4" />}
+                          验证密钥
+                        </button>
+                        <button
+                          onClick={handleSaveConfig}
+                          disabled={saving || modelTesting || cleaningLegacy}
+                          className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 rounded-lg text-sm font-medium"
+                        >
+                          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Key className="w-4 h-4" />}
+                          保存并启用服务
+                        </button>
+                        <button
+                          onClick={() => handlePrimaryNavChange("chat")}
+                          className="px-4 py-2 bg-sky-700 hover:bg-sky-600 rounded-lg text-sm font-medium"
+                        >
+                          立即开始试聊
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {apiEntryMode === "own" && (
+                    <p className="text-xs text-slate-400">如果你已经有自己的 Key，直接填入即可；不会强制去中转站。</p>
+                  )}
+
+                  {saveResult && (
+                    <p className={`text-sm ${saveResult.startsWith("错误") ? "text-red-400" : "text-emerald-400"}`}>
+                      {saveResult}
+                    </p>
+                  )}
+                  {modelTestResult && (
+                    <p className={`text-sm ${modelTestResult.includes("通过") ? "text-emerald-400" : "text-amber-300"}`}>
+                      {modelTestResult}
+                    </p>
+                  )}
+                  {savedAiHint && <p className="text-sky-300 text-sm">{savedAiHint}</p>}
                 </div>
 
                 <details

@@ -1,5 +1,5 @@
 {
-  "name": "openclaw-deploy",
+  "name": "yunrui-openclaw",
   "private": true,
   "version": "2.0.0",
   "type": "module",
@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "release": "powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1"
+    "release": "powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1",
+    "check:yunrui": "node scripts/check-yunrui-release.mjs"
   },
   "dependencies": {
     "@tailwindcss/vite": "^4.2.1",

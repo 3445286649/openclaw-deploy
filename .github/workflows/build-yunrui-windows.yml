@@ -1,0 +1,56 @@
+name: Build Yunrui OpenClaw Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'build-release.bat'
+      - '.github/workflows/build-yunrui-windows.yml'
+
+jobs:
+  build-windows:
+    name: Build Windows release zip
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run Yunrui release checks
+        run: npm run check:yunrui
+
+      - name: Build release zip
+        shell: pwsh
+        env:
+          VITE_YUNRUI_RELAY_STATION_URL: ${{ secrets.YUNRUI_RELAY_STATION_URL }}
+        run: ./scripts/build-release.ps1
+
+      - name: Upload release folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yunrui-OpenClaw-release-folder
+          path: release/**
+
+      - name: Upload Windows zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: Yunrui-OpenClaw-Windows-zip
+          path: Yunrui-OpenClaw-v*-Windows.zip
